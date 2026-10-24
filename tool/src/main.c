@@ -1708,6 +1708,7 @@ static void read_input(Input *in, float dt, SDL_Gamepad **pad)
 {
     static float hold[4];
     static int held[4];
+    static int pad_a_held, pad_b_held, pad_start_held, pad_back_held, pad_opts_held;
     int down[4] = { 0 };
     float mx = in->mx, my = in->my;
     memset(in, 0, sizeof *in);
@@ -1745,24 +1746,40 @@ static void read_input(Input *in, float dt, SDL_Gamepad **pad)
             break;
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
             int b = e.gbutton.button;
-            if (b == SDL_GAMEPAD_BUTTON_SOUTH) in->a = 1;
-            if (b == SDL_GAMEPAD_BUTTON_EAST) in->b = 1;
-            if (b == SDL_GAMEPAD_BUTTON_START || b == SDL_GAMEPAD_BUTTON_BACK) in->opts = 1;
+            if (b == SDL_GAMEPAD_BUTTON_SOUTH) { if (!pad_a_held) in->a = 1; pad_a_held = 1; }
+            if (b == SDL_GAMEPAD_BUTTON_EAST) { if (!pad_b_held) in->b = 1; pad_b_held = 1; }
+            if (b == SDL_GAMEPAD_BUTTON_START) { if (!pad_opts_held) in->opts = 1; pad_start_held = pad_opts_held = 1; }
+            if (b == SDL_GAMEPAD_BUTTON_BACK) { if (!pad_opts_held) in->opts = 1; pad_back_held = pad_opts_held = 1; }
             if (b == SDL_GAMEPAD_BUTTON_DPAD_LEFT) down[0] = 1;
             if (b == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) down[1] = 1;
             if (b == SDL_GAMEPAD_BUTTON_DPAD_UP) down[2] = 1;
             if (b == SDL_GAMEPAD_BUTTON_DPAD_DOWN) down[3] = 1;
             break;
         }
+        case SDL_EVENT_GAMEPAD_BUTTON_UP:
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) pad_a_held = 0;
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) pad_b_held = 0;
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START) pad_start_held = 0;
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) pad_back_held = 0;
+            pad_opts_held = pad_start_held || pad_back_held;
+            break;
         }
     }
     /* held directions repeat like the HOME menu */
     const bool *ks = SDL_GetKeyboardState(NULL);
     int now[4] = { ks[SDL_SCANCODE_LEFT], ks[SDL_SCANCODE_RIGHT], ks[SDL_SCANCODE_UP], ks[SDL_SCANCODE_DOWN] };
     if (*pad) {
-        in->a |= SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_SOUTH);
-        in->b |= SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_EAST);
-        in->opts |= SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_START) || SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_BACK);
+        int a = SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_SOUTH);
+        int b = SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_EAST);
+        int opts = SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_START) || SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_BACK);
+        if (a && !pad_a_held) in->a = 1;
+        if (b && !pad_b_held) in->b = 1;
+        if (opts && !pad_opts_held) in->opts = 1;
+        pad_a_held = a;
+        pad_b_held = b;
+        pad_start_held = SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_START);
+        pad_back_held = SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_BACK);
+        pad_opts_held = opts;
         const int bt[4] = { SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN };
         int ax = SDL_GetGamepadAxis(*pad, SDL_GAMEPAD_AXIS_LEFTX), ay = SDL_GetGamepadAxis(*pad, SDL_GAMEPAD_AXIS_LEFTY);
         int st[4] = { ax < -20000, ax > 20000, ay < -20000, ay > 20000 };
@@ -1770,6 +1787,8 @@ static void read_input(Input *in, float dt, SDL_Gamepad **pad)
             now[i] |= SDL_GetGamepadButton(*pad, (SDL_GamepadButton)bt[i]) | st[i];
             if (st[i] && !held[i]) down[i] = 1;
         }
+    } else {
+        pad_a_held = pad_b_held = pad_start_held = pad_back_held = pad_opts_held = 0;
     }
     int *out[4] = { &in->left, &in->right, &in->up, &in->down };
     for (int i = 0; i < 4; i++) {
@@ -1838,9 +1857,8 @@ int main(int argc, char **argv)
         if (!strncmp(argv[i], "--screen=", 9)) shot_screen = atoi(argv[i] + 9);
         if (!strncmp(argv[i], "--test-icon=", 12)) test_icon = argv[i] + 12;   /* checks: picture for game 0 */
     }
-    char *base = (char *)SDL_GetBasePath();
+    const char *base = SDL_GetBasePath();
     snprintf(app.here, sizeof app.here, "%s", base ? base : ".\\");
-    SDL_free(base);
 #ifdef _WIN32
     SetCurrentDirectoryA(app.here);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);

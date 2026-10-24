@@ -28,10 +28,46 @@ and milestone documentation, not the Flatpak-only package changes.
 - The launcher now enumerates already-connected gamepads on startup and polls confirm/cancel/menu buttons
   in addition to event handling.
 - Updated Linux build and dependency instructions. The Windows tool continues to use SDL2 libraries.
+- The Linux launcher build uses GNU C17 so GCC 15's C23 default does not make the older-glibc compatibility
+  wrappers recurse into themselves at SDL3 startup. The build script writes the launcher beside `bin/` and
+  `tool/`, matching the paths expected by the app.
+- The Linux runtime build also uses GNU C17. Without it, GCC 15 emits C23 `strtol` calls that resolve to the
+  compatibility wrapper and recurse while reading a game's INI file; SMO then consumed a full CPU core
+  before creating its window. Rebuilds through `switchrecomp.py --build-runtime` now include the same flag.
+- `SDL_GetBasePath()` returns an SDL-owned cached path in SDL3, so the launcher keeps it as a `const char *`
+  and does not free it. This avoids a shutdown double free.
+- SDL3 gamepad button events and polling now trigger A, B, and menu actions only on press edges. Previously,
+  holding A while a game tile was selected could launch a new game process every frame.
 - Verified the Linux launcher and X11 runtime compile with GCC against SDL3 3.4.18, SDL3_ttf 3.2.2, and
-  SDL3_image 3.2.4. Runtime controller and audio behavior still needs testing with a Steam Controller.
+  SDL3_image 3.2.4. The Steam Controller is recognized by SDL3; gamepad behavior in a running game still
+  needs a successful SMO launch to verify.
 
 The cumulative beta patch is `patches/milestone-002-main-to-beta.patch`.
+
+## Milestone 003 — Linux H.264 video decoding
+
+- Added a Linux x86_64 OpenH264 2.4.1 static archive, built from Cisco's upstream `v2.4.1` tag to match
+  the runtime's existing 2.4.1 API headers. The upstream BSD license is retained in `runtime/oh264/LICENSE`.
+- Updated runtime builds to use the upstream `libopenh264.a` archive when the platform-specific split
+  decoder/common archives are unavailable. Windows continues using its existing split archives.
+- Rebuilt `bin/runtime_linux_x11` with H.264 enabled. Existing game executables must be recompiled with this
+  runtime to decode H.264 movies. Recompiled the local SMO game executable using its existing execution
+  hints so it is ready for movie playback testing.
+- Build provenance and the reproducible OpenH264 command are recorded in `runtime/oh264/lin/README.md`.
+
+The cumulative beta patch is `patches/milestone-003-main-to-beta.patch`.
+
+## Milestone 004 — Correct audio queue priming
+
+- Shared runtime fix on `beta` and `flatpack`: use a 20 ms audio queue reserve to reduce A/V latency. Playback
+  stays at full rate while the queue meets that reserve; adaptive slowdown applies only below it.
+- Rebuilt the Linux X11 runtime with the 20 ms reserve and installed it into the local SMO executable for testing.
+- The preceding SMO log showed the title music voices beginning at 24.54 seconds and Mario's voice at 25.33
+  seconds. These are guest-mix timestamps and do not establish host playback latency or prove a missing channel.
+- A previous run reported intermittent audio glitching. The 20 ms build is ready for a playback comparison; no
+  underflow counter is currently available, so the log cannot independently confirm an audible glitch.
+
+The cumulative beta patch is `patches/milestone-004-main-to-beta.patch`.
 
 ## Recording the next milestone
 
