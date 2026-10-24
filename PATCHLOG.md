@@ -19,6 +19,16 @@ from `main` to `beta` in `patches/`.
 The beta patch is `patches/milestone-001-main-to-beta.patch`. It contains the shared memory optimization
 and milestone documentation, not the Flatpak-only package changes.
 
+## Milestone 002 — Compile the optimized beta runtime
+
+- Built `bin/runtime_linux_x11` on `beta` with GCC from the updated runtime sources; the build completed
+  successfully.
+- The rebuilt runtime is synchronized to `flatpack` because it contains the same shared memory code.
+- This confirms compilation only. Gameplay and performance measurements are still needed to determine
+  whether the memory lookup optimization improves real workloads.
+
+The cumulative beta patch is `patches/milestone-002-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep
