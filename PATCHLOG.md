@@ -38,6 +38,15 @@ The cumulative beta patch is `patches/milestone-002-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-003-main-to-beta.patch`.
 
+## Milestone 004 — Launcher controller button polling
+
+- Shared launcher change on `beta` and `flatpack`: explicitly enable SDL controller events and poll A, B, Start,
+  and Back state as well as handling button events. This supports Steam Input configurations that update state but
+  do not reliably emit button-down events.
+- Rebuilt the Linux launcher at the repository root as `SwitchRecomp` for direct testing.
+
+The cumulative beta patch is `patches/milestone-004-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep
