@@ -8,6 +8,7 @@
 #include "audio_queue.h"
 #include <math.h>
 #include <limits.h>
+#include <stdbool.h>
 #if defined(_WIN32)
 #include <mmsystem.h>
 #else
@@ -58,18 +59,19 @@ static int host_open(void){ WAVEFORMATEX f; memset(&f,0,sizeof f); f.wFormatTag=
   LOG("audio: Windows waveOut, 48000 Hz stereo PCM16 enabled\n"); return 1;
 }
 #else
-/* SDL2 is optional and loaded at run time, same as the linux controller backend */
-typedef struct { int freq; u16 format; u8 channels,silence; u16 samples,padding; u32 size; void(*callback)(void*,u8*,int); void* userdata; } AudioSpec;
-static void* sdl_lib; static u32 device;
-static struct { int(*init)(u32); u32(*open)(const char*,int,const AudioSpec*,AudioSpec*,int); void(*pause)(u32,int); int(*queue)(u32,const void*,u32); u32(*queued)(u32); void(*close)(u32); const char*(*error)(void); } sdl;
-static void device_close(void){ if(device) sdl.close(device); device=0; }
-static int host_open(void){ sdl_lib=dlopen("libSDL2-2.0.so.0",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib) sdl_lib=dlopen("libSDL2.so",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib){ WARN("audio: SDL2 not available\n"); return 0; }
+/* SDL3 is optional and loaded at run time, same as the Linux gamepad backend. */
+typedef struct { int format; int channels; int freq; } AudioSpec;
+typedef void SDL_AudioStream;
+static void* sdl_lib; static SDL_AudioStream* device;
+static struct { bool(*init)(u32); SDL_AudioStream*(*open)(u32,const AudioSpec*,void*,void*); bool(*resume)(SDL_AudioStream*); bool(*queue)(SDL_AudioStream*,const void*,int); int(*queued)(SDL_AudioStream*); void(*close)(SDL_AudioStream*); const char*(*error)(void); } sdl;
+static void device_close(void){ if(device) sdl.close(device); device=NULL; }
+static int host_open(void){ sdl_lib=dlopen("libSDL3.so.0",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib) sdl_lib=dlopen("libSDL3.so",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib){ WARN("audio: SDL3 not available\n"); return 0; }
 #define SYM(field,name) do{*(void**)(&sdl.field)=dlsym(sdl_lib,name);if(!sdl.field)return 0;}while(0)
-  SYM(init,"SDL_InitSubSystem"); SYM(open,"SDL_OpenAudioDevice"); SYM(pause,"SDL_PauseAudioDevice"); SYM(queue,"SDL_QueueAudio"); SYM(queued,"SDL_GetQueuedAudioSize"); SYM(close,"SDL_CloseAudioDevice"); SYM(error,"SDL_GetError");
+  SYM(init,"SDL_InitSubSystem"); SYM(open,"SDL_OpenAudioDeviceStream"); SYM(resume,"SDL_ResumeAudioStreamDevice"); SYM(queue,"SDL_PutAudioStreamData"); SYM(queued,"SDL_GetAudioStreamQueued"); SYM(close,"SDL_DestroyAudioStream"); SYM(error,"SDL_GetError");
 #undef SYM
-  AudioSpec want={0}; want.freq=48000; want.format=0x8010; want.channels=2; want.samples=1024;
-  if(sdl.init(0x10) || (device=sdl.open(NULL,0,&want,NULL,0))==0){ WARN("audio: SDL2 output failed: %s\n",sdl.error()); return 0; }
-  sdl.pause(device,0); LOG("audio: SDL2, 48000 Hz stereo PCM16 enabled\n"); return 1;
+  AudioSpec want={0}; want.freq=48000; want.format=0x8010; want.channels=2;
+  if(!sdl.init(0x10) || !(device=sdl.open(0xFFFFFFFFu,&want,NULL,NULL)) || !sdl.resume(device)){ WARN("audio: SDL3 output failed: %s\n",sdl.error()); return 0; }
+  LOG("audio: SDL3, 48000 Hz stereo PCM16 enabled\n"); return 1;
 }
 #endif
 static void host_write(const float* samples,unsigned frames){
@@ -97,7 +99,7 @@ static void host_write(const float* samples,unsigned frames){
   }
   if(!r) host_next=(k+1)%HOST_N;
 #else
-  while(sdl.queue(device,dst,frames*4)!=0 && !audio_stopping()) plat_sleep_ns(5000000);
+  while(!sdl.queue(device,dst,frames*4) && !audio_stopping()) plat_sleep_ns(5000000);
 #endif
   pm_unlock(&host_lock);
 }

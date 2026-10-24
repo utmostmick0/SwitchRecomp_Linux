@@ -4,7 +4,7 @@
 /* drawing helpers on top of SDL_Renderer. anti aliased shapes and icons get rasterized once into textures, text
    goes through a small cache */
 #pragma once
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include <stdbool.h>
 
 typedef struct { Uint8 r, g, b, a; } Color;

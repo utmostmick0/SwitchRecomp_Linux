@@ -1,4 +1,4 @@
 #!/bin/sh
-# SwitchRecomp (the tool) for Linux: needs the SDL2, SDL2_ttf and SDL2_image development packages
+# SwitchRecomp (the tool) for Linux: needs SDL3, SDL3_ttf and SDL3_image development packages
 cd "$(dirname "$0")"
-cc -O2 -Wall -Wno-missing-braces main.c gfx.c music.c glibc_compat.c -o ${1:-../SwitchRecomp} $(pkg-config --cflags --libs sdl2 SDL2_ttf SDL2_image) -lm
+cc -O2 -Wall -Wno-missing-braces main.c gfx.c music.c glibc_compat.c -o "${1:-../SwitchRecomp}" $(pkg-config --cflags --libs sdl3 sdl3-ttf sdl3-image) -lm

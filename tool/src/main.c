@@ -27,8 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <SDL.h>
-#include <SDL_image.h>
+#include <SDL3/SDL.h>
+#include <SDL3_image/SDL_image.h>
 #ifndef _WIN32
 #define IMG_Load(p) IMG_Load(px(p))
 #define IMG_SavePNG(s, p) IMG_SavePNG(s, px(p))
@@ -323,7 +323,7 @@ static void load_game(Game *g, SDL_Renderer *r)
         SDL_Surface *s = IMG_Load(p);
         if (s) {
             g->icon = SDL_CreateTextureFromSurface(r, s);
-            SDL_FreeSurface(s);
+            SDL_DestroySurface(s);
         }
     }
     game_file(p, sizeof p, g, EXE_SUFFIX);
@@ -473,15 +473,16 @@ static int set_custom_icon(Game *g, const char *file)
 {
     SDL_Surface *s = IMG_Load(file);
     if (!s) return 0;
-    SDL_Surface *c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ABGR8888, 0);
-    SDL_FreeSurface(s);
+    SDL_Surface *c = SDL_ConvertSurface(s, SDL_PIXELFORMAT_ABGR8888);
+    SDL_DestroySurface(s);
     if (!c) return 0;
     int side = c->w < c->h ? c->w : c->h;
     SDL_Rect src = { (c->w - side) / 2, (c->h - side) / 2, side, side };
-    SDL_Surface *d = SDL_CreateRGBSurfaceWithFormat(0, 256, 256, 32, SDL_PIXELFORMAT_ABGR8888);
+    SDL_Rect dst = { 0, 0, 256, 256 };
+    SDL_Surface *d = SDL_CreateSurface(256, 256, SDL_PIXELFORMAT_ABGR8888);
     SDL_SetSurfaceBlendMode(c, SDL_BLENDMODE_NONE);
-    SDL_BlitScaled(c, &src, d, NULL);
-    SDL_FreeSurface(c);
+    SDL_BlitSurfaceScaled(c, &src, d, &dst, SDL_SCALEMODE_LINEAR);
+    SDL_DestroySurface(c);
     char dir[MAX_PATH], p[MAX_PATH], o[MAX_PATH];
     game_file(dir, sizeof dir, g, "_data");
     CreateDirectoryA(dir, NULL);
@@ -493,8 +494,8 @@ static int set_custom_icon(Game *g, const char *file)
         else if (file_exists(p)) DeleteFileA(p);
     }
     snprintf(p, sizeof p, "%s\\icon.png", dir);
-    int ok = IMG_SavePNG(d, p) == 0;
-    SDL_FreeSurface(d);
+    int ok = IMG_SavePNG(d, p);
+    SDL_DestroySurface(d);
     snprintf(o, sizeof o, "%s\\icon_custom", dir);
     FILE *f = fopen(o, "w");
     if (f) fclose(f);
@@ -545,7 +546,7 @@ static struct {
     int fd;
 #endif
     SDL_Thread *reader;
-    SDL_mutex *lock;
+    SDL_Mutex *lock;
     char pending[8192];
     int npending;
     int running, finished, ok, cancelled;
@@ -1609,7 +1610,7 @@ static void list_draw(const Input *in)
     gfx_rect(30, 88, 1220, 1, with_alpha(th->line, alpha));
 
     SDL_Rect clip = { 0, LIST_Y - 8, SCREEN_W, 640 - LIST_Y };
-    SDL_RenderSetClipRect(gfx_renderer(), &clip);
+    SDL_SetRenderClipRect(gfx_renderer(), &clip);
     float off = L.top_y * ROW_H;
     for (int i = 0; i < L.nrows; i++) {
         const Row *r = &L.rows[i];
@@ -1624,7 +1625,7 @@ static void list_draw(const Input *in)
     float s = L.pop > 0.5f ? 0 : 3 * expf(-L.pop * 12) * cosf(L.pop * 24);
     float y = L.sel_y + slide - off;
     gfx_round_frame(LIST_X - 4 - s, y - 2 - s, LIST_W + 8 + 2 * s, ROW_H + 4 + 2 * s, 4, 5, with_alpha(pulse_color(), alpha));
-    SDL_RenderSetClipRect(gfx_renderer(), NULL);
+    SDL_SetRenderClipRect(gfx_renderer(), NULL);
 
     /* more rows below / above */
     if (L.top + LIST_ROWS < L.nrows) gfx_text(FONT_HINT, "...", SCREEN_W / 2.0f, 636, ALIGN_CENTER, with_alpha(th->text_dim, alpha));
@@ -1703,7 +1704,7 @@ static void progress_draw(const Input *in)
 
 /* ------------------------------------------------------------------ input */
 
-static void read_input(Input *in, float dt, SDL_GameController **pad)
+static void read_input(Input *in, float dt, SDL_Gamepad **pad)
 {
     static float hold[4];
     static int held[4];
@@ -1715,18 +1716,18 @@ static void read_input(Input *in, float dt, SDL_GameController **pad)
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         switch (e.type) {
-        case SDL_QUIT: app.quit = 1; break;
-        case SDL_MOUSEMOTION: in->mx = (float)e.motion.x; in->my = (float)e.motion.y; in->moved = 1; break;
-        case SDL_MOUSEBUTTONDOWN:
+        case SDL_EVENT_QUIT: app.quit = 1; break;
+        case SDL_EVENT_MOUSE_MOTION: in->mx = e.motion.x; in->my = e.motion.y; in->moved = 1; break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
             in->mx = (float)e.button.x;
             in->my = (float)e.button.y;
             if (e.button.button == SDL_BUTTON_LEFT) in->click = 1;
             if (e.button.button == SDL_BUTTON_RIGHT) in->rclick = 1;
             if (e.button.button == SDL_BUTTON_X1) in->back = 1;
             break;
-        case SDL_MOUSEWHEEL: in->wheel += e.wheel.y; break;
-        case SDL_KEYDOWN: {
-            SDL_Keycode k = e.key.keysym.sym;
+        case SDL_EVENT_MOUSE_WHEEL: in->wheel += (int)e.wheel.y; break;
+        case SDL_EVENT_KEY_DOWN: {
+            SDL_Keycode k = e.key.key;
             int dir = k == SDLK_LEFT ? 0 : k == SDLK_RIGHT ? 1 : k == SDLK_UP ? 2 : k == SDLK_DOWN ? 3 : -1;
             if (dir >= 0) { if (!e.key.repeat) down[dir] = 1; }
             else if (!e.key.repeat) {
@@ -1736,31 +1737,37 @@ static void read_input(Input *in, float dt, SDL_GameController **pad)
             }
             break;
         }
-        case SDL_CONTROLLERDEVICEADDED:
-            if (!*pad) *pad = SDL_GameControllerOpen(e.cdevice.which);
+        case SDL_EVENT_GAMEPAD_ADDED:
+            if (!*pad) *pad = SDL_OpenGamepad(e.gdevice.which);
             break;
-        case SDL_CONTROLLERBUTTONDOWN: {
-            int b = e.cbutton.button;
-            if (b == SDL_CONTROLLER_BUTTON_A) in->a = 1;
-            if (b == SDL_CONTROLLER_BUTTON_B) in->b = 1;
-            if (b == SDL_CONTROLLER_BUTTON_START || b == SDL_CONTROLLER_BUTTON_BACK) in->opts = 1;
-            if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT) down[0] = 1;
-            if (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) down[1] = 1;
-            if (b == SDL_CONTROLLER_BUTTON_DPAD_UP) down[2] = 1;
-            if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) down[3] = 1;
+        case SDL_EVENT_GAMEPAD_REMOVED:
+            if (*pad && SDL_GetGamepadID(*pad) == e.gdevice.which) { SDL_CloseGamepad(*pad); *pad = NULL; }
+            break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+            int b = e.gbutton.button;
+            if (b == SDL_GAMEPAD_BUTTON_SOUTH) in->a = 1;
+            if (b == SDL_GAMEPAD_BUTTON_EAST) in->b = 1;
+            if (b == SDL_GAMEPAD_BUTTON_START || b == SDL_GAMEPAD_BUTTON_BACK) in->opts = 1;
+            if (b == SDL_GAMEPAD_BUTTON_DPAD_LEFT) down[0] = 1;
+            if (b == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) down[1] = 1;
+            if (b == SDL_GAMEPAD_BUTTON_DPAD_UP) down[2] = 1;
+            if (b == SDL_GAMEPAD_BUTTON_DPAD_DOWN) down[3] = 1;
             break;
         }
         }
     }
     /* held directions repeat like the HOME menu */
-    const Uint8 *ks = SDL_GetKeyboardState(NULL);
+    const bool *ks = SDL_GetKeyboardState(NULL);
     int now[4] = { ks[SDL_SCANCODE_LEFT], ks[SDL_SCANCODE_RIGHT], ks[SDL_SCANCODE_UP], ks[SDL_SCANCODE_DOWN] };
     if (*pad) {
-        const int bt[4] = { SDL_CONTROLLER_BUTTON_DPAD_LEFT, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, SDL_CONTROLLER_BUTTON_DPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_DOWN };
-        int ax = SDL_GameControllerGetAxis(*pad, SDL_CONTROLLER_AXIS_LEFTX), ay = SDL_GameControllerGetAxis(*pad, SDL_CONTROLLER_AXIS_LEFTY);
+        in->a |= SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_SOUTH);
+        in->b |= SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_EAST);
+        in->opts |= SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_START) || SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_BACK);
+        const int bt[4] = { SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN };
+        int ax = SDL_GetGamepadAxis(*pad, SDL_GAMEPAD_AXIS_LEFTX), ay = SDL_GetGamepadAxis(*pad, SDL_GAMEPAD_AXIS_LEFTY);
         int st[4] = { ax < -20000, ax > 20000, ay < -20000, ay > 20000 };
         for (int i = 0; i < 4; i++) {
-            now[i] |= SDL_GameControllerGetButton(*pad, bt[i]) | st[i];
+            now[i] |= SDL_GetGamepadButton(*pad, (SDL_GamepadButton)bt[i]) | st[i];
             if (st[i] && !held[i]) down[i] = 1;
         }
     }
@@ -1790,13 +1797,13 @@ static void splash_show(SDL_Renderer *ren, double secs)
         for (int i = 0; i < SPLASH_W * SPLASH_H; i++) px[i] = 0x00FFFFFFu | ((Uint32)cov[i] << 24);
         SDL_UpdateTexture(t, NULL, px, SPLASH_W * 4);
         SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
-        SDL_SetTextureScaleMode(t, SDL_ScaleModeLinear);
+        SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
         Uint64 t0 = SDL_GetPerformanceCounter();
         double freq = (double)SDL_GetPerformanceFrequency(), fin = 0.25, vstart = secs * 0.7;
         for (;;) {
             SDL_Event ev;
             int quit = 0;
-            while (SDL_PollEvent(&ev)) if (ev.type == SDL_QUIT) { SDL_PushEvent(&ev); quit = 1; break; }
+            while (SDL_PollEvent(&ev)) if (ev.type == SDL_EVENT_QUIT) { SDL_PushEvent(&ev); quit = 1; break; }
             double tt = (double)(SDL_GetPerformanceCounter() - t0) / freq;
             if (quit || tt >= secs) break;
             double al = 1.0, e = 0.0;
@@ -1807,7 +1814,8 @@ static void splash_show(SDL_Renderer *ren, double secs)
             int w = (int)(SCREEN_W * (1.0 + 0.06 * e)), h = (int)(SCREEN_H * (1.0 + 0.06 * e));
             SDL_Rect d = { (SCREEN_W - w) / 2, (SCREEN_H - h) / 2, w, h };
             SDL_SetTextureAlphaMod(t, (Uint8)(al * 255.0));
-            SDL_RenderCopy(ren, t, NULL, &d);
+            SDL_FRect dst = { (float)d.x, (float)d.y, (float)d.w, (float)d.h };
+            SDL_RenderTexture(ren, t, NULL, &dst);
             SDL_RenderPresent(ren);
             SDL_Delay(5);
         }
@@ -1830,7 +1838,7 @@ int main(int argc, char **argv)
         if (!strncmp(argv[i], "--screen=", 9)) shot_screen = atoi(argv[i] + 9);
         if (!strncmp(argv[i], "--test-icon=", 12)) test_icon = argv[i] + 12;   /* checks: picture for game 0 */
     }
-    char *base = SDL_GetBasePath();
+    char *base = (char *)SDL_GetBasePath();
     snprintf(app.here, sizeof app.here, "%s", base ? base : ".\\");
     SDL_free(base);
 #ifdef _WIN32
@@ -1842,8 +1850,7 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO) < 0) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
 #ifdef _WIN32
         MessageBoxA(NULL, SDL_GetError(), "SwitchRecomp", MB_ICONERROR);
 #else
@@ -1851,9 +1858,10 @@ int main(int argc, char **argv)
 #endif
         return 1;
     }
-    SDL_Window *win = SDL_CreateWindow("SwitchRecomp v190", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, SCREEN_W, SCREEN_H, SDL_WINDOW_RESIZABLE);
-    SDL_Renderer *ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : NULL;
-    if (!ren && win) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    SDL_Window *win = SDL_CreateWindow("SwitchRecomp v190", SCREEN_W, SCREEN_H, SDL_WINDOW_RESIZABLE);
+    SDL_Renderer *ren = win ? SDL_CreateRenderer(win, NULL) : NULL;
+    if (ren) SDL_SetRenderVSync(ren, 1);
+    if (!ren && win) ren = SDL_CreateRenderer(win, SDL_SOFTWARE_RENDERER);
     char fonts[MAX_PATH];
     path_join(fonts, sizeof fonts, app.here, "tool\\fonts\\");
 #ifndef _WIN32
@@ -1867,10 +1875,9 @@ int main(int argc, char **argv)
 #endif
         return 1;
     }
-    SDL_RenderSetLogicalSize(ren, SCREEN_W, SCREEN_H);
+    SDL_SetRenderLogicalPresentation(ren, SCREEN_W, SCREEN_H, SDL_LOGICAL_PRESENTATION_LETTERBOX);
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
     splash_show(ren, 2.0);
-    IMG_Init(IMG_INIT_JPG | IMG_INIT_PNG);
     J.lock = SDL_CreateMutex();
 
     load_settings();
@@ -1884,7 +1891,12 @@ int main(int argc, char **argv)
     }
     home_enter();
 
-    SDL_GameController *pad = NULL;
+    SDL_Gamepad *pad = NULL;
+    int pad_count = 0;
+    SDL_JoystickID *pad_ids = SDL_GetGamepads(&pad_count);
+    for (int i = 0; pad_ids && i < pad_count && !pad; i++)
+        if (SDL_IsGamepad(pad_ids[i])) pad = SDL_OpenGamepad(pad_ids[i]);
+    SDL_free(pad_ids);
     Input in;
     memset(&in, 0, sizeof in);
     in.mx = in.my = -1;
@@ -1933,12 +1945,8 @@ int main(int argc, char **argv)
         else { progress_update(&in, dt); progress_draw(&in); }
         if (D.open) dialog_draw();
         if (shot && ++frames == 90) {
-            int w, h;
-            SDL_GetRendererOutputSize(ren, &w, &h);
-            SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
-            SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_ARGB8888, s->pixels, s->pitch);
-            SDL_SaveBMP(s, shot);
-            SDL_FreeSurface(s);
+            SDL_Surface *s = SDL_RenderReadPixels(ren, NULL);
+            if (s) { SDL_SaveBMP(s, shot); SDL_DestroySurface(s); }
             break;
         }
         SDL_RenderPresent(ren);
@@ -1946,7 +1954,6 @@ int main(int argc, char **argv)
     if (J.running) job_cancel();
     unload_games();
     music_close();
-    IMG_Quit();
     gfx_exit();
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);

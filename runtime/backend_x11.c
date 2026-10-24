@@ -2,7 +2,7 @@
    Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
    Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
 /* X11 + GLX 4.3 backend, the linux version of backend_win32.c (wayland desktops run it through XWayland).
-   controllers come from SDL2, loaded at run time like XInput on windows. F1 help F3 screenshot F4 fps limit F5
+   controllers come from SDL3, loaded at run time like XInput on windows. F1 help F3 screenshot F4 fps limit F5
    trace F8 full res screenshot F11/Alt+Enter fullscreen Esc quit. the Xvfb tests run on this too (screenshots,
    scripted input) */
 #include "rt.h"
@@ -13,6 +13,7 @@
 #include <X11/keysym.h>
 #include <GL/glx.h>
 #include <dlfcn.h>
+#include <stdbool.h>
 #include <time.h>
 
 static Display* dpy; static Window win; static Atom wm_delete, a_state, a_fs; static Cursor g_blank;
@@ -35,43 +36,46 @@ void backend_ini(const char* k, const char* v){
 
 int video_has_gl(void){ return 1; }
 
-/* ---------------------------------------------------------------- SDL2 game controllers, loaded dynamically */
-typedef void SDLGC;
+/* ---------------------------------------------------------------- SDL3 gamepads, loaded dynamically */
+typedef void SDLGamepad;
+typedef u32 SDLGamepadID;
 static struct {
-  int (*Init)(u32); int (*SetHint)(const char*, const char*); int (*NumJoysticks)(void); int (*IsGameController)(int);
-  SDLGC* (*Open)(int); int (*Attached)(SDLGC*); void (*Close)(SDLGC*); void (*Update)(void);
-  u8 (*Button)(SDLGC*, int); i16 (*Axis)(SDLGC*, int); const char* (*Name)(SDLGC*);
+  bool (*InitSubSystem)(u32); bool (*SetHint)(const char*, const char*); SDLGamepadID* (*GetGamepads)(int*);
+  bool (*IsGamepad)(SDLGamepadID); SDLGamepad* (*Open)(SDLGamepadID); bool (*Connected)(SDLGamepad*);
+  void (*Close)(SDLGamepad*); void (*Update)(void); bool (*Button)(SDLGamepad*, int);
+  i16 (*Axis)(SDLGamepad*, int); const char* (*Name)(SDLGamepad*); void (*Free)(void*);
 } sdl;
 
-static SDLGC* g_pad_gc; static u64 g_pad_scan;
+static SDLGamepad* g_pad_gc; static u64 g_pad_scan;
 
 static void sdl_load(void){
-  void* h=dlopen("libSDL2-2.0.so.0",RTLD_NOW|RTLD_LOCAL); if(!h) h=dlopen("libSDL2.so",RTLD_NOW|RTLD_LOCAL);
-  if(!h){ LOG("controllers: SDL2 not found (install libsdl2), keyboard only\n"); return; }
-  void** f[]={(void**)&sdl.Init,(void**)&sdl.SetHint,(void**)&sdl.NumJoysticks,(void**)&sdl.IsGameController,(void**)&sdl.Open,(void**)&sdl.Attached,
-              (void**)&sdl.Close,(void**)&sdl.Update,(void**)&sdl.Button,(void**)&sdl.Axis,(void**)&sdl.Name};
-  const char* n[]={"SDL_Init","SDL_SetHint","SDL_NumJoysticks","SDL_IsGameController","SDL_GameControllerOpen","SDL_GameControllerGetAttached",
-                   "SDL_GameControllerClose","SDL_GameControllerUpdate","SDL_GameControllerGetButton","SDL_GameControllerGetAxis","SDL_GameControllerName"};
-  for(int i=0;i<11;i++){ *f[i]=dlsym(h,n[i]); if(!*f[i]){ memset(&sdl,0,sizeof sdl); return; } }
-  /* buttons by position like on windows, also for nintendo controllers that SDL would map by label */
-  sdl.SetHint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS","0");
+  void* h=dlopen("libSDL3.so.0",RTLD_NOW|RTLD_LOCAL); if(!h) h=dlopen("libSDL3.so",RTLD_NOW|RTLD_LOCAL);
+  if(!h){ LOG("controllers: SDL3 not found (install SDL3), keyboard only\n"); return; }
+  void** f[]={(void**)&sdl.InitSubSystem,(void**)&sdl.SetHint,(void**)&sdl.GetGamepads,(void**)&sdl.IsGamepad,(void**)&sdl.Open,(void**)&sdl.Connected,
+              (void**)&sdl.Close,(void**)&sdl.Update,(void**)&sdl.Button,(void**)&sdl.Axis,(void**)&sdl.Name,(void**)&sdl.Free};
+  const char* n[]={"SDL_InitSubSystem","SDL_SetHint","SDL_GetGamepads","SDL_IsGamepad","SDL_OpenGamepad","SDL_GamepadConnected",
+                   "SDL_CloseGamepad","SDL_UpdateGamepads","SDL_GetGamepadButton","SDL_GetGamepadAxis","SDL_GetGamepadName","SDL_free"};
+  for(int i=0;i<12;i++){ *f[i]=dlsym(h,n[i]); if(!*f[i]){ memset(&sdl,0,sizeof sdl); return; } }
+  /* SDL3 gamepad face buttons are positional, matching Switch controls by location. */
   sdl.SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS","1");
-  if(sdl.Init(0x2000 /* SDL_INIT_GAMECONTROLLER */)){ memset(&sdl,0,sizeof sdl); return; }
+  if(!sdl.InitSubSystem(0x2000 /* SDL_INIT_GAMEPAD */)){ memset(&sdl,0,sizeof sdl); return; }
 }
 
 static i32 dz(i32 v){ return (v>-7000 && v<7000)? 0 : v; }
 
 static void pad_poll(u64* b, i32* lx, i32* ly, i32* rx, i32* ry){
-  if(!sdl.Init) return;
+  if(!sdl.InitSubSystem) return;
   sdl.Update();
-  if(g_pad_gc && !sdl.Attached(g_pad_gc)){ sdl.Close(g_pad_gc); g_pad_gc=NULL; LOG("controllers: disconnected\n"); }
+  if(g_pad_gc && !sdl.Connected(g_pad_gc)){ sdl.Close(g_pad_gc); g_pad_gc=NULL; LOG("controllers: disconnected\n"); }
   if(!g_pad_gc){ u64 now=plat_ns(); if(now-g_pad_scan<1000000000ull) return; g_pad_scan=now;
-    for(int i=0;i<sdl.NumJoysticks() && !g_pad_gc;i++) if(sdl.IsGameController(i)) g_pad_gc=sdl.Open(i);
+    int count=0; SDLGamepadID* ids=sdl.GetGamepads(&count);
+    for(int i=0;ids && i<count && !g_pad_gc;i++) if(sdl.IsGamepad(ids[i])) g_pad_gc=sdl.Open(ids[i]);
+    if(ids) sdl.Free(ids);
     if(!g_pad_gc) return;
     LOG("controllers: %s\n",sdl.Name(g_pad_gc)? sdl.Name(g_pad_gc) : "connected"); }
-  SDLGC* g=g_pad_gc;
-  /* SDL names buttons by Xbox position: A bottom, B right, X left, Y top */
-  static const struct { int sdl, bit; } m[]={{1,0},{0,1},{3,2},{2,3},{7,4},{8,5},{9,6},{10,7},{6,10},{4,11},{13,12},{11,13},{14,14},{12,15}};
+  SDLGamepad* g=g_pad_gc;
+  /* SDL3 names face buttons by position: south bottom, east right, west left, north top. */
+  static const struct { int sdl, bit; } m[]={{0,0},{1,1},{2,2},{3,3},{7,4},{8,5},{9,6},{10,7},{6,10},{4,11},{13,12},{11,13},{14,14},{12,15}};
   for(unsigned i=0;i<sizeof m/sizeof m[0];i++) if(sdl.Button(g,m[i].sdl)) *b|=1ull<<m[i].bit;
   if(sdl.Axis(g,4)>7700) *b|=1ull<<8; if(sdl.Axis(g,5)>7700) *b|=1ull<<9;
   /* SDL's Y axes point down, the Switch's up */

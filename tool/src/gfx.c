@@ -4,7 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <SDL_ttf.h>
+#include <SDL3_ttf/SDL_ttf.h>
 #include "gfx.h"
 
 static SDL_Renderer *g_r;
@@ -49,7 +49,7 @@ static Shape *shape_slot(void)
 /* coverage from a signed distance in pixels, 4x4 samples per pixel so thin strokes stay smooth */
 static SDL_Texture *rasterize(int w, int h, SdfFn fn, const float *p)
 {
-    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ABGR8888);
+    SDL_Surface *s = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_ABGR8888);
     if (!s)
         return NULL;
     Uint32 *px = s->pixels;
@@ -66,7 +66,7 @@ static SDL_Texture *rasterize(int w, int h, SdfFn fn, const float *p)
             px[y * (s->pitch / 4) + x] = (a << 24) | 0xFFFFFF;
         }
     SDL_Texture *t = SDL_CreateTextureFromSurface(g_r, s);
-    SDL_FreeSurface(s);
+    SDL_DestroySurface(s);
     if (t)
         SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
     return t;
@@ -93,7 +93,9 @@ static void draw_tinted(SDL_Texture *t, const SDL_Rect *src, float x, float y, f
     SDL_SetTextureColorMod(t, c.r, c.g, c.b);
     SDL_SetTextureAlphaMod(t, c.a);
     SDL_FRect dst = { x, y, w, h };
-    SDL_RenderCopyF(g_r, t, src, &dst);
+    SDL_FRect srcf;
+    if (src) { srcf = (SDL_FRect){ (float)src->x, (float)src->y, (float)src->w, (float)src->h }; }
+    SDL_RenderTexture(g_r, t, src ? &srcf : NULL, &dst);
 }
 
 /* ---- signed distance functions, in pixels ---- */
@@ -155,7 +157,7 @@ static SDL_Texture *shadow_tex(int w, int h, float radius, float spread)
     }
     int pad = (int)ceilf(spread * 2);
     int tw = w + pad * 2, th = h + pad * 2;
-    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, tw, th, 32, SDL_PIXELFORMAT_ABGR8888);
+    SDL_Surface *s = SDL_CreateSurface(tw, th, SDL_PIXELFORMAT_ABGR8888);
     if (!s)
         return NULL;
     Uint32 *px = s->pixels;
@@ -166,7 +168,7 @@ static SDL_Texture *shadow_tex(int w, int h, float radius, float spread)
             px[y * (s->pitch / 4) + x] = ((Uint32)(a * 255) << 24) | 0xFFFFFF;
         }
     SDL_Texture *t = SDL_CreateTextureFromSurface(g_r, s);
-    SDL_FreeSurface(s);
+    SDL_DestroySurface(s);
     SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
     *shape_slot() = (Shape){ 100, { p[0], p[1], p[2], p[3] }, tw, th, t, ++g_shape_clock };
     return t;
@@ -330,13 +332,13 @@ static TextEntry *text_get(FontId f, const char *s)
     memset(slot, 0, sizeof(*slot));
     if (!g_fonts[f] || !s[0])
         return NULL;
-    SDL_Surface *surf = TTF_RenderUTF8_Blended(g_fonts[f], s, (SDL_Color){ 255, 255, 255, 255 });
+    SDL_Surface *surf = TTF_RenderText_Blended(g_fonts[f], s, 0, (SDL_Color){ 255, 255, 255, 255 });
     if (!surf)
         return NULL;
     slot->tex = SDL_CreateTextureFromSurface(g_r, surf);
     slot->w = surf->w;
     slot->h = surf->h;
-    SDL_FreeSurface(surf);
+    SDL_DestroySurface(surf);
     if (!slot->tex)
         return NULL;
     SDL_SetTextureBlendMode(slot->tex, SDL_BLENDMODE_BLEND);
@@ -362,7 +364,7 @@ static const struct { const char *file; int size; } g_font_specs[FONT_COUNT] = {
 bool gfx_init(SDL_Renderer *r, const char *font_dir)
 {
     g_r = r;
-    if (TTF_Init() < 0)
+    if (!TTF_Init())
         return false;
     for (int i = 0; i < FONT_COUNT; i++) {
         char path[1024];
@@ -406,7 +408,7 @@ void gfx_rect(float x, float y, float w, float h, Color c)
     SDL_SetRenderDrawBlendMode(g_r, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(g_r, c.r, c.g, c.b, c.a);
     SDL_FRect rc = { x, y, w, h };
-    SDL_RenderFillRectF(g_r, &rc);
+    SDL_RenderFillRect(g_r, &rc);
 }
 
 /* nine-slice: corners from a texture of size 2r, edges and middle as plain rects */
@@ -500,14 +502,16 @@ void gfx_texture(SDL_Texture *t, float x, float y, float w, float h, float alpha
     SDL_SetTextureColorMod(t, 255, 255, 255);
     SDL_SetTextureAlphaMod(t, (Uint8)(255 * clampf(alpha, 0, 1)));
     SDL_FRect dst = { x, y, w, h };
-    SDL_RenderCopyF(g_r, t, NULL, &dst);
+    SDL_RenderTexture(g_r, t, NULL, &dst);
 }
 
 float gfx_text_width(FontId f, const char *s)
 {
     int w = 0;
-    if (g_fonts[f] && s[0])
-        TTF_SizeUTF8(g_fonts[f], s, &w, NULL);
+    if (g_fonts[f] && s[0]) {
+        int h;
+        TTF_GetStringSize(g_fonts[f], s, 0, &w, &h);
+    }
     return (float)w;
 }
 
@@ -517,7 +521,7 @@ float gfx_text(FontId f, const char *s, float x, float y, Align align, Color c)
     if (!e)
         return 0;
     float left = align == ALIGN_CENTER ? x - e->w / 2.0f : align == ALIGN_RIGHT ? x - e->w : x;
-    draw_tinted(e->tex, NULL, roundf(left), roundf(y - TTF_FontAscent(g_fonts[f])), e->w, e->h, c);
+    draw_tinted(e->tex, NULL, roundf(left), roundf(y - TTF_GetFontAscent(g_fonts[f])), e->w, e->h, c);
     return (float)e->w;
 }
 

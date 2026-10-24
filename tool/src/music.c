@@ -1,5 +1,5 @@
 /* SwitchRecomp by MZ Labs, Copyright 2026 MZ Labs. AGPL-3.0, see LICENSE.txt and NOTICE.txt. the decoders in audio_decode/ keep their own licenses */
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -9,16 +9,27 @@
 #define DR_MP3_IMPLEMENTATION
 #include "audio_decode/dr_mp3.h"
 #include "audio_decode/stb_vorbis.c"
-static SDL_AudioDeviceID device;
+static SDL_AudioStream* device;
 static float* samples;
 static size_t count,cursor;
 static float gain=.25f;
 static int playing;
 static char loaded[4096],music_err[256];
-static void callback(void* user,Uint8* stream,int len){
-    (void)user; float* dst=(float*)stream; int n=len/(int)sizeof(float);
-    if(!playing || !count){ memset(stream,0,len); return; }
-    for(int i=0;i<n;i++){ float x=samples[cursor++]*gain; if(cursor==count) cursor=0; dst[i]=isfinite(x)?fmaxf(-1,fminf(1,x)):0; }
+static void callback(void* user, SDL_AudioStream* stream, int amount, int total){
+    (void)user; (void)total;
+    float buffer[2048];
+    while(amount > 0){
+        int bytes=amount>(int)sizeof buffer?(int)sizeof buffer:amount;
+        int n=bytes/(int)sizeof(float);
+        for(int i=0;i<n;i++){
+            float x=0;
+            if(playing && count){ x=samples[cursor++]*gain; if(cursor==count) cursor=0; }
+            buffer[i]=isfinite(x)?fmaxf(-1,fminf(1,x)):0;
+        }
+        if(!SDL_PutAudioStreamData(stream,buffer,n*(int)sizeof(float))) break;
+        amount-=n*(int)sizeof(float);
+        if(n==0) break;
+    }
 }
 const char* music_error(void){ return music_err; }
 int music_load(const char* path){
@@ -34,21 +45,23 @@ int music_load(const char* path){
         free(pcm);
     }
     if(!decoded || !frames || !channels || channels>8 || !rate || frames*channels>0x1fffffff){ free(decoded); SDL_strlcpy(music_err,"Invalid or unsupported WAV, OGG or MP3.",sizeof music_err); return 0; }
-    SDL_AudioStream* convert=SDL_NewAudioStream(AUDIO_F32SYS,(Uint8)channels,(int)rate,AUDIO_F32SYS,2,48000);
+    SDL_AudioSpec src={ .format=SDL_AUDIO_F32, .channels=(int)channels, .freq=(int)rate };
+    SDL_AudioSpec dst={ .format=SDL_AUDIO_F32, .channels=2, .freq=48000 };
+    SDL_AudioStream* convert=SDL_CreateAudioStream(&src,&dst);
     int bytes=(int)(frames*channels*sizeof(float));
-    if(!convert || SDL_AudioStreamPut(convert,decoded,bytes)<0 || SDL_AudioStreamFlush(convert)<0){ free(decoded); if(convert) SDL_FreeAudioStream(convert); SDL_strlcpy(music_err,SDL_GetError(),sizeof music_err); return 0; }
-    free(decoded); int size=SDL_AudioStreamAvailable(convert); float* pcm=size>0?malloc((size_t)size):NULL;
-    if(!pcm || SDL_AudioStreamGet(convert,pcm,size)!=size){ free(pcm); SDL_FreeAudioStream(convert); SDL_strlcpy(music_err,"Could not convert the music file.",sizeof music_err); return 0; }
-    SDL_FreeAudioStream(convert);
-    if(!device){ SDL_AudioSpec want={0}; want.freq=48000; want.format=AUDIO_F32SYS; want.channels=2; want.samples=1024; want.callback=callback;
-        device=SDL_OpenAudioDevice(NULL,0,&want,NULL,0); if(!device){ free(pcm); SDL_strlcpy(music_err,SDL_GetError(),sizeof music_err); return 0; }}
-    SDL_LockAudioDevice(device); free(samples); samples=pcm; count=(size_t)size/sizeof(float); cursor=0; SDL_strlcpy(loaded,path,sizeof loaded); SDL_UnlockAudioDevice(device);
-    SDL_PauseAudioDevice(device,0); music_err[0]=0; return 1;
+    if(!convert || !SDL_PutAudioStreamData(convert,decoded,bytes) || !SDL_FlushAudioStream(convert)){ free(decoded); if(convert) SDL_DestroyAudioStream(convert); SDL_strlcpy(music_err,SDL_GetError(),sizeof music_err); return 0; }
+    free(decoded); int size=SDL_GetAudioStreamAvailable(convert); float* pcm=size>0?malloc((size_t)size):NULL;
+    if(!pcm || SDL_GetAudioStreamData(convert,pcm,size)!=size){ free(pcm); SDL_DestroyAudioStream(convert); SDL_strlcpy(music_err,"Could not convert the music file.",sizeof music_err); return 0; }
+    SDL_DestroyAudioStream(convert);
+    if(!device){ SDL_AudioSpec want={ .freq=48000, .format=SDL_AUDIO_F32, .channels=2 };
+        device=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&want,callback,NULL); if(!device){ free(pcm); SDL_strlcpy(music_err,SDL_GetError(),sizeof music_err); return 0; }}
+    SDL_LockAudioStream(device); free(samples); samples=pcm; count=(size_t)size/sizeof(float); cursor=0; SDL_strlcpy(loaded,path,sizeof loaded); SDL_UnlockAudioStream(device);
+    SDL_ResumeAudioStreamDevice(device); music_err[0]=0; return 1;
 }
 void music_config(const char* path,int enabled,float volume){
     if(enabled && path && path[0] && !music_load(path)) enabled=0;
-    if(device) SDL_LockAudioDevice(device);
+    if(device) SDL_LockAudioStream(device);
     playing=enabled; gain=isfinite(volume)?fmaxf(0,fminf(1,volume)):0;
-    if(device) SDL_UnlockAudioDevice(device);
+    if(device) SDL_UnlockAudioStream(device);
 }
-void music_close(void){ if(device) SDL_CloseAudioDevice(device); device=0; free(samples); samples=NULL; count=cursor=0; loaded[0]=0; }
+void music_close(void){ if(device) SDL_DestroyAudioStream(device); device=NULL; free(samples); samples=NULL; count=cursor=0; loaded[0]=0; }

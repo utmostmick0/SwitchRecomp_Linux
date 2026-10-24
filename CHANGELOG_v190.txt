@@ -12,7 +12,7 @@ tool/build_tool.bat and build_tool.sh rebuild SwitchRecomp.exe with GCC.
 
 AUDIO
 Games have sound now. audren mixes PCM and DSP-ADPCM voices, audout streams PCM16 (Celeste, Brawlhalla),
-5.1 gets mixed down to stereo, and the output goes through waveOut on Windows and SDL2 on Linux.
+5.1 gets mixed down to stereo, and the output goes through waveOut on Windows and SDL3 on Linux.
 F7 records the sound to a .wav next to the .mp4, on the same clock as the video.
 Some effects, biquad filters and surround virtualization aren't done yet.
 
