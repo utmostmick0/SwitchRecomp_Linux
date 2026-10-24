@@ -6,6 +6,11 @@ game-code changes are synchronized between those branches, while packaging-speci
 their respective branches. Each milestone records the shared changes here and stores a unified patch
 from `main` to `beta` in `patches/`.
 
+Generate the cumulative patch on `beta` with `scripts/create-milestone-patch.sh NNN`. It contains the
+committed `main`-to-`beta` source, binary, and documentation changes (including this log), encoded as a
+binary-capable Git diff. Earlier patch files are excluded to avoid nesting patches. Apply it from a clean
+`main` checkout with `git apply --binary patches/milestone-NNN-main-to-beta.patch`.
+
 ## Milestone 001 — Flatpak foundation and memory lookup
 
 - Shared across `flatpack` and `beta`: optimized guest memory block lookup using the existing sorted
