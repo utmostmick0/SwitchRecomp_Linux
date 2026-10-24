@@ -47,6 +47,32 @@ The cumulative beta patch is `patches/milestone-003-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-004-main-to-beta.patch`.
 
+## Milestone 005 — Linux H.264 video decoding
+
+- Shared runtime change on `beta` and `flatpack`: use Cisco OpenH264 2.4.1's upstream `libopenh264.a`
+  when platform-specific split decoder/common archives are unavailable. Windows keeps using its existing
+  split archives.
+- Added the matching Linux x86_64 static archive, built from Cisco's upstream `v2.4.1` tag to match the
+  existing 2.4.1 headers. Build provenance is in `runtime/oh264/lin/README.md`; the BSD license remains in
+  `runtime/oh264/LICENSE`.
+- Runtime builds use GNU C17 on Linux, preserving the compatibility fix required by GCC 15.
+- Rebuilt the Linux X11 runtime with H.264 enabled. Existing game executables need recompilation to use it.
+- Flatpak-specific packaging files are unchanged by this shared runtime milestone.
+
+The cumulative beta patch is `patches/milestone-005-main-to-beta.patch`.
+
+## Milestone 006 — Correct audio queue priming
+
+- Shared runtime fix on `beta` and `flatpack`: use a 20 ms audio queue reserve to reduce A/V latency. Playback
+  stays at full rate while the queue meets that reserve; adaptive slowdown applies only below it.
+- Rebuilt the Linux X11 runtime with the 20 ms reserve; the beta SMO executable now contains this runtime for playback testing.
+- The preceding SMO log showed the title music voices beginning at 24.54 seconds and Mario's voice at 25.33
+  seconds. These are guest-mix timestamps and do not establish host playback latency or prove a missing channel.
+- A previous run reported intermittent audio glitching. The 20 ms build is ready for a playback comparison; no
+  underflow counter is currently available, so the log cannot independently confirm an audible glitch.
+
+The cumulative beta patch is `patches/milestone-006-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep
