@@ -40,7 +40,11 @@ static void merge(void){
 
 int mem_is_free(u64 a, u64 s){
   if(a<AS_BASE || a+s>AS_SIZE || a+s<a) return 0;
-  for(int i=0;i<nblk;i++){ MemBlock* b=&blk[i]; if(b->addr<a+s && a<b->addr+b->size) return 0; }
+  /* Blocks are sorted and non-overlapping. Skip everything ending at or before a,
+     then only the first remaining block can overlap [a, a+s). */
+  int first=0,last=nblk;
+  while(first<last){ int mid=first+(last-first)/2; if(blk[mid].addr+blk[mid].size<=a) first=mid+1; else last=mid; }
+  if(first<nblk && blk[first].addr<a+s) return 0;
   return 1; }
 
 int mem_map(u64 a, u64 s, u32 state, u32 perm){
@@ -92,11 +96,19 @@ u64 mem_find_free(u64 lo, u64 hi, u64 size, u64 align){
   if(!align) align=0x1000;
   pm_lock(&g_memlock);
   u64 a=(lo+align-1)&~(align-1);
-  for(;;){
-    if(a+size>hi || a+size<a){ pm_unlock(&g_memlock); return 0; }
-    int clash=0;
-    for(int i=0;i<nblk;i++){ MemBlock* b=&blk[i]; if(b->addr<a+size && a<b->addr+b->size){ a=(b->addr+b->size+align-1)&~(align-1); clash=1; break; } }
-    if(!clash){ pm_unlock(&g_memlock); return a; } } }
+  if(a<lo || a+size<a || a+size>hi){ pm_unlock(&g_memlock); return 0; }
+  /* Walk the sorted ranges once. The previous loop restarted at block zero
+     after every collision, making dense address spaces quadratic to scan. */
+  for(int i=0;i<nblk;i++){
+    MemBlock* b=&blk[i];
+    if(b->addr+b->size<=a) continue;
+    if(b->addr>=a+size) break;
+    u64 end=b->addr+b->size;
+    if(end>UINT64_MAX-(align-1)){ pm_unlock(&g_memlock); return 0; }
+    a=(end+align-1)&~(align-1);
+    if(a<end || a+size<a || a+size>hi){ pm_unlock(&g_memlock); return 0; }
+  }
+  pm_unlock(&g_memlock); return a; }
 
 u64 kmem_alloc(u64 size, u32 state, u32 perm){
   size=(size+0xFFF)&~0xFFFull;

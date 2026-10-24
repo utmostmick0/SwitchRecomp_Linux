@@ -43,6 +43,14 @@ LO QUE NO HAY EN LINUX (todavia)
   - Grabacion de video con F7 (usa Media Foundation de Windows).
   - Generacion de frames LSFG si no tienes Lossless.dll.
 
+FLATPAK / STEAM DECK (BORRADOR)
+  Hay un manifiesto inicial en org.mzlabs.SwitchRecomp.yml. La interfaz guarda por defecto los juegos en
+  $XDG_DATA_HOME/SwitchRecomp/games (en Flatpak, dentro de ~/.var/app/org.mzlabs.SwitchRecomp/data),
+  y los ajustes en $XDG_CONFIG_HOME/SwitchRecomp. El directorio de instalacion se mantiene solo para lectura.
+  Para compilar el Flatpak: flatpak-builder --user --install --force-clean build-dir org.mzlabs.SwitchRecomp.yml
+  Este manifiesto es una base de empaquetado, no un Flatpak listo para publicar. Todavia hay que integrar
+  SDL2_image/SDL2_ttf, Python, gcc/clang y un selector de archivos compatible con el portal de Flatpak.
+
 SI LA INTERFAZ NO ABRE
   Falta SDL2_ttf o SDL2_image: instala los paquetes de arriba. Para recompilarla desde el codigo:
     sudo apt install libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev && sh SwitchRecomp/tool/src/build_tool_linux.sh

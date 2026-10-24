@@ -7,6 +7,7 @@
 #define POSIX_COMPAT_H
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -80,6 +81,19 @@ static int FindNextFileA(HANDLE h, WIN32_FIND_DATAA *fd) { return px_find_next((
 static int FindClose(HANDLE h) { PxFind *f = h; closedir(f->d); free(f); return 1; }
 
 static int CreateDirectoryA(const char *p, void *sa) { (void)sa; return mkdir(px(p), 0755) == 0; }
+static int px_mkdirs(const char *path)
+{
+    char p[MAX_PATH];
+    snprintf(p, sizeof p, "%s", path);
+    px_inplace(p);
+    for (char *s = p + (p[0] == '/'); *s; s++) {
+        if (*s != '/') continue;
+        *s = 0;
+        if (mkdir(p, 0755) && errno != EEXIST) { *s = '/'; return 0; }
+        *s = '/';
+    }
+    return mkdir(p, 0755) == 0 || errno == EEXIST;
+}
 static int DeleteFileA(const char *p) { return unlink(px(p)) == 0; }
 static int MoveFileA(const char *a, const char *b) { char x[MAX_PATH]; snprintf(x, sizeof x, "%s", px(a)); return rename(x, px(b)) == 0; }
 /* copies keep the source's permissions, so a copied runtime stays executable */

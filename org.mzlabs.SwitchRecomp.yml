@@ -1,0 +1,32 @@
+app-id: org.mzlabs.SwitchRecomp
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: switchrecomp
+finish-args:
+  - --share=ipc
+  - --socket=x11
+  - --socket=wayland
+  - --device=dri
+  - --socket=pulseaudio
+  - --talk-name=org.freedesktop.portal.Desktop
+modules:
+  - name: switchrecomp
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 switchrecomp-launcher.sh /app/bin/switchrecomp
+      - install -Dm755 SwitchRecomp /app/share/switchrecomp/SwitchRecomp
+      - install -Dm644 switchrecomp.py /app/share/switchrecomp/switchrecomp.py
+      - install -Dm644 a64.py /app/share/switchrecomp/a64.py
+      - install -Dm644 codegen.py /app/share/switchrecomp/codegen.py
+      - install -Dm644 nxloader.py /app/share/switchrecomp/nxloader.py
+      - install -Dm644 brt.py /app/share/switchrecomp/brt.py
+      - install -Dm644 tools_sym.py /app/share/switchrecomp/tools_sym.py
+      - install -Dm644 LICENSE.txt /app/share/licenses/switchrecomp/LICENSE.txt
+      - install -Dm644 NOTICE.txt /app/share/licenses/switchrecomp/NOTICE.txt
+      - cp -a tool bin runtime /app/share/switchrecomp/
+      - install -Dm644 org.mzlabs.SwitchRecomp.desktop /app/share/applications/org.mzlabs.SwitchRecomp.desktop
+      - install -Dm644 org.mzlabs.SwitchRecomp.metainfo.xml /app/share/metainfo/org.mzlabs.SwitchRecomp.metainfo.xml
+    sources:
+      - type: dir
+        path: .

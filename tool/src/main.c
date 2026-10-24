@@ -196,7 +196,33 @@ static void ini_set(const char *file, const char *key, const char *val)
     free(buf);
 }
 
-static void tool_ini(char *out, size_t n) { path_join(out, n, app.here, "SwitchRecomp.ini"); }
+static void tool_ini(char *out, size_t n)
+{
+#ifdef _WIN32
+    path_join(out, n, app.here, "SwitchRecomp.ini");
+#else
+    const char *base = getenv("XDG_CONFIG_HOME");
+    char fallback[MAX_PATH];
+    if (!base || !base[0]) {
+        const char *home = getenv("HOME");
+        snprintf(fallback, sizeof fallback, "%s/.config", home && home[0] ? home : ".");
+        base = fallback;
+    }
+    snprintf(out, n, "%s/SwitchRecomp/SwitchRecomp.ini", base);
+#endif
+}
+
+#ifndef _WIN32
+static void linux_user_dirs(char *data, size_t nd, char *config, size_t nc)
+{
+    const char *d = getenv("XDG_DATA_HOME"), *c = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    char fallback[MAX_PATH];
+    if (!d || !d[0]) { snprintf(fallback, sizeof fallback, "%s/.local/share", home && home[0] ? home : "."); d = fallback; }
+    snprintf(data, nd, "%s/SwitchRecomp", d);
+    if (!c || !c[0]) { snprintf(fallback, sizeof fallback, "%s/.config", home && home[0] ? home : "."); c = fallback; }
+    snprintf(config, nc, "%s/SwitchRecomp", c);
+}
+#endif
 static void runtime_path(char *out, size_t n) { path_join(out, n, app.here, RUNTIME_FILE); }
 static void game_file(char *out, size_t n, const Game *g, const char *suffix)
 {
@@ -1459,7 +1485,15 @@ static void load_settings(void)
         size_t l = strlen(gd);
         snprintf(app.games_dir, sizeof app.games_dir, "%s%s", gd, gd[l - 1] == '\\' || gd[l - 1] == '/' ? "" : "\\");
     } else
+#ifdef _WIN32
         snprintf(app.games_dir, sizeof app.games_dir, "%sgames\\", app.here);
+#else
+    {
+        char data[MAX_PATH], config[MAX_PATH];
+        linux_user_dirs(data, sizeof data, config, sizeof config);
+        snprintf(app.games_dir, sizeof app.games_dir, "%s/games/", data);
+    }
+#endif
 #ifndef _WIN32
     px_inplace(app.games_dir);
 #endif
@@ -1874,7 +1908,13 @@ int main(int argc, char **argv)
     J.lock = SDL_CreateMutex();
 
     load_settings();
+#ifdef _WIN32
     CreateDirectoryA(app.games_dir, NULL);
+#else
+    { char data[MAX_PATH], config[MAX_PATH]; linux_user_dirs(data, sizeof data, config, sizeof config);
+      if (!px_mkdirs(data) || !px_mkdirs(config) || !px_mkdirs(app.games_dir))
+          fprintf(stderr, "SwitchRecomp: could not create user data/config directories\n"); }
+#endif
     read_version();
     load_games(ren);
     if (test_icon && app.ngames) {

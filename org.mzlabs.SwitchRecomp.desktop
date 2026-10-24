@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=SwitchRecomp
+Comment=Recompile and run Nintendo Switch game dumps
+Exec=switchrecomp
+Terminal=false
+Type=Application
+Categories=Game;Emulator;
+StartupNotify=true
