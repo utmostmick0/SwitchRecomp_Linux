@@ -1775,6 +1775,7 @@ static void read_input(Input *in, float dt, SDL_GameController **pad)
     /* held directions repeat like the HOME menu */
     const Uint8 *ks = SDL_GetKeyboardState(NULL);
     int now[4] = { ks[SDL_SCANCODE_LEFT], ks[SDL_SCANCODE_RIGHT], ks[SDL_SCANCODE_UP], ks[SDL_SCANCODE_DOWN] };
+    static int pad_held[3];
     if (*pad) {
         const int bt[4] = { SDL_CONTROLLER_BUTTON_DPAD_LEFT, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, SDL_CONTROLLER_BUTTON_DPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_DOWN };
         int ax = SDL_GameControllerGetAxis(*pad, SDL_CONTROLLER_AXIS_LEFTX), ay = SDL_GameControllerGetAxis(*pad, SDL_CONTROLLER_AXIS_LEFTY);
@@ -1783,6 +1784,20 @@ static void read_input(Input *in, float dt, SDL_GameController **pad)
             now[i] |= SDL_GameControllerGetButton(*pad, bt[i]) | st[i];
             if (st[i] && !held[i]) down[i] = 1;
         }
+        /* Poll action buttons as well as consuming SDL button events. Some Steam
+           Input configurations update controller state without delivering events. */
+        int buttons[3] = {
+            SDL_GameControllerGetButton(*pad, SDL_CONTROLLER_BUTTON_A),
+            SDL_GameControllerGetButton(*pad, SDL_CONTROLLER_BUTTON_B),
+            SDL_GameControllerGetButton(*pad, SDL_CONTROLLER_BUTTON_START) ||
+                SDL_GameControllerGetButton(*pad, SDL_CONTROLLER_BUTTON_BACK)
+        };
+        if (buttons[0] && !pad_held[0]) in->a = 1;
+        if (buttons[1] && !pad_held[1]) in->b = 1;
+        if (buttons[2] && !pad_held[2]) in->opts = 1;
+        memcpy(pad_held, buttons, sizeof pad_held);
+    } else {
+        memset(pad_held, 0, sizeof pad_held);
     }
     int *out[4] = { &in->left, &in->right, &in->up, &in->down };
     for (int i = 0; i < 4; i++) {
@@ -1871,6 +1886,7 @@ int main(int argc, char **argv)
 #endif
         return 1;
     }
+    SDL_GameControllerEventState(SDL_ENABLE);
     SDL_Window *win = SDL_CreateWindow("SwitchRecomp v190", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, SCREEN_W, SCREEN_H, SDL_WINDOW_RESIZABLE);
     SDL_Renderer *ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : NULL;
     if (!ren && win) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
