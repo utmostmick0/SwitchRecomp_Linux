@@ -1773,6 +1773,12 @@ static void read_input(Input *in, float dt, SDL_GameController **pad)
         case SDL_CONTROLLERDEVICEADDED:
             if (!*pad) *pad = SDL_GameControllerOpen(e.cdevice.which);
             break;
+        case SDL_CONTROLLERDEVICEREMOVED:
+            if (*pad && !SDL_GameControllerGetAttached(*pad)) {
+                SDL_GameControllerClose(*pad);
+                *pad = NULL;
+            }
+            break;
         case SDL_CONTROLLERBUTTONDOWN: {
             int b = e.cbutton.button;
             if (b == SDL_CONTROLLER_BUTTON_A) in->a = 1;
@@ -1784,6 +1790,20 @@ static void read_input(Input *in, float dt, SDL_GameController **pad)
             if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) down[3] = 1;
             break;
         }
+        }
+    }
+    /* SDL may not deliver DEVICEADDED for a controller that was already connected
+       before SDL initialized. Scan here as well, and repeat after disconnects. */
+    if (*pad && !SDL_GameControllerGetAttached(*pad)) {
+        SDL_GameControllerClose(*pad);
+        *pad = NULL;
+    }
+    if (!*pad) {
+        for (int i = 0; i < SDL_NumJoysticks(); i++) {
+            if (SDL_IsGameController(i)) {
+                *pad = SDL_GameControllerOpen(i);
+                if (*pad) break;
+            }
         }
     }
     /* held directions repeat like the HOME menu */

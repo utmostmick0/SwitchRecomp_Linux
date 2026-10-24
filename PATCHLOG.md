@@ -29,6 +29,15 @@ and milestone documentation, not the Flatpak-only package changes.
 
 The cumulative beta patch is `patches/milestone-002-main-to-beta.patch`.
 
+## Milestone 003 — Launcher controller detection
+
+- Shared launcher fix on `beta` and `flatpack`: scan for already-connected SDL game controllers during input polling,
+  and release disconnected controllers so a later reconnect can be detected.
+- This addresses launchers that miss SDL's device-added event when a Steam Controller is connected before startup.
+- Rebuilt the Linux launcher with `tool/src/build_tool_linux.sh`.
+
+The cumulative beta patch is `patches/milestone-003-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep
