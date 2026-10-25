@@ -104,6 +104,7 @@ The cumulative beta patch is `patches/milestone-008-main-to-beta.patch`.
   and clears that ownership marker after synchronized memory/render-target transfers.
 - The change targets SMO's repeated log message dropping its 1600x900 background render target at `0x50fbd0000`.
 - Rebuild the Flatpak runtime from this shared source after beta's visual retest.
+- Refreshed the cumulative patch against the v190 release archive now on `main`.
 
 The cumulative beta patch is `patches/milestone-009-main-to-beta.patch`.
 
