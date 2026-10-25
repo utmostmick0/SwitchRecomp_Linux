@@ -13,7 +13,7 @@
 typedef struct { char* path; u64 off, size; int logged; } RFile;
 
 static size_t g_romdir_len;
-static RFile* rfiles; static int nrfiles, caprfiles;
+static RFile* rfiles; static int nrfiles;
 static u8* rmeta; static u64 rmeta_size;        /* header + tables sit at the start of the image */
 static u64 rdata_off, rtotal;
 static FILE* rraw;                               /* plain romfs.bin */

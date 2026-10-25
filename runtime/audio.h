@@ -5,7 +5,6 @@
 #define SWR_AUDIO_FRAMES 240
 extern int g_opt_audio_slowdown;
 void swr_audio_init(void);
-void swr_audio_submit(const float* stereo, unsigned frames);
 void swr_audio_submit_at(const float* stereo, unsigned frames, u64 sample_end);
 int swr_audio_read_pcm16(u64 address,unsigned frames,unsigned channels,float volume,float* stereo);
 void swr_audio_begin_update(SvcObj* o,unsigned blocks);

@@ -337,7 +337,7 @@ void vi_vsync_tick(void);
 void nv_init(void);
 /* gpu */
 void gpu_init(void);
-void gpu_submit(u64* entries, u32 n, u32 channel, u32 incs);
+void gpu_submit(u64* entries, u32 n, u32 channel, u32 incs, u32 wait_id, u32 wait_val);   /* wait_id ~0u: no fence to wait for */
 void gpu_present(u64 gpu_addr_or_cpu, u32 nvmap_handle, u32 w, u32 h, u32 stride, u32 fmt, int is_blocklinear, u32 block_h_log2, u64 cpu_addr);
 u64  nvmap_addr(u32 handle);
 u64  gmmu_translate(u64 gva);

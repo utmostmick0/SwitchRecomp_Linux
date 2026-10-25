@@ -74,6 +74,45 @@ The cumulative beta patch is `patches/milestone-003-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-004-main-to-beta.patch`.
 
+## Milestone 005 — v190 runtime and recompiler fixes
+
+- Ported the v190 source changes from `SwitchRecomp_v190_linux.tar.gz` into the shared runtime and tool code.
+- Initialized GPU channel color masks so GBA Classics' loading UI is not discarded, kept supported depth-buffer copies
+  on the GPU for Sonic Frontiers, and moved submit-fence waits onto the GPU queue to avoid blocking the game thread.
+- Added per-compute-dispatch GPU timing entries and more detailed GPU/GL/compiler-thread stall diagnostics. GL fence
+  polling now takes the driver lock to avoid concurrent driver calls during shader compilation.
+- Merged the recompiler and shader changes while retaining beta's SDL3 launcher and build configuration. The archive's
+  SDL2 standalone installer packaging is not part of the beta AppImage line.
+- Rebuilt the SDL3 launcher and Linux X11 runtime from the updated source. The launcher build completed with existing
+  `-Wformat-truncation` path warnings; both builds completed successfully.
+- Existing recompiled games need their runtime updated or the games recompiled before these runtime fixes take effect.
+
+The cumulative beta patch is `patches/milestone-005-main-to-beta.patch`.
+
+## Milestone 006 — synchronous render-target flushes before GPU copies
+
+- SMO's live log showed its 480x544 corner-video output sharing guest memory with a render-target view, followed by
+  repeated DMA copies and asynchronous render-target readbacks at that address.
+- Made render-target flushes synchronous before DMA/2D engine copies. A delayed PBO readback could otherwise write an
+  older render-target image into guest memory after the copy had updated video or background pixels.
+- Rebuilt the Linux X11 runtime and copied it over `games/smo` so SMO uses the rebuilt runtime. `games/smo_code.so`
+  remains unchanged; the game code did not need recompilation for this runtime change.
+- This is a targeted correctness fix based on the logged copy/readback ordering; it still needs visual confirmation in
+  SMO because the runtime log does not capture rendered pixels.
+
+The cumulative beta patch is `patches/milestone-006-main-to-beta.patch`.
+
+## Milestone 007 — preserve GPU-written render targets during texture lookup
+
+- SMO's retest confirmed that synchronous DMA/2D flushes removed the asynchronous readback path, but the 1600x900
+  background render target at `0x50fbd0000` was still repeatedly discarded when its guest-memory signature differed.
+- Texture lookup now trusts a render target marked GPU-written instead of comparing it to stale guest memory. A
+  synchronous flush or memory-to-render-target reload clears that ownership marker after updating the signature.
+- This fixes the cache decision implicated by the new log. The current SMO run is still active, so its executable will
+  be rebuilt with this change after the process exits.
+
+The cumulative beta patch is `patches/milestone-007-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

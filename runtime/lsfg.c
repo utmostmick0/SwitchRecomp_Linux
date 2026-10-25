@@ -91,7 +91,6 @@ typedef struct { GLuint prog; int nu; LsfgUnit u[24]; } LProg;
 
 static LProg g_p[P_N];
 static int g_ok=-1; static GLuint g_smp[3];   /* 0 black border, 1 white border, 2 clamp */
-static char g_why[256];
 
 static GLuint cs_compile(const char* src, char* err, int errn){
   GLuint s=glCreateShader(GL_COMPUTE_SHADER); glShaderSource(s,1,&src,NULL); glCompileShader(s);

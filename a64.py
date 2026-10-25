@@ -120,10 +120,6 @@ def ins(name, pattern, spec=(), kind=None):
     return deco
 
 
-def sel_ds(g):
-    return 64 if g.v('sf') else 32
-
-
 # ------------------------------------------------------------------ PC-relative
 @ins('ADR', '0 xx 10000 xxxxxxxxxxxxxxxxxxx xxxxx')
 def _(g):

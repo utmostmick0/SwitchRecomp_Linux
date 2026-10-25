@@ -77,7 +77,7 @@ static void ise_decode(const u8* d, int pos, int count, int q, int* vals, int re
 /* ---------------------------------------------------------------- unquantize */
 static int unq_color(int v, int q){
   const Q* t=&qtab[q]; int nb=t->bits;
-  if(!t->trits && !t->quints){ /* bit-replicate to 8 bits */ int r=0, s=nb; int x=v; r=x<<(8-nb); int sh=8-nb; while(sh>0){ sh-=nb; r|= sh>=0? x<<sh : x>>(-sh); } return r&255; }
+  if(!t->trits && !t->quints){ /* bit-replicate to 8 bits */ int r=0; int x=v; r=x<<(8-nb); int sh=8-nb; while(sh>0){ sh-=nb; r|= sh>=0? x<<sh : x>>(-sh); } return r&255; }
   int m=v&((1<<nb)-1), tq=v>>nb; int A= (m&1)? 0x1FF : 0, B=0, C=0, D=tq;
   int b=(m>>1)&1, c=(m>>2)&1, dd=(m>>3)&1, e=(m>>4)&1, f=(m>>5)&1, g=(m>>6)&1, h=(m>>7)&1; (void)h;
   if(t->trits){
@@ -287,11 +287,3 @@ void astc_decode_rows(const u8* src, u32 w, u32 h, u32 bw, u32 bh, u8* dst, u32 
     decode_block(src+((u64)j*bx+i)*16,(int)bw,(int)bh,blk);
     for(u32 y=0;y<bh;y++){ u32 py=j*bh+y; if(py>=h) break;
       for(u32 x=0;x<bw;x++){ u32 px=i*bw+x; if(px>=w) break; memcpy(dst+((u64)py*w+px)*4,blk+(y*bw+x)*4,4); } } } }
-
-void astc_decode_image(const u8* src, u32 w, u32 h, u32 bw, u32 bh, u8* dst){
-  u32 bx=(w+bw-1)/bw, by=(h+bh-1)/bh; u8 blk[12*12*4];
-  for(u32 j=0;j<by;j++) for(u32 i=0;i<bx;i++){
-    decode_block(src+((u64)j*bx+i)*16,(int)bw,(int)bh,blk);
-    for(u32 y=0;y<bh;y++){ u32 py=j*bh+y; if(py>=h) break;
-      for(u32 x=0;x<bw;x++){ u32 px=i*bw+x; if(px>=w) break; memcpy(dst+((u64)py*w+px)*4,blk+(y*bw+x)*4,4); } } }
-}

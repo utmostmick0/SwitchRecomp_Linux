@@ -583,6 +583,10 @@ static int SDLCALL job_reader(void *arg)
 static int find_python(char *out, size_t n)
 {
 #ifndef _WIN32
+    /* the package's own python first, then the system's */
+    char p[MAX_PATH];
+    snprintf(p, sizeof p, "%spython/bin/python3", px(app.here));
+    if (!access(p, X_OK)) { px_quote(out, n, p); return 1; }
     if (!system("command -v python3 >/dev/null 2>&1")) { snprintf(out, n, "python3"); return 1; }
     return 0;
 #else
@@ -631,7 +635,7 @@ static void job_line(const char *s)
 
 static int job_start(const char *src)
 {
-    char py[MAX_PATH], cc[MAX_PATH], cmd[4096];
+    char py[MAX_PATH], cc[MAX_PATH], cmd[6144];
     memset(&J.pending, 0, sizeof J.pending);
     J.npending = 0;
     J.nlines = 0;
@@ -645,16 +649,41 @@ static int job_start(const char *src)
     snprintf(J.phase, sizeof J.phase, "Starting...");
     J.t0 = app.now;
     if (!find_python(py, sizeof py)) {
-        job_line("Python 3 was not found. Unzip the complete package (python\\ folder).");
+#ifdef _WIN32
+        /* Install.bat gets python (and GCC) into this folder, it opens in its own window */
+        char ib[MAX_PATH];
+        snprintf(ib, sizeof ib, "%sInstall.bat", app.here);
+        if (file_exists(ib) && (INT_PTR)ShellExecuteA(NULL, "open", ib, NULL, app.here, SW_SHOWNORMAL) > 32)
+            job_line("Python is not installed yet: Install.bat is downloading it (and GCC) in another window. Recompile again when it says All done.");
+        else
+            job_line("Python 3 was not found. Double-click Install.bat (needs internet) or install Python from python.org.");
+#else
+        job_line("Python 3 was not found. Double-click Install.sh (needs internet) or install python3 with your package manager.");
+#endif
         J.finished = 1;
         return 0;
     }
 #ifndef _WIN32
-    /* linux: the system's gcc (or clang), the game comes out as <name> + <name>_code.so */
-    (void)cc;
-    const char *lcc = !system("command -v gcc >/dev/null 2>&1") ? "gcc" : !system("command -v clang >/dev/null 2>&1") ? "clang" : NULL;
+    /* linux: the GCC that "Install GCC.sh" puts in gcc/, else the system's gcc (or clang). the game comes out as
+       <name> + <name>_code.so */
+    char lcc_own[MAX_PATH * 2];
+    snprintf(cc, sizeof cc, "%sgcc/bin/x86_64-conda-linux-gnu-gcc", px(app.here));
+    px_quote(lcc_own, sizeof lcc_own, cc);
+    const char *lcc = !access(cc, X_OK) ? lcc_own : !system("command -v gcc >/dev/null 2>&1") ? "gcc" : !system("command -v clang >/dev/null 2>&1") ? "clang" : NULL;
+    /* no compiler at all: download GCC first (tool/get_deps.py, into gcc/) and then recompile, all in this job */
+    char inst[MAX_PATH * 3] = "";
     if (!lcc) {
-        job_line("No C compiler found. Install gcc (Debian/Ubuntu: sudo apt install gcc, Fedora: sudo dnf install gcc, Arch: sudo pacman -S gcc).");
+        char gp[MAX_PATH], qg[MAX_PATH * 2];
+        snprintf(gp, sizeof gp, "%stool/get_deps.py", px(app.here));
+        if (!access(gp, R_OK)) {
+            px_quote(qg, sizeof qg, gp);
+            snprintf(inst, sizeof inst, "%s -u -I %s gcc && ", py, qg);
+            lcc = lcc_own;
+            job_line("No C compiler found: downloading GCC first (only this time).");
+        }
+    }
+    if (!lcc) {
+        job_line("No C compiler found. Double-click Install.sh in the SwitchRecomp folder (needs internet), then Recompile.");
         J.finished = 1;
         return 0;
     }
@@ -668,15 +697,20 @@ static int job_start(const char *src)
     char sp[MAX_PATH];
     snprintf(sp, sizeof sp, "%sswitchrecomp.py", px(app.here));
     px_quote(qh, sizeof qh, sp);
-    snprintf(cmd, sizeof cmd, "%s -u %s %s --target linux --backend x11 --outdir %s --cc %s --jobs %d%s",
-        py, qh, qs, qo, lcc, px_nproc(), app.native ? " --native" : "");
+    snprintf(cmd, sizeof cmd, "%s%s -u %s %s --target linux --backend x11 --outdir %s --cc %s --jobs %d%s",
+        inst, py, qh, qs, qo, lcc, px_nproc(), app.native ? " --native" : "");
+    if (inst[0]) {   /* px_spawn_pipe execs the command, so the && chain needs its own shell */
+        char ch[sizeof cmd];
+        px_quote(ch, sizeof ch, cmd);
+        snprintf(cmd, sizeof cmd, "/bin/sh -c %s", ch);
+    }
     if (!px_spawn_pipe(cmd, px(app.here), &J.pid, &J.fd)) {
         job_line("Could not start Python.");
         J.finished = 1;
         return 0;
     }
     J.running = 1;
-    job_line(!strcmp(lcc, "gcc") ? "Compiler: GCC" : "Compiler: Clang");
+    job_line(strcmp(lcc, "clang") ? "Compiler: GCC" : "Compiler: Clang");
     J.reader = SDL_CreateThread(job_reader, "reader", NULL);
     return 1;
 #endif
@@ -685,7 +719,7 @@ static int job_start(const char *src)
     snprintf(cc, sizeof cc, "%sgcc\\Library\\bin\\x86_64-w64-mingw32-gcc.exe", app.here);
     if (gcc && !file_exists(cc)) {
         /* GCC is a separate download, building with TCC is better than not building at all */
-        job_line("GCC is not in the gcc\\ folder (separate download): using TCC. Add GCC later and use Recompile for a faster game.");
+        job_line("GCC is not installed: using TCC. Double-click Install.bat (needs internet) and use Recompile for a faster game.");
         gcc = 0;
     }
     if (!gcc) snprintf(cc, sizeof cc, "%stcc\\tcc.exe", app.here);

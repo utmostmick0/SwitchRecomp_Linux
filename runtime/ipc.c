@@ -39,8 +39,6 @@ static SvcReg regs[256]; static int nregs;
 
 void svc_register(const char* n, SvcCtor c){ strncpy(regs[nregs].name,n,15); regs[nregs].ctor=c; nregs++; }
 
-static int generic_stub(SvcObj* o, IpcCtx* c){ WARN("  [service not implemented] %s cmd %u (replying ok)\n",o->name,c->cmd); return 0; }
-
 SvcObj* svc_open(const char* name){
   for(int i=0;i<nregs;i++) if(!strcmp(regs[i].name,name)) return regs[i].ctor();
   return NULL; }
