@@ -16,10 +16,8 @@ static u64 g_next_tid = 0x50;
 #define R_BADHANDLE   0xE401
 #define R_BADSTATE    0xFA01
 #define R_BADADDR     0xCC01
-#define R_BADSIZE     0xCA01
 #define R_OUTOFMEM    0xD001
 #define R_BADENUM     0xF001
-#define R_BADCOMBO    0xE801
 #define R_NOTFOUND    0xF201
 #define R_OUTOFRANGE  0xEE01
 #define R_BADMEMSTATE 0xD401
@@ -850,7 +848,7 @@ static void sample_thread(KThread* t){
 
 /* threads.txt: per-thread state, used when the screen stops changing */
 void kernel_dump_threads(void);
-void kernel_dump_threads_stall(void){ g_dump_sample=1; kernel_dump_threads(); g_dump_sample=0; }
+void kernel_dump_threads_stall(void){ extern void gpu_gl_stall_report(void); gpu_gl_stall_report(); g_dump_sample=1; kernel_dump_threads(); g_dump_sample=0; }
 
 void kernel_dump_threads(void){
   static const char* kinds[]={"running/in svc","objects","mutex","condvar","address"};

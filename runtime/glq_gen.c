@@ -506,13 +506,13 @@ void APIENTRY q_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GL
 typedef void (APIENTRY *T_glFinish)(void);
 T_glFinish r_glFinish;
 typedef struct {  } S_glFinish;
-static void e_glFinish(void* p){ S_glFinish* qa_=(S_glFinish*)p; r_glFinish(); }
+static void e_glFinish(void* p){ (void)p; r_glFinish(); }
 void APIENTRY q_glFinish(void){ if(t_glq_direct){ r_glFinish(); return; } S_glFinish qa_;  glq_sync_n(e_glFinish,&qa_,"glFinish");  }
 typedef void (APIENTRY *T_glFlush)(void);
 T_glFlush r_glFlush;
 typedef struct { int dummy_; } A_glFlush;
-static void e_glFlush(void* p){ A_glFlush* qa_=(A_glFlush*)p; r_glFlush(); }
-void APIENTRY q_glFlush(void){ if(t_glq_direct){ r_glFlush(); return; } A_glFlush* qa_=(A_glFlush*)glq_alloc(sizeof(A_glFlush),0,e_glFlush); glq_commit(); }
+static void e_glFlush(void* p){ (void)p; r_glFlush(); }
+void APIENTRY q_glFlush(void){ if(t_glq_direct){ r_glFlush(); return; } glq_alloc(sizeof(A_glFlush),0,e_glFlush); glq_commit(); }
 typedef void (APIENTRY *T_glGetTexImage)(GLenum target, GLint level, GLenum format, GLenum type, void * pixels);
 T_glGetTexImage r_glGetTexImage;
 void APIENTRY q_glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void * pixels);

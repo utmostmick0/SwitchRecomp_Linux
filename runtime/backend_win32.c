@@ -118,59 +118,108 @@ volatile int g_rec_toggle;
 
 void backend_rec_state(int on){ if(g_hwnd) PostMessageA(g_hwnd,WM_APP+8,(WPARAM)on,0); }
 
-static const char* HELP=
-  "SwitchRecomp - controls\n\n"
-  "XInput (Xbox) controller: same as the Switch controller (A/B swapped by position).\n\n"
-  "Keyboard:\n"
-  "  Arrows = D-Pad     W A S D = Left stick    I J K L = Right stick\n"
-  "  X / Space = A    Z = B    C = X    V = Y\n"
-  "  Q = L   E = R   1 = ZL   3 = ZR   Enter = +   Backspace = -\n\n"
-  "Mouse mode: move the mouse to move the right stick. F1 releases the pointer.\n"
-  "F1 = controls   F3 = screenshot   F4 = FPS limit 60 / unlimited   F5 = diagnostic dump (trace)\n"
-  "F7 = record .mp4 video (press F7 again to stop; saved in the recordings folder)\n"
-  "F8 = instant full-resolution screenshot (PNG in the captures folder)\n"
-  "F11 / Alt+Enter = fullscreen   Esc = quit";
-
-/* the F1 controls are normal win32 buttons and get saved in the game's ini */
-static const char* inversion_names[]={"Normal", "Invert left / right", "Invert up / down", "Invert both axes"};
-static void controls_labels(HWND h){
-  SetWindowTextA(GetDlgItem(h,101),g_mouse_mode?"Right stick: Mouse":"Right stick: I J K L");
-  SetWindowTextA(GetDlgItem(h,102),inversion_names[g_mouse_invert&3]);
-  SetWindowTextA(GetDlgItem(h,107),g_opt_audio_slowdown?"Smooth audio slowdown: ON":"Smooth audio slowdown: OFF");
-  char text[64]; snprintf(text,sizeof text,"Mouse sensitivity: %ld%%",g_mouse_sensitivity); SetWindowTextA(GetDlgItem(h,103),text);
-  EnableWindow(GetDlgItem(h,104),g_mouse_sensitivity>10); EnableWindow(GetDlgItem(h,105),g_mouse_sensitivity<500);
-}
+/* F1: controls and the mouse/audio options, drawn like the recompiler's settings page (same colors and layout: light
+   gray page, rows with the value in cyan, cyan frame on the selected row, button hints at the bottom). the options
+   get saved in the game's ini */
+#define CW_W 760
+#define CW_H 620
+#define CW_ROW 46
+#define CW_LIST_Y 84
+#define CW_NOPT 4
+static const char* inversion_names[]={"Normal", "Left / right inverted", "Up / down inverted", "Both inverted"};
+static const char* const cw_keys[][2]={
+  {"D-Pad","Arrows"}, {"Left stick","W A S D"}, {"Right stick","I J K L (or the mouse)"}, {"A  B  X  Y","X/Space  Z  C  V"},
+  {"L  R  ZL  ZR","Q  E  1  3"}, {"+  -","Enter  Backspace"}, {"Controller","Xbox (XInput) pad"}};
+static const char* const cw_fkeys[][2]={
+  {"F1","This page"}, {"F3","Screenshot"}, {"F4","FPS limit on/off"}, {"F5","Diagnostic trace"},
+  {"F7","Record video"}, {"F8","Full resolution capture"}, {"F11","Fullscreen"}, {"Esc","Quit the game"}};
+static int cw_sel;
+static HFONT cw_font(int px, int weight){ return CreateFontA(-px,0,0,0,weight,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,"Segoe UI"); }
+static void cw_value(int i, char* o, size_t n){
+  switch(i){
+    case 0: snprintf(o,n,"%s",g_mouse_mode?"Mouse":"I J K L keys"); break;
+    case 1: snprintf(o,n,"%s",inversion_names[g_mouse_invert&3]); break;
+    case 2: snprintf(o,n,"%s%ld%%%s",g_mouse_sensitivity>10?"<  ":"",g_mouse_sensitivity,g_mouse_sensitivity<500?"  >":""); break;
+    default: snprintf(o,n,"%s",g_opt_audio_slowdown?"On":"Off"); } }
+static void cw_change(int i, int dir){
+  extern void ini_set(const char*,const char*); char value[8];
+  if(i==0){ g_mouse_mode=!g_mouse_mode; snprintf(value,sizeof value,"%ld",g_mouse_mode); ini_set("mouse_right_stick",value); }
+  else if(i==1){ g_mouse_invert=(g_mouse_invert+(dir<0?3:1))&3; snprintf(value,sizeof value,"%ld",g_mouse_invert); ini_set("mouse_invert",value); }
+  else if(i==2){ LONG n= dir==0? 100 : g_mouse_sensitivity+dir*10; if(n<10) n=10; if(n>500) n=500; g_mouse_sensitivity=n;
+    snprintf(value,sizeof value,"%.2f",n/100.0); ini_set("mouse_sensitivity",value); }
+  else { g_opt_audio_slowdown=!g_opt_audio_slowdown; ini_set("audio_slowdown",g_opt_audio_slowdown?"1":"0"); } }
+static void cw_rect(HDC dc, int x, int y, int w, int h, COLORREF c){ RECT r={x,y,x+w,y+h}; HBRUSH b=CreateSolidBrush(c); FillRect(dc,&r,b); DeleteObject(b); }
+static void cw_text(HDC dc, HFONT f, const char* t, int x, int y, int w, int h, UINT fmt, COLORREF c){
+  RECT r={x,y,x+w,y+h}; SelectObject(dc,f); SetTextColor(dc,c); DrawTextA(dc,t,-1,&r,fmt|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX); }
+/* a round button hint like the recompiler's bottom bar: dark circle with the letter, then the action */
+static int cw_hint(HDC dc, HFONT fl, HFONT ft, int right, int y, const char* key, const char* what){
+  SIZE sz; SelectObject(dc,ft); GetTextExtentPoint32A(dc,what,(int)strlen(what),&sz);
+  int x=right-sz.cx; cw_text(dc,ft,what,x,y-16,sz.cx+2,32,DT_LEFT,RGB(45,45,45));
+  HBRUSH b=CreateSolidBrush(RGB(45,45,45)); HPEN pn=(HPEN)GetStockObject(NULL_PEN); SelectObject(dc,b); SelectObject(dc,pn);
+  int cx=x-24; Ellipse(dc,cx-14,y-14,cx+15,y+15); DeleteObject(b);
+  cw_text(dc,fl,key,cx-14,y-15,29,29,DT_CENTER,RGB(255,255,255));
+  return cx-30; }
+static void cw_paint(HWND h){
+  PAINTSTRUCT ps; HDC wdc=BeginPaint(h,&ps);
+  HDC dc=CreateCompatibleDC(wdc); HBITMAP bm=CreateCompatibleBitmap(wdc,CW_W,CW_H); HGDIOBJ obm=SelectObject(dc,bm);
+  SetBkMode(dc,TRANSPARENT);
+  HFONT fh=cw_font(30,FW_NORMAL), fb=cw_font(21,FW_NORMAL), fs=cw_font(17,FW_NORMAL), fk=cw_font(16,FW_SEMIBOLD);
+  const COLORREF bg=RGB(235,235,235), text=RGB(45,45,45), dim=RGB(130,130,130), accent=RGB(8,175,200), sep=RGB(205,205,205);
+  cw_rect(dc,0,0,CW_W,CW_H,bg);
+  cw_text(dc,fh,"Controls",40,18,500,48,DT_LEFT,text);
+  cw_rect(dc,20,66,CW_W-40,1,text);
+  static const char* const names[CW_NOPT]={"Right stick","Mouse direction","Mouse sensitivity","Smooth audio slowdown"};
+  for(int i=0;i<CW_NOPT;i++){ int y=CW_LIST_Y+i*CW_ROW; char v[64]; cw_value(i,v,sizeof v);
+    if(i) cw_rect(dc,40,y,CW_W-80,1,sep);
+    cw_text(dc,fb,names[i],64,y,360,CW_ROW,DT_LEFT,text);
+    cw_text(dc,fb,v,CW_W-380,y,316,CW_ROW,DT_RIGHT,accent); }
+  { /* the selected row: cyan frame with round corners, like the recompiler's cursor */
+    int y=CW_LIST_Y+cw_sel*CW_ROW; HPEN pn=CreatePen(PS_SOLID,4,accent); SelectObject(dc,pn); SelectObject(dc,GetStockObject(NULL_BRUSH));
+    RoundRect(dc,38,y-1,CW_W-38,y+CW_ROW+2,10,10); DeleteObject(pn); }
+  int ky=CW_LIST_Y+CW_NOPT*CW_ROW+22;
+  cw_text(dc,fs,"KEYBOARD",64,ky,300,24,DT_LEFT,dim); cw_text(dc,fs,"KEYS",410,ky,300,24,DT_LEFT,dim);
+  for(int i=0;i<7;i++){ int y=ky+28+i*28;
+    cw_text(dc,fs,cw_keys[i][0],64,y,120,28,DT_LEFT,text); cw_text(dc,fs,cw_keys[i][1],170,y,220,28,DT_LEFT,accent); }
+  for(int i=0;i<8;i++){ int y=ky+28+i*28;
+    cw_text(dc,fs,cw_fkeys[i][0],410,y,50,28,DT_LEFT,accent); cw_text(dc,fs,cw_fkeys[i][1],460,y,260,28,DT_LEFT,text); }
+  cw_rect(dc,30,CW_H-60,CW_W-60,1,text);
+  int x=cw_hint(dc,fk,fb,CW_W-40,CW_H-30,"A","Change");
+  cw_hint(dc,fk,fb,x-20,CW_H-30,"B","Back");
+  cw_text(dc,fs,"Esc or F1: back to the game",40,CW_H-46,300,32,DT_LEFT,dim);
+  BitBlt(wdc,0,0,CW_W,CW_H,dc,0,0,SRCCOPY);
+  DeleteObject(fh); DeleteObject(fb); DeleteObject(fs); DeleteObject(fk);
+  SelectObject(dc,obm); DeleteObject(bm); DeleteDC(dc); EndPaint(h,&ps); }
 static LRESULT CALLBACK controls_proc(HWND h,UINT m,WPARAM w,LPARAM l){
-  if(m==WM_COMMAND){ int id=LOWORD(w); extern void ini_set(const char*,const char*); char value[8];
-    if(id==101){ g_mouse_mode=!g_mouse_mode; snprintf(value,sizeof value,"%ld",g_mouse_mode); ini_set("mouse_right_stick",value); controls_labels(h); return 0; }
-    if(id==102){ g_mouse_invert=(g_mouse_invert+1)&3; snprintf(value,sizeof value,"%ld",g_mouse_invert); ini_set("mouse_invert",value); controls_labels(h); return 0; }
-    if(id>=104 && id<=106){
-      LONG n=id==106?100:g_mouse_sensitivity+(id==104?-10:10); if(n<10) n=10; if(n>500) n=500; g_mouse_sensitivity=n;
-      snprintf(value,sizeof value,"%.2f",n/100.0); ini_set("mouse_sensitivity",value); controls_labels(h); return 0;
-    }
-    if(id==107){ g_opt_audio_slowdown=!g_opt_audio_slowdown; ini_set("audio_slowdown",g_opt_audio_slowdown?"1":"0"); controls_labels(h); return 0; }
-    if(id==IDOK || id==IDCANCEL){ DestroyWindow(h); return 0; }
-  }
-  if(m==WM_CLOSE){ DestroyWindow(h); return 0; }
-  return DefWindowProcA(h,m,w,l);
-}
+  switch(m){
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: cw_paint(h); return 0;
+    case WM_KEYDOWN:
+      if(w==VK_ESCAPE || w==VK_F1 || w==VK_BACK || w=='Z'){ DestroyWindow(h); return 0; }
+      if(w==VK_UP || w=='W'){ if(cw_sel>0) cw_sel--; }
+      else if(w==VK_DOWN || w=='S'){ if(cw_sel<CW_NOPT-1) cw_sel++; }
+      else if(w==VK_LEFT || w=='A') cw_change(cw_sel,-1);
+      else if(w==VK_RIGHT || w=='D' || w==VK_RETURN || w==VK_SPACE || w=='X') cw_change(cw_sel,+1);
+      else if(w=='R' && cw_sel==2) cw_change(2,0);
+      InvalidateRect(h,NULL,FALSE); return 0;
+    case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: {
+      int x=(short)LOWORD(l), y=(short)HIWORD(l), i=(y-CW_LIST_Y)/CW_ROW;
+      if(y>=CW_LIST_Y && i>=0 && i<CW_NOPT && x>=38 && x<CW_W-38){
+        if(i!=cw_sel){ cw_sel=i; InvalidateRect(h,NULL,FALSE); }
+        /* sensitivity: the left half lowers it, the right half raises it */
+        if(m!=WM_MOUSEMOVE){ cw_change(i, m==WM_RBUTTONDOWN? -1 : i==2 && x<CW_W/2? -1 : +1); InvalidateRect(h,NULL,FALSE); } }
+      else if(m==WM_LBUTTONDOWN && y>CW_H-60) DestroyWindow(h);
+      return 0; }
+    case WM_CLOSE: DestroyWindow(h); return 0; }
+  return DefWindowProcA(h,m,w,l); }
 static void show_controls(void){
   int fs=g_fullscreen; g_controls_open=1; keys_held=0; mouse_capture(); if(fs) set_fullscreen(0);
   HINSTANCE hi=GetModuleHandle(NULL); WNDCLASSA wc={0}; wc.lpfnWndProc=controls_proc; wc.hInstance=hi;
-  wc.hCursor=LoadCursor(NULL,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1); wc.lpszClassName="SwitchRecompControls"; RegisterClassA(&wc);
-  RECT parent; GetWindowRect(g_hwnd,&parent); RECT r={0,0,710,460}; AdjustWindowRect(&r,WS_CAPTION|WS_SYSMENU,FALSE);
-  HWND h=CreateWindowA(wc.lpszClassName,"SwitchRecomp - Controls",WS_CAPTION|WS_SYSMENU,
-    parent.left+20,parent.top+20,r.right-r.left,r.bottom-r.top,g_hwnd,NULL,hi,NULL);
-  HFONT font=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
-  HWND text=CreateWindowA("STATIC",HELP,WS_CHILD|WS_VISIBLE,16,12,680,280,h,NULL,hi,NULL); SendMessage(text,WM_SETFONT,(WPARAM)font,TRUE);
-  const char* labels[]={"", "", "Back to game"}; int ids[]={101,102,IDOK};
-  for(int i=0;i<3;i++){ HWND b=CreateWindowA("BUTTON",labels[i],WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,16+i*230,315,220,34,h,(HMENU)(INT_PTR)ids[i],hi,NULL); SendMessage(b,WM_SETFONT,(WPARAM)font,TRUE); }
-  HWND sensitivity=CreateWindowA("STATIC","",WS_CHILD|WS_VISIBLE|SS_CENTER,106,369,200,22,h,(HMENU)(INT_PTR)103,hi,NULL); SendMessage(sensitivity,WM_SETFONT,(WPARAM)font,TRUE);
-  const char* speed_labels[]={"-", "+", "Reset to 100%"}; int speed_x[]={16,316,406},speed_width[]={80,80,280};
-  for(int i=0;i<3;i++){ HWND b=CreateWindowA("BUTTON",speed_labels[i],WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,speed_x[i],360,speed_width[i],34,h,(HMENU)(INT_PTR)(104+i),hi,NULL); SendMessage(b,WM_SETFONT,(WPARAM)font,TRUE); }
-  HWND audio=CreateWindowA("BUTTON","",WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,16,405,670,34,h,(HMENU)(INT_PTR)107,hi,NULL); SendMessage(audio,WM_SETFONT,(WPARAM)font,TRUE);
-  controls_labels(h); EnableWindow(g_hwnd,FALSE); ShowWindow(h,SW_SHOW); SetFocus(GetDlgItem(h,101));
-  MSG msg; while(IsWindow(h) && GetMessageA(&msg,NULL,0,0)>0){ if(!IsDialogMessageA(h,&msg)){ TranslateMessage(&msg); DispatchMessageA(&msg); } }
+  wc.hCursor=LoadCursor(NULL,IDC_ARROW); wc.hbrBackground=NULL; wc.lpszClassName="SwitchRecompControls"; RegisterClassA(&wc);
+  RECT parent; GetWindowRect(g_hwnd,&parent); RECT r={0,0,CW_W,CW_H}; AdjustWindowRect(&r,WS_CAPTION|WS_SYSMENU,FALSE);
+  int ww=r.right-r.left, wh=r.bottom-r.top, x=(parent.left+parent.right-ww)/2, y=(parent.top+parent.bottom-wh)/2; if(x<0) x=0; if(y<0) y=0;
+  HWND h=CreateWindowA(wc.lpszClassName,"SwitchRecomp - Controls",WS_CAPTION|WS_SYSMENU,x,y,ww,wh,g_hwnd,NULL,hi,NULL);
+  EnableWindow(g_hwnd,FALSE); ShowWindow(h,SW_SHOW); SetFocus(h);
+  MSG msg; while(IsWindow(h) && GetMessageA(&msg,NULL,0,0)>0){ TranslateMessage(&msg); DispatchMessageA(&msg); }
   EnableWindow(g_hwnd,TRUE); SetForegroundWindow(g_hwnd); if(fs) set_fullscreen(1); g_controls_open=0; keys_held=0; mouse_capture();
 }
 static u64 keymap(WPARAM k){

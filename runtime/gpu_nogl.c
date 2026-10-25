@@ -5,7 +5,7 @@
 #include "gpu.h"
 int g_gl=0; u64 g_draws;
 
-int gpu_async_submit(u64* e, u32 n, u32 syncpt, u32 incs){ (void)e;(void)n;(void)syncpt;(void)incs; return 0; }
+int gpu_async_submit(u64* e, u32 n, u32 syncpt, u32 incs, u32 wid, u32 wval){ (void)e;(void)n;(void)syncpt;(void)incs;(void)wid;(void)wval; return 0; }
 
 void gpu_gl_present_buffer(u64 a, u32 w, u32 h, u32 p, u32 l, u32 b, u32 f){ (void)a;(void)w;(void)h;(void)p;(void)l;(void)b;(void)f; }
 
@@ -38,6 +38,8 @@ void gpu_gl_dispatch(void* ch, const void* q, unsigned long long code){ (void)ch
 volatile int g_cs_any; void cs_mem_need(u64 a, u64 n){ (void)a; (void)n; }
 
 void gpu_gl_before_syncwait(void){}
+
+void gpu_gl_stall_report(void){}
 int gpu_gl_hold_write(u64 addr, const void* data, u32 len){ (void)addr; (void)data; (void)len; return 0; }
 int gpu_gl_hold_reduce(u64 addr, u32 op, u32 payload, int is_signed){ (void)addr; (void)op; (void)payload; (void)is_signed; return 0; }
 

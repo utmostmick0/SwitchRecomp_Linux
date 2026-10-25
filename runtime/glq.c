@@ -77,10 +77,12 @@ static void q_sync_ex(void* p){ QSync* s=*(QSync**)p; s->ex(s->arg); __atomic_st
 
 static int q_sync_ready(void* p){ return __atomic_load_n(&((QSync*)p)->done,__ATOMIC_SEQ_CST); }
 
+static volatile u64 g_wait_t0; static const char* volatile g_wait_name;   /* the GPU thread waiting on a sync call */
+
 void glq_sync(void (*ex)(void*), void* arg){
   if(t_glq_direct || !g_active){ ex(arg); return; }
   QSync s={ex,arg,0}; QSync** p=(QSync**)glq_alloc(sizeof(QSync*),0,q_sync_ex); *p=&s; glq_commit();
-  q_wait(q_sync_ready,&s); }
+  g_wait_t0=plat_ns(); q_wait(q_sync_ready,&s); g_wait_t0=0; g_wait_name=NULL; }
 
 /* every call that returns something waits until the GL thread ran everything queued before it, so one in the
    middle of a frame costs the whole queue. I count them per function (time spent waiting) for the performance
@@ -90,7 +92,7 @@ static SyncStat g_ss[48];
 
 void glq_sync_n(void (*ex)(void*), void* arg, const char* name){
   if(t_glq_direct || !g_active){ ex(arg); return; }
-  u64 t0=plat_ns(); glq_sync(ex,arg); u64 dt=plat_ns()-t0;
+  u64 t0=plat_ns(); g_wait_name=name; glq_sync(ex,arg); u64 dt=plat_ns()-t0;
   for(int i=0;i<48;i++){ if(g_ss[i].n==name || !g_ss[i].n){ g_ss[i].n=name; g_ss[i].cnt++; g_ss[i].ns+=dt; break; } } }
 
 /* "glGetUniformLocation 12x 3.1ms, ..." for the worst ones since the last call, then reset */
@@ -125,10 +127,6 @@ void APIENTRY q_glGenBuffers(GLsizei n, GLuint* p){ q_gen(1,n,p); }
 void APIENTRY q_glGenSamplers(GLsizei n, GLuint* p){ q_gen(2,n,p); }
 void APIENTRY q_glGenFramebuffers(GLsizei n, GLuint* p){ q_gen(3,n,p); }
 void APIENTRY q_glGenVertexArrays(GLsizei n, GLuint* p){ q_gen(4,n,p); }
-
-static void q_nop(void* arg){ (void)arg; }
-
-void glq_finish_all(void){ if(g_active && !t_glq_direct) glq_sync(q_nop,NULL); }
 
 /* ---------- unpack state, needed to know how many bytes to copy */
 static GLint g_un_align=4, g_un_row=0, g_un_imgh=0, g_un_skp=0, g_un_skr=0, g_un_ski=0; static GLuint g_un_pbo;
@@ -323,6 +321,8 @@ void* glq_proc(const char* n){
    on a different shader every run, then everything after the first crash crashed too). with this on they take
    turns: the GL thread holds the lock while it runs a batch, the compile thread while it compiles */
 static PMutex g_drv; static volatile int g_drv_on;
+static volatile int g_drv_who;   /* 1 while the GL thread is inside the driver, for the stall report */
+static volatile u64 g_batch_t0; static void (* volatile g_cur_ex)(void*);
 void glq_excl(void){ if(g_drv_on) return; pm_init(&g_drv); __atomic_store_n(&g_drv_on,1,__ATOMIC_RELEASE); }
 int glq_drv_lock(void){ if(!__atomic_load_n(&g_drv_on,__ATOMIC_ACQUIRE)) return 0; pm_lock(&g_drv); return 1; }
 void glq_drv_unlock(void){ pm_unlock(&g_drv); }
@@ -342,21 +342,36 @@ static void gl_thread(void* arg){ (void)arg;
   for(;;){
     u64 h=__atomic_load_n(&g_qh,__ATOMIC_ACQUIRE), t=g_qt;
     if(t==h){
-      if(g_vf_list) q_poll_fences();
+      /* the fence poll is a driver call too, so it takes the lock like a batch. without it the poll ran while the
+         compile thread was inside the driver and tomodachi froze on intel a few seconds after its first compute */
+      if(g_vf_list){ int lk=glq_drv_lock(); g_drv_who=1; q_poll_fences(); g_drv_who=0; if(lk) glq_drv_unlock(); }
       { extern int plat_ncpu(void); static u64 spin; if(!spin) spin= plat_ncpu()<=2? 15000 : 50000;   /* less on 2 cores, the game needs them */
         u64 t0=plat_ns(); while(__atomic_load_n(&g_qh,__ATOMIC_ACQUIRE)==t && plat_ns()-t0<spin) cpu_relax(); }   /* then sleep on g_qc (woken by glq_commit) */
       if(__atomic_load_n(&g_qh,__ATOMIC_ACQUIRE)!=t) continue;
       pm_lock(&g_qm); __atomic_store_n(&g_sleeping,1,__ATOMIC_RELEASE);
       if(__atomic_load_n(&g_qh,__ATOMIC_ACQUIRE)==t) pc_wait(&g_qc,&g_qm, g_vf_list? 500000 : 2000000);
       __atomic_store_n(&g_sleeping,0,__ATOMIC_RELEASE); pm_unlock(&g_qm); continue; }
-    int lk=glq_drv_lock();
+    int lk=glq_drv_lock(); g_drv_who=1; g_batch_t0=plat_ns();
     while(t!=h){
       QHdr* hd=(QHdr*)(g_q+t%Q_CAP); u32 sz=hd->size;
-      hd->ex(hd->data); if(hd->big) free(hd->data);
+      g_cur_ex=hd->ex; hd->ex(hd->data); if(hd->big) free(hd->data);
       t+=sz; __atomic_store_n(&g_qt,t,__ATOMIC_RELEASE);
       if(((++n)&255)==0 && g_vf_list) q_poll_fences(); }
-    if(lk) glq_drv_unlock();
+    g_batch_t0=0; g_drv_who=0; if(lk) glq_drv_unlock();
   } }
+
+/* one line for the stall dump: is the GL thread stuck inside the driver, idle, or waiting for the driver lock */
+void glq_stall_report(char* out, size_t cap){
+  out[0]=0; if(!g_active){ snprintf(out,cap,"off"); return; }
+  u64 h=__atomic_load_n(&g_qh,__ATOMIC_ACQUIRE), t=__atomic_load_n(&g_qt,__ATOMIC_ACQUIRE), b0=g_batch_t0;
+  int o=snprintf(out,cap,"%.1f KB queued, ",(h-t)/1024.0);
+  if(b0){ char m[64]; u64 off=0; void* ex=(void*)g_cur_ex;
+    if(!plat_addr_module((u64)(uintptr_t)ex,m,sizeof m,&off)) snprintf(m,sizeof m,"?");
+    snprintf(out+o,cap-o,"in a batch for %.0f ms (call at %s+%llx)",(plat_ns()-b0)/1e6,m,(unsigned long long)off); }
+  else if(h!=t) snprintf(out+o,cap-o,"waiting for the driver lock");
+  else snprintf(out+o,cap-o,"idle%s",g_vf_list? ", polling fences" : "");
+  u64 w0=g_wait_t0; const char* wn=g_wait_name; size_t l=strlen(out);
+  if(w0 && l<cap) snprintf(out+l,cap-l,", the GPU thread waits on it for %.0f ms (%s)",(plat_ns()-w0)/1e6,wn? wn : "sync call"); }
 
 int glq_start(void){
   if(getenv("SWR_NO_GLQ") || !backend_glq_ok()) return 0;

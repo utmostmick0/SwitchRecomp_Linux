@@ -78,6 +78,35 @@ The cumulative beta patch is `patches/milestone-005-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-006-main-to-beta.patch`.
 
+## Milestone 007 — v190 runtime and recompiler fixes
+
+- Synchronized the v190 shared source fixes from beta: GPU color-mask defaults, GPU-side depth copies, queued GPU
+  fence waits, compute-dispatch profiling, and GL/shader stall diagnostics.
+- Applied the same runtime and recompiler fixes to the Flatpak source tree while retaining its Flatpak-specific
+  launcher, data paths, and package manifest.
+- The Flatpak runtime binary has not been rebuilt for this milestone.
+
+The cumulative beta patch is `patches/milestone-007-main-to-beta.patch`.
+
+## Milestone 008 — synchronous render-target flushes before GPU copies
+
+- Synced the shared runtime fix from beta: render-target flushes before DMA/2D copies now wait for the current image,
+  preventing a delayed PBO readback from overwriting newer guest-memory pixels.
+- This addresses the SMO log sequence where the corner-video buffer was repeatedly copied while asynchronous readbacks
+  targeted a render-target view at the same guest address.
+- The rebuilt beta runtime is ready for visual testing; Flatpak's runtime should be rebuilt from this shared source.
+
+The cumulative beta patch is `patches/milestone-008-main-to-beta.patch`.
+
+## Milestone 009 — preserve GPU-written render targets during texture lookup
+
+- Synced the beta cache fix: texture lookup now keeps GPU-written render targets despite stale guest-memory signatures,
+  and clears that ownership marker after synchronized memory/render-target transfers.
+- The change targets SMO's repeated log message dropping its 1600x900 background render target at `0x50fbd0000`.
+- Rebuild the Flatpak runtime from this shared source after beta's visual retest.
+
+The cumulative beta patch is `patches/milestone-009-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

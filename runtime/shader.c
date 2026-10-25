@@ -236,8 +236,6 @@ static char* opB(Ctx* c, u64 w, int kind){ switch(kind){ case 0: return R(c,B(w,
 
 static char* opBf(Ctx* c, u64 w, int kind){ switch(kind){ case 0: return RF(c,B(w,20,8)); case 1: return CBF(c,cb_idx(w),cb_off(w)); case 2: return imm20f(w); case 3: return imm32f(w); default: return RF(c,B(w,39,8)); } }
 
-static int kind_of(int id, int base){ return id-base; }
-
 static char* fneg_abs(const char* e, int neg, int abs){ const char* x=e; if(abs) x=T("abs(%s)",x); if(neg) x=T("(-%s)",x); return (char*)x; }
 
 static char* fsat(const char* e, int sat){ return sat? T("clamp(%s,0.0,1.0)",e) : (char*)e; }

@@ -152,13 +152,6 @@ void swr_audio_submit_at(const float* samples,unsigned frames,u64 sample_end){
     done+=accepted; if(done<frames) plat_sleep_ns(1000000);
   }
 }
-void swr_audio_submit(const float* samples,unsigned frames){
-#if defined(SWR_RECORD_AUDIO)
-  extern u64 guest_ns(void); swr_audio_submit_at(samples,frames,guest_ns());
-#else
-  swr_audio_submit_at(samples,frames,0);
-#endif
-}
 #define NV 4096
 #define NM 64
 #define NC 24
