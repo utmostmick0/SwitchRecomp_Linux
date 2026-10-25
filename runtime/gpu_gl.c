@@ -90,8 +90,12 @@ static GlFmt tic_format(u32 w0, int srgb){
     case 0x02: r= F(GL_RGB32F,GL_RGB,GL_FLOAT,12); break;
     case 0x03: r= flt? F(GL_RGBA16F,GL_RGBA,GL_HALF_FLOAT,8) : sn? F(GL_RGBA16_SNORM,GL_RGBA,GL_SHORT,8) : ui? F(GL_RGBA16UI,GL_RGBA_INTEGER,GL_UNSIGNED_SHORT,8) : si? F(GL_RGBA16I,GL_RGBA_INTEGER,GL_SHORT,8) : F(GL_RGBA16,GL_RGBA,GL_UNSIGNED_SHORT,8); break;
     case 0x04: r= flt? F(GL_RG32F,GL_RG,GL_FLOAT,8) : ui? F(GL_RG32UI,GL_RG_INTEGER,GL_UNSIGNED_INT,8) : F(GL_RG32I,GL_RG_INTEGER,GL_INT,8); break;
+    /* ETC2/EAC are core in OpenGL 4.3. Preserve their 4x4 blocks on upload. */
+    case 0x06: r=FC(srgb? 0x9275 : 0x9274,8); break; /* ETC2 RGB8 */
     case 0x07: case 0x08: r= sn? F(GL_RGBA8_SNORM,GL_RGBA,GL_BYTE,4) : ui? F(GL_RGBA8UI,GL_RGBA_INTEGER,GL_UNSIGNED_BYTE,4) : si? F(GL_RGBA8I,GL_RGBA_INTEGER,GL_BYTE,4) : F(srgb? GL_SRGB8_ALPHA8 : GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE,4); break;
     case 0x09: r= ui? F(GL_RGB10_A2UI,GL_RGBA_INTEGER,GL_UNSIGNED_INT_2_10_10_10_REV,4) : F(GL_RGB10_A2,GL_RGBA,GL_UNSIGNED_INT_2_10_10_10_REV,4); break;
+    case 0x0A: r=FC(srgb? 0x9277 : 0x9276,8); break; /* ETC2 RGB8 punch-through alpha */
+    case 0x0B: r=FC(srgb? 0x9279 : 0x9278,16); break; /* ETC2 RGBA8 / EAC alpha */
     case 0x0C: r= flt? F(GL_RG16F,GL_RG,GL_HALF_FLOAT,4) : sn? F(GL_RG16_SNORM,GL_RG,GL_SHORT,4) : ui? F(GL_RG16UI,GL_RG_INTEGER,GL_UNSIGNED_SHORT,4) : si? F(GL_RG16I,GL_RG_INTEGER,GL_SHORT,4) : F(GL_RG16,GL_RG,GL_UNSIGNED_SHORT,4); break;
     case 0x0F: r= flt? F(GL_R32F,GL_RED,GL_FLOAT,4) : ui? F(GL_R32UI,GL_RED_INTEGER,GL_UNSIGNED_INT,4) : F(GL_R32I,GL_RED_INTEGER,GL_INT,4); break;
     case 0x12: r= F(GL_RGBA4,GL_RGBA,GL_UNSIGNED_SHORT_4_4_4_4_REV,2); break;
@@ -99,6 +103,8 @@ static GlFmt tic_format(u32 w0, int srgb){
     case 0x15: r= F(GL_RGB565,GL_RGB,GL_UNSIGNED_SHORT_5_6_5_REV,2); break;
     case 0x16: r= F(GL_RGB565,GL_RGB,GL_UNSIGNED_SHORT_5_6_5,2); break;
     case 0x18: r= sn? F(GL_RG8_SNORM,GL_RG,GL_BYTE,2) : ui? F(GL_RG8UI,GL_RG_INTEGER,GL_UNSIGNED_BYTE,2) : si? F(GL_RG8I,GL_RG_INTEGER,GL_BYTE,2) : F(GL_RG8,GL_RG,GL_UNSIGNED_BYTE,2); break;
+    case 0x19: r=FC(sn? 0x9271 : 0x9270,8); break; /* EAC R11 */
+    case 0x1A: r=FC(sn? 0x9273 : 0x9272,16); break; /* EAC RG11 */
     case 0x1B: r= flt? F(GL_R16F,GL_RED,GL_HALF_FLOAT,2) : sn? F(GL_R16_SNORM,GL_RED,GL_SHORT,2) : ui? F(GL_R16UI,GL_RED_INTEGER,GL_UNSIGNED_SHORT,2) : si? F(GL_R16I,GL_RED_INTEGER,GL_SHORT,2) : F(GL_R16,GL_RED,GL_UNSIGNED_SHORT,2); break;
     case 0x1D: case 0x1C: r= sn? F(GL_R8_SNORM,GL_RED,GL_BYTE,1) : ui? F(GL_R8UI,GL_RED_INTEGER,GL_UNSIGNED_BYTE,1) : si? F(GL_R8I,GL_RED_INTEGER,GL_BYTE,1) : F(GL_R8,GL_RED,GL_UNSIGNED_BYTE,1); break;
     case 0x20: r= F(GL_RGB9_E5,GL_RGB,GL_UNSIGNED_INT_5_9_9_9_REV,4); break;
@@ -119,7 +125,6 @@ static GlFmt tic_format(u32 w0, int srgb){
     case 0x2F: r= FD(GL_DEPTH_COMPONENT32F,GL_DEPTH_COMPONENT,GL_FLOAT,4); break;
     case 0x30: r= FD(GL_DEPTH32F_STENCIL8,GL_DEPTH_STENCIL,GL_FLOAT_32_UNSIGNED_INT_24_8_REV,8); break;   /* ZF32_X24S8 */
     case 0x3A: r= FD(GL_DEPTH_COMPONENT16,GL_DEPTH_COMPONENT,GL_UNSIGNED_SHORT,2); break;
-    case 0x19: r= FD(GL_DEPTH32F_STENCIL8,GL_DEPTH_STENCIL,GL_FLOAT_32_UNSIGNED_INT_24_8_REV,8); break;
     default: r= F(GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE,4); r.bpp=0; { static u32 said[4]; int k; for(k=0;k<4&&said[k]!=f+1;k++); if(k==4){ for(k=0;k<4&&said[k];k++); if(k<4){ said[k]=f+1; WARN("gpu: unsupported texture format %x (ignored)\n",f); } } } break;
   }
   if(r.astc && srgb) r.ifmt=GL_SRGB8_ALPHA8;
