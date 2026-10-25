@@ -7,7 +7,7 @@
 /* the runtime version goes in every log, so you can tell a crash report from an old or third party build by the
    first line */
 #ifndef SWR_RUNTIME_VERSION
-#define SWR_RUNTIME_VERSION "v190"
+#define SWR_RUNTIME_VERSION "v190-sonic-cbuf"
 #endif
 const char* g_runtime_version=SWR_RUNTIME_VERSION;
 #include "rt.h"
@@ -456,16 +456,17 @@ int swr_main(int argc, char** argv){
     if(++tick%300==0) save_hints();
     /* dump thread states to threads.txt every 15s, useful when something hangs */
     if(tick%900==0){ extern __thread FILE* g_log_redirect; extern void kernel_dump_threads(void); char p[1200]; snprintf(p,sizeof p,"%sthreads.txt",g_exedir);
-      FILE* f=fopen(p,"w"); if(f){ fprintf(f,"second %d, frames %d\n",tick/60,g_frames); g_log_redirect=f; kernel_dump_threads(); g_log_redirect=NULL; fclose(f); } }
+      FILE* f=fopen(p,"w"); if(f){ extern void gpu_gl_stall_report(void); fprintf(f,"second %d, frames %d\n",tick/60,g_frames); g_log_redirect=f; gpu_gl_stall_report(); kernel_dump_threads(); g_log_redirect=NULL; fclose(f); } }
     /* auto diag only with diag=1, F5 always works */
     { extern int g_opt_diag; if(g_opt_diag && (tick==60*20 || tick==60*40)){ extern void gpu_gl_dump_rts(void); gpu_gl_dump_rts(); } }
     /* after jumping out of a driver crash the driver can keep a lock it never lets go of, and the game just stops
        with no image. the shader is on the skip list already, so close with a message instead of hanging forever */
     { extern volatile int g_driver_recovered; static int lf=-1, still; if(!g_driver_recovered || g_frames!=lf){ lf=g_frames; still=0; }
-      else if(++still==60*8) fatal("The video driver crashed while compiling a shader and stopped responding.\nThat shader is on the skip list now, open the game again.\n(if it keeps happening, update the video driver)"); }
+      else if(++still==60*8) fatal("The video driver crashed while compiling a shader and stopped responding.\nThat shader is on the skip list now, open the game again: from now on this game compiles\nits shaders in a separate process, so a driver crash can't stop it.\n(if it keeps happening, update the video driver)"); }
     { static int last_frames=-1, still=0, dumps=0; if(g_frames!=last_frames){ last_frames=g_frames; still=0; }
-      else if(++still==60*15 && dumps<4){ dumps++; still=0; extern void kernel_dump_threads_stall(void);
-        LOG("warning: %d s without a new image (frames=%d, GPU submits=%llu)\n",15,g_frames,(unsigned long long)g_gpu_submits); kernel_dump_threads_stall(); } }
+      /* the first dump after 6 s: people close a frozen game before 15 */
+      else if(++still==60*(dumps? 15 : 6) && dumps<4){ int sec= dumps? 15 : 6; dumps++; still=0; extern void kernel_dump_threads_stall(void);
+        LOG("warning: %d s without a new image (frames=%d, GPU submits=%llu)\n",sec,g_frames,(unsigned long long)g_gpu_submits); kernel_dump_threads_stall(); } }
     next+=16666667ull; u64 now=plat_ns(); if(next>now) plat_sleep_ns((i64)(next-now)); else if(now-next>100000000ull) next=now;
   }
   save_hints(); { extern void gpu_gl_rec_finish(void); gpu_gl_rec_finish(); } LOG("Exit.\n"); fflush(NULL);

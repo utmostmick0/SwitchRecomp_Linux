@@ -12,5 +12,5 @@ void glq_swap(void);                        /* queued swap, never more than one 
 int glq_worker_current(void);               /* worker context current + bypass the queue on this thread */
 u64  glq_thread_cpu_ns(void);   /* CPU time used by the GL thread so far */
 void glq_sync_report(char* out, size_t cap, u32 frames);   /* worst blocking GL calls since the last report */
-void glq_finish_all(void);                  /* block until the GL thread drained the queue */
+void glq_stall_report(char* out, size_t cap);   /* GL thread state for the stall dump */
 #endif

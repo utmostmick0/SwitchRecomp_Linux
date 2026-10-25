@@ -37,6 +37,33 @@ almost black with shadows=0).
 F5 traces: the first line says the GPU, driver and render scale, and the values of small textures (exposure, LUTs)
 are read correctly now (they all read 0 before).
 Linux: SwitchRecomp-v190-x86_64.AppImage. It unpacks itself into ~/.local/share/SwitchRecomp the first time.
+Intel on Windows: Tomodachi Life froze a few seconds after it started using compute shaders. The GL thread checked
+the compute fences without the driver lock while the compile thread was inside the driver. It takes the lock now,
+and a compute result that never comes back can't hold the game's fences for more than 4 s.
+When the image stops for 15 s the log also says what the GPU thread, the GL thread and the compile thread are doing.
+Install.bat (Windows) and Install.sh (Linux) download what's missing into the SwitchRecomp folder, with internet and
+nothing else to do (no admin rights, no password): on Windows Python 3.14 (from NuGet) and GCC (from conda-forge),
+on Linux SDL2 (from PyPI) and GCC. Every download is checked against its SHA-256. The packages stay small (Python
+isn't in the Windows zip anymore). The tool runs them by itself too: Windows opens Install.bat when Python is
+missing, Linux gets SDL2 the first time it opens and GCC the first time you recompile.
+Intel on Windows: the shader helper process is off until the video driver crashes on a shader in that game (then
+it's on from the next run). With it always on, Tomodachi Life froze on a loading screen on Intel HD. shader_process=1
+in the ini still forces it on.
+When the image stops, the log dumps the thread state after 6 s instead of 15, and threads.txt also says what the GPU
+thread, the GL thread and the compile thread are doing.
+F1 (Windows): the controls page looks like the recompiler's settings now. Up/Down pick an option, Left/Right or
+Enter change it, a click changes it too, Esc or F1 goes back to the game.
+Sonic Frontiers: the lighting was black (only the HUD and a few emissive bits showed). The game copies its depth
+buffer with the 2D engine right after the gbuffer, and every lighting pass reads that copy. The copy came from
+memory, where the depth buffer never was, so the whole screen read as "far". The 2D engine copies depth buffers on
+the GPU now, as a depth texture with the same format.
+Code cleanup: removed functions and variables nothing used anymore (an old ASTC whole-image decoder, a draw capture
+nothing turned on, an unused audio submit, a GL queue flush and a few leftovers). The audio tests build again.
+performance.txt: every compute shader gets its own line in "GPU time of one frame" (key, workgroups, MB of buffers),
+it used to count for the pass after it.
+Images written by compute or fragment shaders go to the mip level their TIC asks for (res_min_mip_level). Sonic
+Frontiers builds its depth pyramid that way for the light culling, every level used to land in mip 0. F5 traces list
+the images each compute writes. SWR_NO_IMG_LEVEL=1 goes back to mip 0.
 
 LICENSE AND STARTUP SCREEN
 SwitchRecomp is now under the GNU AGPL v3 (LICENSE.txt) with additional terms in NOTICE.txt.
@@ -45,3 +72,5 @@ vanishes at the end): white logo on black with the copyright notice in the corne
 forks have to keep it.
 The Launcher is gone, the recompiler already does everything it did.
 Android (APK builds, touch controls, the GLES renderer) is gone from the code.
+
+- SubmitGpfifo with a wait fence no longer blocks the game thread: the GPU thread waits for the fence. Fixes apps that signal the fence from the CPU after submitting (official GBA emulator: 2 s per frame, black screen).

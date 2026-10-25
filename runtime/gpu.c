@@ -184,6 +184,9 @@ static GpuChannel* chan_get(u32 id){
   /* hw reset values that NVN/deko3d rely on and never write. sRGB writes are on by default, if not sRGB targets
      get stored linear and look too dark */
   c->r3d[0x4B8]=1;
+  /* gba classics leaves the color masks at reset. zero masks discarded every sprite, including the loading UI.
+     initialize once; explicit masks from the game still replace these values */
+  for(int i=0;i<8;i++) c->r3d[0x680+i]=0x1111;
   c->r3d[0x4E]=1; c->r3d[0x556]=1; /* render-enable reset: true */
   g_gpu.chan[g_gpu.nchan++]=c; return c; }
 
@@ -207,9 +210,10 @@ void gpu_init(void){ pm_init(&g_gpulock); gpu3d_init(); }
 /* with GL, submissions go to the GPU thread */
 volatile u64 g_gpu_submits;
 
-void gpu_submit(u64* e, u32 n, u32 channel, u32 incs){ g_gpu_submits++;
-  extern int gpu_async_submit(u64* e, u32 n, u32 syncpt, u32 incs);
-  if(gpu_async_submit(e,n,channel,incs)) return;
+void gpu_submit(u64* e, u32 n, u32 channel, u32 incs, u32 wait_id, u32 wait_val){ g_gpu_submits++;
+  extern int gpu_async_submit(u64* e, u32 n, u32 syncpt, u32 incs, u32 wait_id, u32 wait_val);
+  if(gpu_async_submit(e,n,channel,incs,wait_id,wait_val)) return;
+  if(wait_id!=~0u) syncpt_wait(wait_id,wait_val,2000000000);
   gpu_submit_now(e,n,channel);
   for(u32 i=0;i<incs;i++) syncpt_incr(channel);
 }

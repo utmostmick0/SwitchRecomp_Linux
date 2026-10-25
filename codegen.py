@@ -372,20 +372,3 @@ def interp_body(r, step):
     if k == 'brk': return 'c->pc=pc; c->rt->brk(c,pc,%s); return;' % r[1]
     raise ValueError(k)
 
-
-def emit_static_step(w, pc, name):
-    """single instruction as a function, used by the Unicorn tests"""
-    r = a64.emit_static(w, pc)
-    s = ['u64 %s(CPU* RESTRICT c){ u8* const M=c->mem; (void)M;' % name]
-    if r is None: s.append(' c->rt->undef(c,%s,%s); return %s;' % (lit(pc), lit(w), lit(pc)))
-    elif isinstance(r, str): s.append(' ' + fix_undef(r, pc, w) + ' return %s;' % lit(pc + 4))
-    else:
-        k = r[0]
-        if k == 'b': s.append(' return %s;' % lit(r[1]))
-        elif k == 'bc': s.append(' if(%s) return %s; return %s;' % (r[1], lit(r[2]), lit(pc + 4)))
-        elif k in ('bl',): s.append(' c->x[30]=%s; return %s;' % (lit(pc + 4), lit(r[1])))
-        elif k == 'blr': s.append(' { u64 t_=%s; c->x[30]=%s; return t_; }' % (r[1], lit(pc + 4)))
-        elif k in ('br', 'ret'): s.append(' return %s;' % r[1])
-        else: s.append(' return %s;' % lit(pc + 4))
-    s.append('}')
-    return '\n'.join(s)
