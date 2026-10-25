@@ -108,8 +108,9 @@ The cumulative beta patch is `patches/milestone-006-main-to-beta.patch`.
   background render target at `0x50fbd0000` was still repeatedly discarded when its guest-memory signature differed.
 - Texture lookup now trusts a render target marked GPU-written instead of comparing it to stale guest memory. A
   synchronous flush or memory-to-render-target reload clears that ownership marker after updating the signature.
-- This fixes the cache decision implicated by the new log. The current SMO run is still active, so its executable will
-  be rebuilt with this change after the process exits.
+- This fixes the cache decision implicated by the new log. Rebuilt the Linux X11 runtime and copied it into
+  `games/smo` after the game exited; `games/smo_code.so` remains unchanged.
+- Regenerated the cumulative milestone patch against the v190 release archive now on `main`.
 
 The cumulative beta patch is `patches/milestone-007-main-to-beta.patch`.
 
