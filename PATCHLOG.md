@@ -114,6 +114,64 @@ The cumulative beta patch is `patches/milestone-006-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-007-main-to-beta.patch`.
 
+## Milestone 008 — OpenGL geometry shader support
+
+- Ported the geometry shader translation and draw-pipeline support from `Switchrecomp0` into the shared Linux runtime.
+- Geometry shaders now declare primitive input/output layouts, read indexed per-vertex attributes, apply the runtime
+  viewport/depth transform to emitted vertices, and bind their separable GL program and stage resources.
+- Geometry shader draws require separable program pipeline support. Tessellation stages remain unsupported; when
+  separable pipelines are unavailable, the runtime logs and draws without the geometry stage.
+- Synchronized the shared source changes to `flatpack`; packaging-specific files were not changed. Rebuilt the Linux
+  X11 runtime on both work branches to check compilation. Game-level rendering still needs validation with a title that
+  uses geometry shaders.
+
+The cumulative beta patch is `patches/milestone-008-main-to-beta.patch`.
+
+## Milestone 009 — shader opcode lookup table
+
+- Ported the shader decoder lookup optimization from Metroid Dread Recomp. It precomputes the first matching opcode
+  for each 16-bit instruction prefix, replacing a linear pattern scan for each decoded instruction.
+- Retained beta's shader patterns and special EXIT handling. No Dread-specific Vulkan, Android, or audio code was
+  copied because those changes do not match this OpenGL runtime.
+- Rebuilt beta's Linux X11 runtime; the Flatpak runtime also needs rebuilding before that package uses this change.
+
+The cumulative beta patch is `patches/milestone-009-main-to-beta.patch`.
+
+## Milestone 010 — 30 FPS presentation cap
+
+- `fps_limit=30` now skips every other presented image while keeping the game's normal 60 Hz update pacing. The
+  existing `fps_target` render-skip setting remains available separately.
+- The cap handles both GPU-backed and CPU-converted presentation paths. Rebuilt the beta Linux X11 runtime; the
+  Flatpak runtime also needs rebuilding before use.
+
+The cumulative beta patch is `patches/milestone-010-main-to-beta.patch`.
+
+## Milestone 011 — rsync ROMFS copying on Linux
+
+- Linux ROMFS copies now use `rsync` to transfer only files that are new or changed, preserving
+  timestamps and the existing two-second mtime tolerance. Extra destination files are left intact.
+- Windows and Linux installations without `rsync` continue to use the existing Python copy path;
+  the tool reports when Linux falls back because `rsync` is unavailable.
+- The same change is synchronized to the Flatpak branch. No game/runtime rebuild is needed; the
+  Python recompiler takes effect the next time a game is copied.
+
+The cumulative beta patch is `patches/milestone-011-main-to-beta.patch`.
+
+## Milestone 012 — XCDE shader limits and texture formats
+
+- XCDE's latest log showed two vertex shaders failing with NVIDIA's `no buffers available for bindable uniform cb15`.
+  The translator now checks per-stage OpenGL uniform-block limits and moves only excess guest constant buffers to
+  read-only storage blocks, with the runtime binding those buffers through the existing upload path.
+- Added OpenGL mappings for the logged G24R8 and RGBX16SN texture formats. RGBX16SN forces its unused X component
+  to opaque alpha when sampled.
+- The trace manifests in `games/captures/traces/1` through `9` report no untranslated or failed shaders in their
+  recorded draws. The two titles that submit one frame and then stop, and SEVEN_Produ's null-address instruction
+  fetch, remain separate game startup failures without a safe runtime fix identified from these traces.
+- Runtime sources changed on both beta and Flatpak. Rebuild each runtime before testing; games do not need
+  recompilation.
+
+The cumulative beta patch is `patches/milestone-012-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

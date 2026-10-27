@@ -11,6 +11,7 @@
 int g_glsl_version=440;
 int g_vs_layer_ext=1;   /* 1 ARB_shader_viewport_layer_array, 2 AMD_vertex_shader_layer, 3 NV_viewport_array2, 0 none */
 int g_rs_binding=83;   /* binding of the res-scale UBO, set by gpu_gl */
+int g_gl_ubo_blocks[6]={18,18,18,18,18,18};
 #define B(v,lo,n) ((u32)(((v)>>(lo))&((1ull<<(n))-1)))
 
 /* ============================================================ text */
@@ -138,16 +139,19 @@ static int ops_ready;
 
 static int opcmp(const void* a, const void* b){ const Op* x=a,*y=b; return y->bits-x->bits; }
 
+static const Op* op_decode[65536];
+static const Op* op_nop;
 static void ops_init(void){
   int n=0; for(;ops[n].pat;n++){ u64 m=0,v=0; int bits=0; for(int i=0;i<16;i++){ char ch=ops[n].pat[i]; u64 bit=1ull<<(63-i); if(ch=='0'||ch=='1'){ m|=bit; bits++; if(ch=='1') v|=bit; } } ops[n].mask=m; ops[n].val=v; ops[n].bits=bits; }
-  qsort(ops,n,sizeof(Op),opcmp); ops_ready=1; }
-
-static const Op* op_nop;
+  qsort(ops,n,sizeof(Op),opcmp);
+  /* Opcode patterns only inspect the top 16 bits. Keep the ordered decoder's
+     first match for each prefix, including equally specific overlapping masks. */
+  for(u32 word=0;word<65536;word++){ u64 w=(u64)word<<48; for(int i=0;i<n;i++) if((w&ops[i].mask)==ops[i].val){ op_decode[word]=&ops[i]; break; } }
+  for(int i=0;i<n;i++) if(ops[i].id==O_NOP){ op_nop=&ops[i]; break; }
+  ops_ready=1; }
 
 /* EXIT.FCSM_TR after VOTE.VTG is a hw cull exit, treat it as a NOP or the VS never writes position */
-static const Op* decode(u64 w){ for(int i=0;ops[i].pat;i++) if((w&ops[i].mask)==ops[i].val){
-    if(ops[i].id==O_EXIT && ((w&31)==0x1c)){ if(!op_nop) for(int k=0;ops[k].pat;k++) if(ops[k].id==O_NOP){ op_nop=&ops[k]; break; } if(op_nop) return op_nop; }
-    return &ops[i]; } return NULL; }
+static const Op* decode(u64 w){ const Op* op=op_decode[w>>48]; return op && op->id==O_EXIT && (w&31)==0x1c && op_nop? op_nop : op; }
 
 /* ============================================================ context */
 typedef struct {
@@ -259,17 +263,18 @@ static const char* bop(u32 op, const char* a, const char* b){
   switch(op){ case 0: return T("(%s && %s)",a,b); case 1: return T("(%s || %s)",a,b); case 2: return T("(%s != %s)",a,b); } return a; }
 
 /* ============================================================ attributes */
-static char* attr_read(Ctx* c, u32 addr, int is_output){
+static char* attr_read_idx(Ctx* c, u32 addr, int is_output, const char* gs_index){
   u32 comp=(addr>>2)&3;
   if(addr>=0x80 && addr<0x280){ u32 i=(addr-0x80)>>4;
     if(is_output){ c->out_used[i]=1; return T("floatBitsToUint(out_attr%u.%c)",i,"xyzw"[comp]); }
     c->in_used[i]=1;
     if(c->stage==ST_VS && (c->si->attr_int_mask>>i)&1) return T("uint(in_attr%u.%c)",i,"xyzw"[comp]);
+    if(c->stage==ST_GS) return T("floatBitsToUint(in_attr%u[%s].%c)",i,gs_index? gs_index : "0", "xyzw"[comp]);
     return T("floatBitsToUint(in_attr%u.%c)",i,"xyzw"[comp]); }
   if(addr>=0x70 && addr<0x80){
     if(c->stage==ST_FS){ c->si->uses_position_in=1; if(comp==3) return "floatBitsToUint(1.0/gl_FragCoord.w)"; if(comp<2) return T("floatBitsToUint(gl_FragCoord.%c*swr_rs.x)","xy"[comp]); return T("floatBitsToUint(gl_FragCoord.%c)","xyzw"[comp]); }
     if(c->stage==ST_VS) return T("floatBitsToUint(gl_Position.%c)","xyzw"[comp]);
-    return T("floatBitsToUint(gl_in[0].gl_Position.%c)","xyzw"[comp]); }
+    return T("floatBitsToUint(gl_in[%s].gl_Position.%c)",gs_index? gs_index : "0", "xyzw"[comp]); }
   switch(addr){
     case 0x2FC: return c->stage==ST_VS? "uint(gl_VertexID)" : "0u";
     case 0x2F8: return c->stage==ST_VS? "uint(gl_InstanceID)" : "0u";
@@ -283,6 +288,7 @@ static char* attr_read(Ctx* c, u32 addr, int is_output){
   if(addr>=0x2C0 && addr<0x2E0) return "0u";
   return "0u";
 }
+static char* attr_read(Ctx* c, u32 addr, int is_output){ return attr_read_idx(c,addr,is_output,NULL); }
 
 static void attr_write(Ctx* c, u32 addr, const char* val){
   u32 comp=(addr>>2)&3;
@@ -713,6 +719,10 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     setr(c,d,v); break; }
   case O_ALD: {
     u32 addr=B(w,20,10), n=B(w,47,2)+1; int is_out=B(w,32,1);
+    if(c->stage==ST_GS && !is_out && B(w,8,8)!=255){
+      const char* ix=T("int(min(%s,%uu))",R(c,B(w,8,8)),c->si->gs_input_vertices? c->si->gs_input_vertices-1 : 0);
+      for(u32 k=0;k<n;k++) setr(c,d+k,attr_read_idx(c,addr+k*4,0,ix));
+      break; }
     if(B(w,8,8)!=255){ /* indexed attribs: only generic-by-register */
       for(u32 k=0;k<n;k++) setr(c,d+k,"0u"); unsupported(c,"indirect ALD",w); break; }
     for(u32 k=0;k<n;k++) setr(c,d+k,attr_read(c,addr+k*4,is_out));
@@ -1239,9 +1249,10 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
   if(!ops_ready) ops_init();
   Ctx* c=calloc(1,sizeof(Ctx)); c->w=(const u64*)code; c->stage=stage; c->si=si;
   u32 attr_int=si->attr_int_mask, attr_sint=si->attr_sint_mask, flat=si->fs_flat_mask; u32 ktm=si->tex_int_mask, kts=si->tex_sint_mask, krm=si->rt_int_mask, krs=si->rt_sint_mask;
+  u32 gs_input_vertices=si->gs_input_vertices;
   u32 kcl[3]={si->cs_local[0],si->cs_local[1],si->cs_local[2]}; int ksh=si->shared_size;
   /* keep attr_sint_mask too, signed integer attributes have to be declared ivec4 and not uvec4 */
-  memset(si,0,sizeof *si); si->stage=stage; memcpy(si->cs_local,kcl,sizeof kcl); si->shared_size=ksh; si->attr_int_mask=attr_int; si->attr_sint_mask=attr_sint; si->fs_flat_mask=flat; si->tex_int_mask=ktm; si->tex_sint_mask=kts; si->rt_int_mask=krm; si->rt_sint_mask=krs;
+  memset(si,0,sizeof *si); si->stage=stage; si->gs_input_vertices=gs_input_vertices; memcpy(si->cs_local,kcl,sizeof kcl); si->shared_size=ksh; si->attr_int_mask=attr_int; si->attr_sint_mask=attr_sint; si->fs_flat_mask=flat; si->tex_int_mask=ktm; si->tex_sint_mask=kts; si->rt_int_mask=krm; si->rt_sint_mask=krs;
   memcpy(si->sph,code,80);
   u32 len; shader_hash(code,max_bytes,&len); u32 n=len/8; c->nwords=n;
   /* leaders + branch targets */
@@ -1336,6 +1347,15 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
   /* packed binding numbers, intel's windows driver has very few: VS 0.., FS 1.., the rest 2.. */
   int slot= stage==ST_VS? 0 : stage==ST_FS? 1 : 2;
   int base_bind=slot*18;
+  si->cbuf_ssbo_mask=0;
+  if(stage!=ST_CS){
+    int max_blocks=g_gl_ubo_blocks[stage]; if(max_blocks<1) max_blocks=18;
+    int used=0; for(int i=0;i<18;i++) used+=(si->cbuf_mask>>i)&1;
+    if(stage==ST_FS && si->uses_position_in) used++;
+    for(int i=17;i>=0 && used>max_blocks;i--) if(si->cbuf_mask&(1u<<i)){
+      si->cbuf_ssbo_mask|=1u<<i; used--;
+    }
+  }
   for(int i=0;i<si->ngbuf;i++) sb_f(D,"layout(std430, binding=%d) %sbuffer S%d_G%d { uint d[]; } g%d;\n",stage==ST_CS? i : slot*8+i,((si->gbuf_wmask>>i)&1)? "" : "readonly ",stage,i,i);
   /* which words got stored to, one bit each, so only those go back to guest memory (like on hw). the runtime
      fills the header: d[b] = where buffer b's bits start, d[16+b] = its size in words. compute and draws both:
@@ -1345,7 +1365,12 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
       "void swr_wmark(uint b, uint w){ if(w < swr_wm.d[16u+b]) atomicOr(swr_wm.d[swr_wm.d[b] + (w>>5u)], 1u << (w&31u)); }\n",stage==ST_CS? si->ngbuf : slot*8+si->ngbuf);
     else sb_put(D,"void swr_wmark(uint b, uint w){}\n"); }
   if(stage==ST_CS) sb_f(D,"layout(local_size_x=%u, local_size_y=%u, local_size_z=%u) in;\n",si->cs_local[0]? si->cs_local[0] : 1,si->cs_local[1]? si->cs_local[1] : 1,si->cs_local[2]? si->cs_local[2] : 1);
-  for(int i=0;i<18;i++) if(si->cbuf_mask&(1u<<i)) sb_f(D,"layout(std140, binding=%d) uniform S%d_CB%d { vec4 d[4096]; } cb%d;\n",base_bind+i,stage,i,i);
+  int cb_ssbo_rank=0;
+  for(int i=0;i<18;i++) if(si->cbuf_mask&(1u<<i)){
+    if(si->cbuf_ssbo_mask&(1u<<i))
+      sb_f(D,"layout(std430, binding=%d) readonly buffer S%d_CB%d { vec4 d[4096]; } cb%d;\n",24+slot*4+cb_ssbo_rank++,stage,i,i);
+    else sb_f(D,"layout(std140, binding=%d) uniform S%d_CB%d { vec4 d[4096]; } cb%d;\n",base_bind+i,stage,i,i);
+  }
   for(int i=0;i<si->ntex;i++){ ShTex* t=&si->tex[i]; sb_f(D,"layout(binding=%d) uniform %s S%d_tex%d;\n#define tex%d S%d_tex%d\n",slot*32+i,T("%s%s",(!t->shadow && ((si->tex_int_mask>>i)&1))? (((si->tex_sint_mask>>i)&1)? "i" : "u") : "",samp_type(t->type,t->array,t->shadow)),stage,i,i,stage,i); }   /* stage-unique name */
   if(stage==ST_VS){
     for(int i=0;i<32;i++) if(c->in_used[i]){ si->in_mask|=1u<<i; int isint=(attr_int>>i)&1; sb_f(D,"layout(location=%d) in %s in_attr%d;\n",i,isint? ((si->attr_sint_mask>>i)&1? "ivec4":"uvec4") : "vec4",i); }
@@ -1358,6 +1383,18 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
     for(int i=0;i<32;i++) if(c->in_used[i]){ si->in_mask|=1u<<i; u8 m=imap[i]; int f=(m&3)==1 || ((m>>2)&3)==1 || (flat>>i)&1; int lin=(m&3)==3;
       sb_f(D,"layout(location=%d) %sin vec4 in_attr%d;\n",i,f? "flat " : lin? "noperspective " : "",i); }
     u32 target=si->sph[18]; for(int rt=0;rt<8;rt++) if((target>>(rt*4))&15) sb_f(D,"layout(location=%d) out %s frag_color%d;\n",rt,((si->rt_int_mask>>rt)&1)? (((si->rt_sint_mask>>rt)&1)? "ivec4" : "uvec4") : "vec4",rt);
+  } else if(stage==ST_GS){
+    static const char* in_prim[]={"points","lines","triangles","lines_adjacency","triangles_adjacency"};
+    static const char* out_prim[]={"points","line_strip","triangle_strip"};
+    u32 iv=si->gs_input_vertices, oi=(si->sph[3]>>24)&15, mv=si->sph[4]&0xFFF, inv=si->sph[2]>>24;
+    u32 ip=iv==1? 0 : iv==2? 1 : iv==4? 3 : iv==6? 4 : 2;
+    u32 op=oi==1? 0 : oi==6? 1 : 2; if(!mv) mv=1;
+    if(inv>1) sb_f(D,"layout(%s, invocations=%u) in;\n",in_prim[ip],inv);
+    else sb_f(D,"layout(%s) in;\n",in_prim[ip]);
+    sb_f(D,"layout(%s, max_vertices=%u) out;\n",out_prim[op],mv);
+    sb_put(D,"in gl_PerVertex { vec4 gl_Position; } gl_in[];\nout gl_PerVertex { vec4 gl_Position; };\n");
+    for(int i=0;i<32;i++) if(c->in_used[i]){ si->in_mask|=1u<<i; sb_f(D,"layout(location=%d) in vec4 in_attr%d[];\n",i,i); }
+    for(int i=0;i<32;i++) if(c->out_used[i]){ si->out_mask|=1u<<i; sb_f(D,"layout(location=%d) out vec4 out_attr%d;\n",i,i); }
   }
   if(c->uses_local) sb_put(D,"uint lmem[1024];\n");
   if(c->uses_shared) sb_f(D,"shared uint smem[%d];\n", stage==ST_CS && si->shared_size>0? (si->shared_size+3)/4 : 16384);

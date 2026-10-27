@@ -16,8 +16,10 @@ typedef struct {
 } ShTex;
 typedef struct {
   int stage;
+  u32 gs_input_vertices;         /* geometry shader input primitive size */
   u32 sph[20];
   u32 cbuf_mask;                 /* cbufs used */
+  u32 cbuf_ssbo_mask;            /* cbufs moved to storage blocks when uniform-block limits are reached */
   u32 cbuf_indirect_mask;
   u32 cbuf_max[18];              /* bytes used per cbuf, so we upload less */
   ShTex tex[SH_MAXTEX]; int ntex;
