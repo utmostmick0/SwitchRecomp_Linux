@@ -43,6 +43,9 @@ LO QUE NO HAY EN LINUX (todavia)
   - Grabacion de video con F7 (usa Media Foundation de Windows).
   - Generacion de frames LSFG si no tienes Lossless.dll.
 
+VIDEO WEBM
+  Los videos VP9 se decodifican con libvpx incluido en el runtime; no hace falta instalar otro paquete.
+
 FLATPAK / STEAM DECK (BORRADOR)
   Hay un manifiesto inicial en org.mzlabs.SwitchRecomp.yml. La interfaz guarda por defecto los juegos en
   $XDG_DATA_HOME/SwitchRecomp/games (en Flatpak, dentro de ~/.var/app/org.mzlabs.SwitchRecomp/data),

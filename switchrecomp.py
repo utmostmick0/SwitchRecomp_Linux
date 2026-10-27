@@ -281,17 +281,22 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     if not all(os.path.isfile(lib) for lib in h264_libs):
         h264_libs = [os.path.join(oh, 'libopenh264.a')]
     h264 = all(os.path.isfile(lib) for lib in h264_libs) and backend in ('win32', 'x11', 'headless')
+    # VP9 WebM movies are indexed from RomFS and decoded with static libvpx.
+    vp = os.path.join(RT, 'vp9', 'win' if target_win else 'lin')
+    vp9 = os.path.isfile(os.path.join(vp, 'libvpx.a')) and backend in ('win32', 'x11', 'headless')
     srcs += [os.path.join(RT, 'host1x.c')]
     if not target_win: srcs += [os.path.join(RT, 'glibc_compat.c')]   # runs on glibc 2.34+ (Ubuntu 22.04, Debian 12)
     # hwopus: libopus (BSD), same rule as OpenH264
     op = os.path.join(RT, 'opus', 'win' if target_win else 'lin')
     opus = os.path.isfile(os.path.join(op, 'libopus.a')) and backend in ('win32', 'x11', 'headless')
-    cmd = [cc] + ([] if target_win else ['-std=gnu17']) + ['-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S', '-I', RT, '-I', os.path.join(RT, 'bcn'), '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'opus', 'include')] + srcs + ['-o', out]
+    cmd = [cc] + ([] if target_win else ['-std=gnu17']) + ['-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S', '-I', RT, '-I', os.path.join(RT, 'bcn'), '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'opus', 'include'), '-I', os.path.join(RT, 'vp9', 'include')] + srcs + ['-o', out]
     if target_win and backend == 'win32': cmd += ['-DSWR_RECORD_AUDIO']
     if not h264: cmd += ['-DSWR_NO_H264']
+    if vp9: cmd += ['-DSWR_HAVE_VP9']
     if not opus: cmd += ['-DSWR_NO_OPUS']
     if spvc: cmd += [spvc]
     if h264: cmd += h264_libs
+    if vp9: cmd += [os.path.join(vp, 'libvpx.a')]
     if opus: cmd += [os.path.join(op, 'libopus.a')]
     if spvc or h264:
         # static on Linux too, so the runtime doesn't depend on the libstdc++ version of the distro

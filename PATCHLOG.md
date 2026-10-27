@@ -18,149 +18,175 @@ binary-capable Git diff. Earlier patch files are excluded to avoid nesting patch
 - `flatpack` only: changed Linux defaults to XDG data/config paths, added writable directory creation,
   and added an initial Flatpak manifest, launcher, desktop entry, AppStream metadata, and Steam Deck notes.
 - `beta` keeps the original AppImage packaging behavior from `main`.
-- Flatpak remains a draft: it still needs SDL2_image/SDL2_ttf, Python, a compiler, and a
+- Flatpak remains a draft: it still needs the SDL3 stack, Python, a compiler, and a
   Flatpak-compatible file chooser before it can package the complete workflow.
 
 The beta patch is `patches/milestone-001-main-to-beta.patch`. It contains the shared memory optimization
 and milestone documentation, not the Flatpak-only package changes.
 
-## Milestone 002 — Compile the optimized beta runtime
+## Milestone 002 — SDL3 migration
 
-- Built `bin/runtime_linux_x11` on `beta` with GCC from the updated runtime sources; the build completed
-  successfully.
-- The rebuilt runtime is synchronized to `flatpack` because it contains the same shared memory code.
-- This confirms compilation only. Gameplay and performance measurements are still needed to determine
-  whether the memory lookup optimization improves real workloads.
+- Replaced SDL2 in the Linux launcher with SDL3, SDL3_ttf, and SDL3_image APIs for rendering, text, image
+  handling, menu gamepad input, and music playback.
+- Replaced the runtime's optional SDL2 gamepad and queued-audio backends with SDL3 gamepad and audio-stream
+  APIs. Both still load SDL3 at runtime so games retain keyboard/playback fallback when SDL3 is unavailable.
+- The launcher now enumerates already-connected gamepads on startup and polls confirm/cancel/menu buttons
+  in addition to event handling.
+- Updated Linux build and dependency instructions. The Windows tool continues to use SDL2 libraries.
+- The Linux launcher build uses GNU C17 so GCC 15's C23 default does not make the older-glibc compatibility
+  wrappers recurse into themselves at SDL3 startup. The build script writes the launcher beside `bin/` and
+  `tool/`, matching the paths expected by the app.
+- The Linux runtime build also uses GNU C17. Without it, GCC 15 emits C23 `strtol` calls that resolve to the
+  compatibility wrapper and recurse while reading a game's INI file; SMO then consumed a full CPU core
+  before creating its window. Rebuilds through `switchrecomp.py --build-runtime` now include the same flag.
+- `SDL_GetBasePath()` returns an SDL-owned cached path in SDL3, so the launcher keeps it as a `const char *`
+  and does not free it. This avoids a shutdown double free.
+- SDL3 gamepad button events and polling now trigger A, B, and menu actions only on press edges. Previously,
+  holding A while a game tile was selected could launch a new game process every frame.
+- Verified the Linux launcher and X11 runtime compile with GCC against SDL3 3.4.18, SDL3_ttf 3.2.2, and
+  SDL3_image 3.2.4. The Steam Controller is recognized by SDL3; gamepad behavior in a running game still
+  needs a successful SMO launch to verify.
 
 The cumulative beta patch is `patches/milestone-002-main-to-beta.patch`.
 
-## Milestone 003 — Launcher controller detection
+## Milestone 003 — Linux H.264 video decoding
 
-- Shared launcher fix on `beta` and `flatpack`: scan for already-connected SDL game controllers during input polling,
-  and release disconnected controllers so a later reconnect can be detected.
-- This addresses launchers that miss SDL's device-added event when a Steam Controller is connected before startup.
-- Rebuilt the Linux launcher with `tool/src/build_tool_linux.sh`.
+- Added a Linux x86_64 OpenH264 2.4.1 static archive, built from Cisco's upstream `v2.4.1` tag to match
+  the runtime's existing 2.4.1 API headers. The upstream BSD license is retained in `runtime/oh264/LICENSE`.
+- Updated runtime builds to use the upstream `libopenh264.a` archive when the platform-specific split
+  decoder/common archives are unavailable. Windows continues using its existing split archives.
+- Rebuilt `bin/runtime_linux_x11` with H.264 enabled. Existing game executables must be recompiled with this
+  runtime to decode H.264 movies. Recompiled the local SMO game executable using its existing execution
+  hints so it is ready for movie playback testing.
+- Build provenance and the reproducible OpenH264 command are recorded in `runtime/oh264/lin/README.md`.
 
 The cumulative beta patch is `patches/milestone-003-main-to-beta.patch`.
 
-## Milestone 004 — Launcher controller button polling
-
-- Shared launcher change on `beta` and `flatpack`: explicitly enable SDL controller events and poll A, B, Start,
-  and Back state as well as handling button events. This supports Steam Input configurations that update state but
-  do not reliably emit button-down events.
-- Rebuilt the Linux launcher at the repository root as `SwitchRecomp` for direct testing.
-
-The cumulative beta patch is `patches/milestone-004-main-to-beta.patch`.
-
-## Milestone 005 — Linux H.264 video decoding
-
-- Shared runtime change on `beta` and `flatpack`: use Cisco OpenH264 2.4.1's upstream `libopenh264.a`
-  when platform-specific split decoder/common archives are unavailable. Windows keeps using its existing
-  split archives.
-- Added the matching Linux x86_64 static archive, built from Cisco's upstream `v2.4.1` tag to match the
-  existing 2.4.1 headers. Build provenance is in `runtime/oh264/lin/README.md`; the BSD license remains in
-  `runtime/oh264/LICENSE`.
-- Runtime builds use GNU C17 on Linux, preserving the compatibility fix required by GCC 15.
-- Rebuilt the Linux X11 runtime with H.264 enabled. Existing game executables need recompilation to use it.
-- Flatpak-specific packaging files are unchanged by this shared runtime milestone.
-
-The cumulative beta patch is `patches/milestone-005-main-to-beta.patch`.
-
-## Milestone 006 — Correct audio queue priming
+## Milestone 004 — Correct audio queue priming
 
 - Shared runtime fix on `beta` and `flatpack`: use a 20 ms audio queue reserve to reduce A/V latency. Playback
   stays at full rate while the queue meets that reserve; adaptive slowdown applies only below it.
-- Rebuilt the Linux X11 runtime with the 20 ms reserve; the beta SMO executable now contains this runtime for playback testing.
+- Rebuilt the Linux X11 runtime with the 20 ms reserve and installed it into the local SMO executable for testing.
 - The preceding SMO log showed the title music voices beginning at 24.54 seconds and Mario's voice at 25.33
   seconds. These are guest-mix timestamps and do not establish host playback latency or prove a missing channel.
 - A previous run reported intermittent audio glitching. The 20 ms build is ready for a playback comparison; no
   underflow counter is currently available, so the log cannot independently confirm an audible glitch.
 
+The cumulative beta patch is `patches/milestone-004-main-to-beta.patch`.
+
+## Milestone 005 — v190 runtime and recompiler fixes
+
+- Ported the v190 source changes from `SwitchRecomp_v190_linux.tar.gz` into the shared runtime and tool code.
+- Initialized GPU channel color masks so GBA Classics' loading UI is not discarded, kept supported depth-buffer copies
+  on the GPU for Sonic Frontiers, and moved submit-fence waits onto the GPU queue to avoid blocking the game thread.
+- Added per-compute-dispatch GPU timing entries and more detailed GPU/GL/compiler-thread stall diagnostics. GL fence
+  polling now takes the driver lock to avoid concurrent driver calls during shader compilation.
+- Merged the recompiler and shader changes while retaining beta's SDL3 launcher and build configuration. The archive's
+  SDL2 standalone installer packaging is not part of the beta AppImage line.
+- Rebuilt the SDL3 launcher and Linux X11 runtime from the updated source. The launcher build completed with existing
+  `-Wformat-truncation` path warnings; both builds completed successfully.
+- Existing recompiled games need their runtime updated or the games recompiled before these runtime fixes take effect.
+
+The cumulative beta patch is `patches/milestone-005-main-to-beta.patch`.
+
+## Milestone 006 — synchronous render-target flushes before GPU copies
+
+- SMO's live log showed its 480x544 corner-video output sharing guest memory with a render-target view, followed by
+  repeated DMA copies and asynchronous render-target readbacks at that address.
+- Made render-target flushes synchronous before DMA/2D engine copies. A delayed PBO readback could otherwise write an
+  older render-target image into guest memory after the copy had updated video or background pixels.
+- Rebuilt the Linux X11 runtime and copied it over `games/smo` so SMO uses the rebuilt runtime. `games/smo_code.so`
+  remains unchanged; the game code did not need recompilation for this runtime change.
+- This is a targeted correctness fix based on the logged copy/readback ordering; it still needs visual confirmation in
+  SMO because the runtime log does not capture rendered pixels.
+
 The cumulative beta patch is `patches/milestone-006-main-to-beta.patch`.
 
-## Milestone 007 — v190 runtime and recompiler fixes
+## Milestone 007 — preserve GPU-written render targets during texture lookup
 
-- Synchronized the v190 shared source fixes from beta: GPU color-mask defaults, GPU-side depth copies, queued GPU
-  fence waits, compute-dispatch profiling, and GL/shader stall diagnostics.
-- Applied the same runtime and recompiler fixes to the Flatpak source tree while retaining its Flatpak-specific
-  launcher, data paths, and package manifest.
-- The Flatpak runtime binary has not been rebuilt for this milestone.
+- SMO's retest confirmed that synchronous DMA/2D flushes removed the asynchronous readback path, but the 1600x900
+  background render target at `0x50fbd0000` was still repeatedly discarded when its guest-memory signature differed.
+- Texture lookup now trusts a render target marked GPU-written instead of comparing it to stale guest memory. A
+  synchronous flush or memory-to-render-target reload clears that ownership marker after updating the signature.
+- This fixes the cache decision implicated by the new log. Rebuilt the Linux X11 runtime and copied it into
+  `games/smo` after the game exited; `games/smo_code.so` remains unchanged.
+- Regenerated the cumulative milestone patch against the v190 release archive now on `main`.
 
 The cumulative beta patch is `patches/milestone-007-main-to-beta.patch`.
 
-## Milestone 008 — synchronous render-target flushes before GPU copies
+## Milestone 008 — OpenGL geometry shader support
 
-- Synced the shared runtime fix from beta: render-target flushes before DMA/2D copies now wait for the current image,
-  preventing a delayed PBO readback from overwriting newer guest-memory pixels.
-- This addresses the SMO log sequence where the corner-video buffer was repeatedly copied while asynchronous readbacks
-  targeted a render-target view at the same guest address.
-- The rebuilt beta runtime is ready for visual testing; Flatpak's runtime should be rebuilt from this shared source.
-
-The cumulative beta patch is `patches/milestone-008-main-to-beta.patch`.
-
-## Milestone 009 — preserve GPU-written render targets during texture lookup
-
-- Synced the beta cache fix: texture lookup now keeps GPU-written render targets despite stale guest-memory signatures,
-  and clears that ownership marker after synchronized memory/render-target transfers.
-- The change targets SMO's repeated log message dropping its 1600x900 background render target at `0x50fbd0000`.
-- Rebuild the Flatpak runtime from this shared source after beta's visual retest.
-- Refreshed the cumulative patch against the v190 release archive now on `main`.
-
-The cumulative beta patch is `patches/milestone-009-main-to-beta.patch`.
-
-## Milestone 010 — OpenGL geometry shader support
-
-- Synced the shared geometry shader translator and OpenGL pipeline support from beta.
+- Ported the geometry shader translation and draw-pipeline support from `Switchrecomp0` into the shared Linux runtime.
 - Geometry shaders now declare primitive input/output layouts, read indexed per-vertex attributes, apply the runtime
   viewport/depth transform to emitted vertices, and bind their separable GL program and stage resources.
 - Geometry shader draws require separable program pipeline support. Tessellation stages remain unsupported; when
   separable pipelines are unavailable, the runtime logs and draws without the geometry stage.
-- Packaging-specific files were not changed. Rebuilt the Flatpak branch's Linux X11 runtime to check compilation;
-  game-level rendering still needs validation with a title that uses geometry shaders.
+- Synchronized the shared source changes to `flatpack`; packaging-specific files were not changed. Rebuilt the Linux
+  X11 runtime on both work branches to check compilation. Game-level rendering still needs validation with a title that
+  uses geometry shaders.
 
-The matching beta patch is `patches/milestone-008-main-to-beta.patch`.
+The cumulative beta patch is `patches/milestone-008-main-to-beta.patch`.
 
-## Milestone 011 — shader opcode lookup table
+## Milestone 009 — shader opcode lookup table
 
-- Synced the shader decoder lookup optimization from beta. A precomputed table maps each 16-bit instruction prefix
-  to the first matching opcode, replacing the per-instruction linear pattern scan.
-- Kept the Flatpak runtime's existing shader patterns and platform-specific changes. Dread-specific Vulkan, Android,
-  and audio code was not copied into this OpenGL runtime.
-- Rebuilt the Linux X11 runtime to check compilation.
+- Ported the shader decoder lookup optimization from Metroid Dread Recomp. It precomputes the first matching opcode
+  for each 16-bit instruction prefix, replacing a linear pattern scan for each decoded instruction.
+- Retained beta's shader patterns and special EXIT handling. No Dread-specific Vulkan, Android, or audio code was
+  copied because those changes do not match this OpenGL runtime.
+- Rebuilt beta's Linux X11 runtime; the Flatpak runtime also needs rebuilding before that package uses this change.
 
-The matching beta patch is `patches/milestone-009-main-to-beta.patch`.
+The cumulative beta patch is `patches/milestone-009-main-to-beta.patch`.
 
-## Milestone 012 — 30 FPS presentation cap
+## Milestone 010 — 30 FPS presentation cap
 
-- Synced beta's `fps_limit=30` mode, which skips every other presented image while retaining the game's normal
-  60 Hz update pacing. GPU and CPU-backed presentation paths use the same cap.
-- Rebuilt the Linux X11 runtime to check compilation. Set `fps_limit=30` in the game's generated INI to enable it.
+- `fps_limit=30` now skips every other presented image while keeping the game's normal 60 Hz update pacing. The
+  existing `fps_target` render-skip setting remains available separately.
+- The cap handles both GPU-backed and CPU-converted presentation paths. Rebuilt the beta Linux X11 runtime; the
+  Flatpak runtime also needs rebuilding before use.
 
-The matching beta patch is `patches/milestone-010-main-to-beta.patch`.
+The cumulative beta patch is `patches/milestone-010-main-to-beta.patch`.
 
-## Milestone 013 — rsync ROMFS copying on Linux
+## Milestone 011 — rsync ROMFS copying on Linux
 
-- Synced beta's Linux ROMFS copy improvement: `rsync` transfers only files that are new or changed,
-  preserves timestamps, and uses the same two-second mtime tolerance. Extra destination files remain.
-- Windows and Linux installations without `rsync` retain the Python copy fallback, with a status
-  message when Linux uses that fallback.
-- This affects the Python recompiler, so it takes effect the next time a game is copied; no game
-  runtime rebuild is needed.
+- Linux ROMFS copies now use `rsync` to transfer only files that are new or changed, preserving
+  timestamps and the existing two-second mtime tolerance. Extra destination files are left intact.
+- Windows and Linux installations without `rsync` continue to use the existing Python copy path;
+  the tool reports when Linux falls back because `rsync` is unavailable.
+- The same change is synchronized to the Flatpak branch. No game/runtime rebuild is needed; the
+  Python recompiler takes effect the next time a game is copied.
 
-The matching beta patch is `patches/milestone-011-main-to-beta.patch`.
+The cumulative beta patch is `patches/milestone-011-main-to-beta.patch`.
 
-## Milestone 014 — XCDE shader limits and texture formats
+## Milestone 012 — XCDE shader limits and texture formats
 
-- Synced beta's XCDE fixes. The shader translator now checks the active OpenGL stage uniform-block limits and uses
-  read-only storage blocks for guest constant buffers that exceed those limits; the runtime binds the overflow
-  buffers through its existing constant-buffer upload path.
-- Added G24R8 and RGBX16SN texture mappings seen in the XCDE log. RGBX16SN samples with opaque alpha for its unused
-  X component.
-- The nine available trace manifests have no untranslated or failed shaders in recorded draws. The one-frame
-  startup stalls and SEVEN_Produ's invalid instruction fetch were not attributable to these renderer issues.
-- Rebuild the Flatpak runtime before testing; existing games do not need recompilation.
+- XCDE's latest log showed two vertex shaders failing with NVIDIA's `no buffers available for bindable uniform cb15`.
+  The translator now checks per-stage OpenGL uniform-block limits and moves only excess guest constant buffers to
+  read-only storage blocks, with the runtime binding those buffers through the existing upload path.
+- Added OpenGL mappings for the logged G24R8 and RGBX16SN texture formats. RGBX16SN forces its unused X component
+  to opaque alpha when sampled.
+- The trace manifests in `games/captures/traces/1` through `9` report no untranslated or failed shaders in their
+  recorded draws. The two titles that submit one frame and then stop, and SEVEN_Produ's null-address instruction
+  fetch, remain separate game startup failures without a safe runtime fix identified from these traces.
+- Runtime sources changed on both beta and Flatpak. Rebuild each runtime before testing; games do not need
+  recompilation.
 
-The matching beta patch is `patches/milestone-012-main-to-beta.patch`.
+The cumulative beta patch is `patches/milestone-012-main-to-beta.patch`.
+
+## Milestone 013 — VP9 WebM playback
+
+- Added the libvpx VP9 decoder path adapted from [Metroid Dread Recomp](https://github.com/DaniSald/Metroid-Dread-Recomp/tree/main/runtime). It indexes WebM files read from RomFS, matches NVDEC jobs to frames, decodes VP9, and associates decoded frames with VIC output surfaces.
+- Vendored libvpx 1.14.1's public headers and BSD-3-Clause license, plus a static x86-64 Linux decoder archive. The runtime stays self-contained and does not need a system libvpx package.
+- Added optional VP9 linkage to the runtime build and updated the Linux notes. The change is synchronized to `flatpack`; both X11 runtimes compile with the decoder linked.
+- XCDE's earlier VP9 movie log motivated this change. The latest log has not yet been rechecked with this decoder, so movie playback and frame matching still need an in-game test. Update XCDE from `bin/runtime_linux_x11` using the launcher's **Runtime** option before testing.
+
+The cumulative beta patch is `patches/milestone-013-main-to-beta.patch`.
+
+## Milestone 014 — Game-labeled frame traces
+
+- F5 frame trace sets are now written to `captures/traces/<sanitized-game-title>_<number>/`, so captures from different games are easy to distinguish and each game's sequence starts at 1.
+- The original game title is also recorded in each `trace.txt`. Existing numeric trace folders are left intact.
+- The runtime source change is synchronized to `flatpack`, and both Linux X11 runtimes have been rebuilt. Update each installed game's runtime from the launcher before recording tagged traces.
+- Refresh the cumulative main-to-beta patch after the pending milestone 013 working changes are committed; generating it from the current branch refs would omit the uncommitted source changes.
 
 ## Recording the next milestone
 
