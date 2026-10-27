@@ -186,7 +186,7 @@ The cumulative beta patch is `patches/milestone-013-main-to-beta.patch`.
 - F5 frame trace sets are now written to `captures/traces/<sanitized-game-title>_<number>/`, so captures from different games are easy to distinguish and each game's sequence starts at 1.
 - The original game title is also recorded in each `trace.txt`. Existing numeric trace folders are left intact.
 - The runtime source change is synchronized to `flatpack`, and both Linux X11 runtimes have been rebuilt. Update each installed game's runtime from the launcher before recording tagged traces.
-- Refresh the cumulative main-to-beta patch after the pending milestone 013 working changes are committed; generating it from the current branch refs would omit the uncommitted source changes.
+- The cumulative beta patch is `patches/milestone-014-main-to-beta.patch`; it is generated from the committed `main..beta` history and excludes previous patch files.
 
 ## Recording the next milestone
 
