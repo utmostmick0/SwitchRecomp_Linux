@@ -172,7 +172,7 @@ static void ini_apply(const char* k, const char* v){
     else if(!strcmp(k,"audio_slowdown")) g_opt_audio_slowdown=atoi(v)!=0;
     else if(!strcmp(k,"smooth_recording")) g_opt_rec_smooth=atoi(v);
     else if(!strcmp(k,"recording_fps")){ g_opt_rec_fps=atoi(v); if(g_opt_rec_fps<15) g_opt_rec_fps=15; if(g_opt_rec_fps>60) g_opt_rec_fps=60; }
-    else if(!strcmp(k,"fps_limit")) g_opt_fps=atoi(v);
+    else if(!strcmp(k,"fps_limit")){ g_opt_fps=atoi(v); if(g_opt_fps!=30 && g_opt_fps<60 && g_opt_fps!=0) g_opt_fps=60; }
     else if(!strcmp(k,"resolution")){ g_opt_resf=(float)atof(v); if(g_opt_resf<0.25f) g_opt_resf=0.25f; if(g_opt_resf>4) g_opt_resf=4; }
     else if(!strcmp(k,"shadows")) g_opt_shadows=atoi(v);
     else if(!strcmp(k,"fps_target")){ /* 30/20: draw every 2nd/3rd frame at normal game speed, 120: frame generation x2 */
@@ -234,7 +234,7 @@ static const IniOpt INI_GRAPHICS[]={
 
 static const IniOpt INI_PERF[]={
   {"fps_target","60","Experimental: 30 or 20 = draw only every 2nd / 3rd frame, the game keeps its normal speed (less GPU work,\n;   effects updated on skipped frames can flicker). 120 = frame generation x2 (needs Lossless.dll, see lsfg). 60 = normal"},
-  {"fps_limit","1","1 = 60 FPS (the speed of a Switch), 0 = unlimited (the game runs faster). Values under 60 are treated as 60: the game advances one step per image, so 30 meant half speed. F4 changes it in game"},
+  {"fps_limit","1","1 = 60 FPS, 30 = cap displayed frames at 30 while the game keeps its 60 Hz update rate, 0 = unlimited. F4 toggles between 60 and unlimited"},
   {"forced_vsync","0","1 = always wait for vsync (can lower FPS a lot on slow PCs)"},
   {"null_trap","0","1 = a write through a NULL pointer stops the game with a precise log (diagnostics; 0 = normal)"},
   {"memory_gb","0","Memory the game sees: 0 = automatic (3.2 GB like the console, more for games that need it,\n;   e.g. Tears of the Kingdom), 4 = console (3.2 GB), 6 or 8 = extended (like yuzu's extended memory layout)"},
@@ -340,7 +340,7 @@ void vi_show_buffer(u32 nvmap_id, u32 offset, u32 w, u32 h, u32 pitch, u32 layou
   }
   { static int once; if(!once){ once=1; if(getenv("SWR_VT")) vt_set(1); } }   /* test smooth clock w/o recording */
   g_frames++; vt_frame();
-  /* fps_limit: 1 = 60, otherwise N fps */
+  /* fps_limit: 1 = 60; 30 skips every other presented image without slowing the 60 Hz game update loop. */
   /* in smooth recording the limiter has to count guest time and not real time, if not games that tick once per
      frame run sped up in the video */
   if(g_vt_on){ u64 per= g_opt_fps>=60 && g_opt_fps<=240? 1000000000ull/(u64)g_opt_fps : 16666667ull;
@@ -349,7 +349,7 @@ void vi_show_buffer(u32 nvmap_id, u32 offset, u32 w, u32 h, u32 pitch, u32 layou
     g=guest_ns(); last_g= (last_g && g-last_g<2*per)? next : g; g_last_present=plat_ns(); return; }
   /* while recording keep at least the 60 cap, uncapped + per frame logic = sped up video */
   if(g_opt_fps || g_rec_active){ u64 per= g_opt_fps>=60 && g_opt_fps<=240? 1000000000ull/(u64)g_opt_fps : 16666667ull;
-    if(g_opt_fps>=10 && g_opt_fps<60){ static int said; if(!said){ said=1; WARN("fps_limit=%d would run the game at %d%% speed (one game step per image): using 60\n",g_opt_fps,g_opt_fps*100/60); } }
+    if(g_opt_fps>=10 && g_opt_fps<60 && g_opt_fps!=30){ static int said; if(!said){ said=1; WARN("fps_limit=%d would run the game at %d%% speed (one game step per image): using 60\n",g_opt_fps,g_opt_fps*100/60); } }
     u64 now=plat_ns(); u64 next=g_last_present+per;
     if(g_last_present && now<next) plat_sleep_ns((i64)(next-now));
     now=plat_ns(); g_last_present= (g_last_present && now-g_last_present<2*per)? next : now; }
@@ -413,7 +413,7 @@ int swr_main(int argc, char** argv){
   split_path(argv[0]);
   char ini[1400];
   snprintf(ini,sizeof ini,"%s%s.ini",g_exedir,g_exename); ini_open(ini);
-  for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-v")) g_verbose=2; else if(!strncmp(argv[i],"--",2) && strchr(argv[i],'=')){ char k[256]; snprintf(k,sizeof k,"%s",argv[i]+2); char* e=strchr(k,'='); if(!e) continue; *e=0; backend_ini(k,e+1); if(!strcmp(k,"docked")) g_opt_docked=atoi(e+1); if(!strcmp(k,"fps_limit")) g_opt_fps=atoi(e+1); } }
+  for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-v")) g_verbose=2; else if(!strncmp(argv[i],"--",2) && strchr(argv[i],'=')){ char k[256]; snprintf(k,sizeof k,"%s",argv[i]+2); char* e=strchr(k,'='); if(!e) continue; *e=0; backend_ini(k,e+1); if(!strcmp(k,"docked")) g_opt_docked=atoi(e+1); if(!strcmp(k,"fps_limit")){ g_opt_fps=atoi(e+1); if(g_opt_fps!=30 && g_opt_fps<60 && g_opt_fps!=0) g_opt_fps=60; } } }
   snprintf(g_datadir,sizeof g_datadir,"%s%s_data/",g_exedir,g_exename);
   snprintf(g_hints_path,sizeof g_hints_path,"%s%s.hints",g_exedir,g_exename);
   pm_init(&g_hint_lock); pm_init(&g_flock);

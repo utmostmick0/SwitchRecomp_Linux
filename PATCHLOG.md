@@ -108,6 +108,60 @@ The cumulative beta patch is `patches/milestone-008-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-009-main-to-beta.patch`.
 
+## Milestone 010 — OpenGL geometry shader support
+
+- Synced the shared geometry shader translator and OpenGL pipeline support from beta.
+- Geometry shaders now declare primitive input/output layouts, read indexed per-vertex attributes, apply the runtime
+  viewport/depth transform to emitted vertices, and bind their separable GL program and stage resources.
+- Geometry shader draws require separable program pipeline support. Tessellation stages remain unsupported; when
+  separable pipelines are unavailable, the runtime logs and draws without the geometry stage.
+- Packaging-specific files were not changed. Rebuilt the Flatpak branch's Linux X11 runtime to check compilation;
+  game-level rendering still needs validation with a title that uses geometry shaders.
+
+The matching beta patch is `patches/milestone-008-main-to-beta.patch`.
+
+## Milestone 011 — shader opcode lookup table
+
+- Synced the shader decoder lookup optimization from beta. A precomputed table maps each 16-bit instruction prefix
+  to the first matching opcode, replacing the per-instruction linear pattern scan.
+- Kept the Flatpak runtime's existing shader patterns and platform-specific changes. Dread-specific Vulkan, Android,
+  and audio code was not copied into this OpenGL runtime.
+- Rebuilt the Linux X11 runtime to check compilation.
+
+The matching beta patch is `patches/milestone-009-main-to-beta.patch`.
+
+## Milestone 012 — 30 FPS presentation cap
+
+- Synced beta's `fps_limit=30` mode, which skips every other presented image while retaining the game's normal
+  60 Hz update pacing. GPU and CPU-backed presentation paths use the same cap.
+- Rebuilt the Linux X11 runtime to check compilation. Set `fps_limit=30` in the game's generated INI to enable it.
+
+The matching beta patch is `patches/milestone-010-main-to-beta.patch`.
+
+## Milestone 013 — rsync ROMFS copying on Linux
+
+- Synced beta's Linux ROMFS copy improvement: `rsync` transfers only files that are new or changed,
+  preserves timestamps, and uses the same two-second mtime tolerance. Extra destination files remain.
+- Windows and Linux installations without `rsync` retain the Python copy fallback, with a status
+  message when Linux uses that fallback.
+- This affects the Python recompiler, so it takes effect the next time a game is copied; no game
+  runtime rebuild is needed.
+
+The matching beta patch is `patches/milestone-011-main-to-beta.patch`.
+
+## Milestone 014 — XCDE shader limits and texture formats
+
+- Synced beta's XCDE fixes. The shader translator now checks the active OpenGL stage uniform-block limits and uses
+  read-only storage blocks for guest constant buffers that exceed those limits; the runtime binds the overflow
+  buffers through its existing constant-buffer upload path.
+- Added G24R8 and RGBX16SN texture mappings seen in the XCDE log. RGBX16SN samples with opaque alpha for its unused
+  X component.
+- The nine available trace manifests have no untranslated or failed shaders in recorded draws. The one-frame
+  startup stalls and SEVEN_Produ's invalid instruction fetch were not attributable to these renderer issues.
+- Rebuild the Flatpak runtime before testing; existing games do not need recompilation.
+
+The matching beta patch is `patches/milestone-012-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

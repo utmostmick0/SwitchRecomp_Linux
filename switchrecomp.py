@@ -308,6 +308,25 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
 
 def sync_tree(src, dst):
     """copy the files that are new or changed (size or time); copy2 keeps the time for the next check"""
+    # ROMFS trees can contain many large files. On Linux, let rsync compare and
+    # transfer only changed files instead of opening and copying each one here.
+    rsync = shutil.which('rsync') if sys.platform.startswith('linux') else None
+    if rsync:
+        os.makedirs(dst, exist_ok=True)
+        cmd = [rsync, '-rlt', '--modify-window=2', '--itemize-changes',
+               '--out-format=%i', '--', os.path.join(os.path.abspath(src), ''),
+               os.path.join(os.path.abspath(dst), '')]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, errors='replace')
+        if result.returncode:
+            detail = result.stderr.strip() or 'no error details'
+            raise RuntimeError('rsync failed while copying ROMFS: ' + detail)
+        # Itemized regular files and symlinks count as copied entries; directory
+        # creation lines do not.
+        return sum(line.startswith(('>f', '<f', '>L', '<L', 'cL'))
+                   for line in result.stdout.splitlines())
+
+    # Keep the portable path for Windows and Linux installs without rsync.
     copied = 0
     for root, dirs, names in os.walk(src):
         droot = os.path.join(dst, os.path.relpath(root, src))
@@ -353,6 +372,8 @@ def copy_data(mods, npdm, romfs, entry, datadir, say):
         if os.path.abspath(romfs) != os.path.abspath(dst):
             first = not os.path.exists(dst)
             if first: say('Copying romfs (may take a while)...')
+            if sys.platform.startswith('linux') and not shutil.which('rsync'):
+                say('rsync is unavailable; using the built-in ROMFS copy fallback')
             n = sync_tree(romfs, dst)
             if n and not first: say('romfs: %d changed files copied' % n)
 

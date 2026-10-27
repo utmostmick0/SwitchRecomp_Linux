@@ -89,16 +89,24 @@ static GlFmt tic_format(u32 w0, int srgb){
     case 0x01: r= flt? F(GL_RGBA32F,GL_RGBA,GL_FLOAT,16) : ui? F(GL_RGBA32UI,GL_RGBA_INTEGER,GL_UNSIGNED_INT,16) : F(GL_RGBA32I,GL_RGBA_INTEGER,GL_INT,16); break;
     case 0x02: r= F(GL_RGB32F,GL_RGB,GL_FLOAT,12); break;
     case 0x03: r= flt? F(GL_RGBA16F,GL_RGBA,GL_HALF_FLOAT,8) : sn? F(GL_RGBA16_SNORM,GL_RGBA,GL_SHORT,8) : ui? F(GL_RGBA16UI,GL_RGBA_INTEGER,GL_UNSIGNED_SHORT,8) : si? F(GL_RGBA16I,GL_RGBA_INTEGER,GL_SHORT,8) : F(GL_RGBA16,GL_RGBA,GL_UNSIGNED_SHORT,8); break;
+    case 0x73: r= F(GL_RGBA16_SNORM,GL_RGBA,GL_SHORT,8); break; /* RGBX16SN: 4x16-bit storage, opaque X */
     case 0x04: r= flt? F(GL_RG32F,GL_RG,GL_FLOAT,8) : ui? F(GL_RG32UI,GL_RG_INTEGER,GL_UNSIGNED_INT,8) : F(GL_RG32I,GL_RG_INTEGER,GL_INT,8); break;
+    /* ETC2/EAC are core in OpenGL 4.3. Preserve their 4x4 blocks on upload. */
+    case 0x06: r=FC(srgb? 0x9275 : 0x9274,8); break; /* ETC2 RGB8 */
     case 0x07: case 0x08: r= sn? F(GL_RGBA8_SNORM,GL_RGBA,GL_BYTE,4) : ui? F(GL_RGBA8UI,GL_RGBA_INTEGER,GL_UNSIGNED_BYTE,4) : si? F(GL_RGBA8I,GL_RGBA_INTEGER,GL_BYTE,4) : F(srgb? GL_SRGB8_ALPHA8 : GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE,4); break;
     case 0x09: r= ui? F(GL_RGB10_A2UI,GL_RGBA_INTEGER,GL_UNSIGNED_INT_2_10_10_10_REV,4) : F(GL_RGB10_A2,GL_RGBA,GL_UNSIGNED_INT_2_10_10_10_REV,4); break;
+    case 0x0A: r=FC(srgb? 0x9277 : 0x9276,8); break; /* ETC2 RGB8 punch-through alpha */
+    case 0x0B: r=FC(srgb? 0x9279 : 0x9278,16); break; /* ETC2 RGBA8 / EAC alpha */
     case 0x0C: r= flt? F(GL_RG16F,GL_RG,GL_HALF_FLOAT,4) : sn? F(GL_RG16_SNORM,GL_RG,GL_SHORT,4) : ui? F(GL_RG16UI,GL_RG_INTEGER,GL_UNSIGNED_SHORT,4) : si? F(GL_RG16I,GL_RG_INTEGER,GL_SHORT,4) : F(GL_RG16,GL_RG,GL_UNSIGNED_SHORT,4); break;
+    case 0x0E: r= FD(GL_DEPTH24_STENCIL8,GL_DEPTH_STENCIL,GL_UNSIGNED_INT_24_8,4); break; /* G24R8 */
     case 0x0F: r= flt? F(GL_R32F,GL_RED,GL_FLOAT,4) : ui? F(GL_R32UI,GL_RED_INTEGER,GL_UNSIGNED_INT,4) : F(GL_R32I,GL_RED_INTEGER,GL_INT,4); break;
     case 0x12: r= F(GL_RGBA4,GL_RGBA,GL_UNSIGNED_SHORT_4_4_4_4_REV,2); break;
     case 0x13: case 0x14: r= F(GL_RGB5_A1,GL_RGBA,GL_UNSIGNED_SHORT_1_5_5_5_REV,2); break;
     case 0x15: r= F(GL_RGB565,GL_RGB,GL_UNSIGNED_SHORT_5_6_5_REV,2); break;
     case 0x16: r= F(GL_RGB565,GL_RGB,GL_UNSIGNED_SHORT_5_6_5,2); break;
     case 0x18: r= sn? F(GL_RG8_SNORM,GL_RG,GL_BYTE,2) : ui? F(GL_RG8UI,GL_RG_INTEGER,GL_UNSIGNED_BYTE,2) : si? F(GL_RG8I,GL_RG_INTEGER,GL_BYTE,2) : F(GL_RG8,GL_RG,GL_UNSIGNED_BYTE,2); break;
+    case 0x19: r=FC(sn? 0x9271 : 0x9270,8); break; /* EAC R11 */
+    case 0x1A: r=FC(sn? 0x9273 : 0x9272,16); break; /* EAC RG11 */
     case 0x1B: r= flt? F(GL_R16F,GL_RED,GL_HALF_FLOAT,2) : sn? F(GL_R16_SNORM,GL_RED,GL_SHORT,2) : ui? F(GL_R16UI,GL_RED_INTEGER,GL_UNSIGNED_SHORT,2) : si? F(GL_R16I,GL_RED_INTEGER,GL_SHORT,2) : F(GL_R16,GL_RED,GL_UNSIGNED_SHORT,2); break;
     case 0x1D: case 0x1C: r= sn? F(GL_R8_SNORM,GL_RED,GL_BYTE,1) : ui? F(GL_R8UI,GL_RED_INTEGER,GL_UNSIGNED_BYTE,1) : si? F(GL_R8I,GL_RED_INTEGER,GL_BYTE,1) : F(GL_R8,GL_RED,GL_UNSIGNED_BYTE,1); break;
     case 0x20: r= F(GL_RGB9_E5,GL_RGB,GL_UNSIGNED_INT_5_9_9_9_REV,4); break;
@@ -119,7 +127,6 @@ static GlFmt tic_format(u32 w0, int srgb){
     case 0x2F: r= FD(GL_DEPTH_COMPONENT32F,GL_DEPTH_COMPONENT,GL_FLOAT,4); break;
     case 0x30: r= FD(GL_DEPTH32F_STENCIL8,GL_DEPTH_STENCIL,GL_FLOAT_32_UNSIGNED_INT_24_8_REV,8); break;   /* ZF32_X24S8 */
     case 0x3A: r= FD(GL_DEPTH_COMPONENT16,GL_DEPTH_COMPONENT,GL_UNSIGNED_SHORT,2); break;
-    case 0x19: r= FD(GL_DEPTH32F_STENCIL8,GL_DEPTH_STENCIL,GL_FLOAT_32_UNSIGNED_INT_24_8_REV,8); break;
     default: r= F(GL_RGBA8,GL_RGBA,GL_UNSIGNED_BYTE,4); r.bpp=0; { static u32 said[4]; int k; for(k=0;k<4&&said[k]!=f+1;k++); if(k==4){ for(k=0;k<4&&said[k];k++); if(k<4){ said[k]=f+1; WARN("gpu: unsupported texture format %x (ignored)\n",f); } } } break;
   }
   if(r.astc && srgb) r.ifmt=GL_SRGB8_ALPHA8;
@@ -853,11 +860,16 @@ typedef struct { u64 gva, cpu; u32 key2, epoch, chk; int stage; Sh* s; } ShA;
 static int g_ww; static int ww_dirty(u64 ga, u64 len, u32 since);
 
 static ShA sha[4096]; static u64 st_sh_fast;
-static int g_sh_bind; static u32* g_last_r3d;
+static int g_sh_bind; static u32* g_last_r3d; static u32 g_gs_input_vertices;
 static int sh_cb_read(u32 idx, u32 off, u32* out);
 static void sh_dump_cbs(u64 h);
 static u32 g_fs_rtk, g_fs_rtm, g_fs_rts;   /* FS integer output key */
 static void aw_write(const char* path, const void* d, size_t n, int append);
+static GLenum shader_gl_type(int stage){
+  return stage==ST_VS? GL_VERTEX_SHADER : stage==ST_GS? GL_GEOMETRY_SHADER :
+         stage==ST_CS? GL_COMPUTE_SHADER : stage==ST_TCS? GL_TESS_CONTROL_SHADER :
+         stage==ST_TES? GL_TESS_EVALUATION_SHADER : GL_FRAGMENT_SHADER;
+}
 
 /* common end stuff: alpha test for the FS, Y flip for the VS */
 static char* sh_post(char* src, int stage){
@@ -870,8 +882,15 @@ static char* sh_post(char* src, int stage){
       char* out=malloc(strlen(src)*2+strlen(fn)+64); memcpy(out,src,pre); out[pre]=0; strcat(out,fn); char* o=out+strlen(out); const char* q2=p;
       while(*q2){ if(!strncmp(q2,"return;",7)){ o+=sprintf(o,"{ if(swr_at.x!=0.0 && !swr_atest(frag_color0.w)) discard; return; }"); q2+=7; } else *o++=*q2++; }
       *o=0; free(src); src=out; } }
+  /* Geometry shaders emit final positions, so apply the viewport/depth conversion per emitted vertex. */
+  if(stage==ST_GS && src){ char* p=strstr(src,"void main(){"); if(p){ size_t pre=p-src; char* ns=malloc(strlen(src)+512);
+      memcpy(ns,src,pre); ns[pre]=0; strcat(ns,"uniform vec4 swr_vp;\n"); strcat(ns,p); free(src); src=ns;
+      const char* fx="{ gl_Position.y *= swr_vp.x; if(swr_vp.y!=0.0) gl_Position.z = gl_Position.z*2.0 - gl_Position.w; EmitVertex(); }";
+      char* out=malloc(strlen(src)*3+64); char* o=out; const char* q2=src;
+      while(*q2){ if(!strncmp(q2,"EmitVertex();",13)){ o+=sprintf(o,"%s",fx); q2+=13; } else *o++=*q2++; }
+      *o=0; free(src); src=out; } }
   /* Y flip */
-  if(stage==ST_VS && src){ char* p=strstr(src,"void main(){"); if(p){ size_t pre=p-src; char* ns=malloc(strlen(src)+512);
+  if(stage==ST_VS && src && !(g_last_r3d && (g_last_r3d[0x840]&1))){ char* p=strstr(src,"void main(){"); if(p){ size_t pre=p-src; char* ns=malloc(strlen(src)+512);
       memcpy(ns,src,pre); ns[pre]=0; strcat(ns,"uniform vec4 swr_vp;\n"); strcat(ns,p); free(src); src=ns;
       /* patch every return */
       char* out=malloc(strlen(src)*3+64); char* o=out; const char* q2=src;
@@ -881,8 +900,8 @@ static char* sh_post(char* src, int stage){
   return src; }
 
 static Sh* shader_get(u64 gva_code, int stage, u32 attr_int, u32 attr_sint){
-  st_shaders++; g_sh_bind= stage==ST_VS? 0 : 4; g_shader_cb_read=sh_cb_read; /* BRX table is only used to mark targets, length doesn't change */
-  u32 key2= stage==ST_VS? (attr_int^(attr_sint*31)) : (attr_int*0x9E3779B1u ^ attr_sint*0x85EBCA6Bu ^ g_fs_rtk);
+  st_shaders++; g_sh_bind= stage==ST_VS? 0 : stage==ST_GS? 3 : 4; g_shader_cb_read=sh_cb_read; /* BRX table is only used to mark targets, length doesn't change */
+  u32 key2= stage==ST_VS? (attr_int^(attr_sint*31)^((g_last_r3d && (g_last_r3d[0x840]&1))? 0xA341316Cu : 0)) : stage==ST_GS? (g_gs_input_vertices*0x85EBCA6Bu) : (attr_int*0x9E3779B1u ^ attr_sint*0x85EBCA6Bu ^ g_fs_rtk);
   ShA* ca=&sha[(u32)((gva_code>>6)^(gva_code>>18)^((u64)key2*0x9E3779B1u)^((u32)stage<<11))&4095];
   if(ca->s && ca->gva==gva_code && ca->stage==stage && ca->key2==key2){
     if(ca->epoch==g_submit_epoch){ st_sh_fast++; return ca->s; }
@@ -904,6 +923,7 @@ static Sh* shader_get(u64 gva_code, int stage, u32 attr_int, u32 attr_sint){
   ca->gva=gva_code; ca->key2=key2; ca->stage=stage; ca->epoch=g_submit_epoch; ca->chk=g_submit_epoch; ca->cpu=gmmu_translate(gva_code); ca->s=s;
   if(stage==ST_FS){ s->si.tex_int_mask=attr_int; s->si.tex_sint_mask=attr_sint; s->si.rt_int_mask=g_fs_rtm; s->si.rt_sint_mask=g_fs_rts; }
   else { s->si.attr_int_mask=attr_int; s->si.attr_sint_mask=attr_sint; }
+  if(stage==ST_GS) s->si.gs_input_vertices=g_gs_input_vertices;
   char* src=shader_to_glsl(code,0x10000,stage,&s->si);
   /* dump shaders with indirect branches (code + cbufs) for offline analysis */
   { extern int g_opt_diag; if(g_opt_diag && src && strstr(src,"uint t_ = uint(")){ static int nb; if(nb<24){ nb++; plat_mkdir("captures"); plat_mkdir("captures/failed"); char fp[200];
@@ -917,8 +937,7 @@ static Sh* shader_get(u64 gva_code, int stage, u32 attr_int, u32 attr_sint){
       snprintf(fp,sizeof fp,"captures/failed/%016llx_%s.bin",(unsigned long long)h,stage==ST_VS?"vs":"fs"); aw_write(fp,code,0x10000,0);
       LOG("shader %016llx saved to %s (send it so the missing texture can be analyzed)\n",(unsigned long long)h,fp); } }
   src=sh_post(src,stage);
-  GLenum ty= stage==ST_VS? GL_VERTEX_SHADER : stage==ST_FS? GL_FRAGMENT_SHADER : stage==ST_GS? GL_GEOMETRY_SHADER : stage==ST_CS? GL_COMPUTE_SHADER : stage==ST_TCS? GL_TESS_CONTROL_SHADER : GL_TESS_EVALUATION_SHADER;
-  (void)ty; if(!src) s->failed=1;
+  if(!src) s->failed=1;
   s->src=src; src=NULL;   /* only compiled if it isn't in the disk cache */
   { static int dump=-1; if(dump<0){ dump=getenv("SWR_DUMP_SHADERS")!=NULL; } if(dump && s->src){ char pth[256]; snprintf(pth,sizeof pth,"shader_%016llx_%d.glsl",(unsigned long long)h,stage); FILE* f=fopen(pth,"w"); if(f){ fputs(s->src,f); fclose(f);} } }
   free(src); free(tmp);
@@ -927,7 +946,7 @@ static Sh* shader_get(u64 gva_code, int stage, u32 attr_int, u32 attr_sint){
 /* deferred compile + on-disk program binaries */
 static int sh_ensure(Sh* s){
   if(s->gl) return 1; if(s->failed || !s->src) return 0;
-  GLenum ty= s->stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER; char err[4096]; err[0]=0;
+  GLenum ty=shader_gl_type(s->stage); char err[4096]; err[0]=0;
   s->gl=compile(ty,s->src,err,sizeof err);
   if(!s->gl){ s->failed=1; WARN("shader %016llx (stage %d) failed to compile:\n%s\n",(unsigned long long)s->hash,s->stage,err); if(g_verbose>=2) WARN("---- GLSL ----\n%s\n",s->src); return 0; }
   return 1; }
@@ -953,7 +972,7 @@ static void pack_add(u64 key, Sh* vs, Sh* fs);
 static void pack_add_sh(u64 key, Sh* s);
 
 static int sh_start(Sh* s){ if(s->gl) return 1; if(s->failed || !s->src) return 0;
-  s->gl=glCreateShader(s->stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER); const char* src=s->src; glShaderSource(s->gl,1,&src,NULL); glCompileShader(s->gl); return 1; }
+  s->gl=glCreateShader(shader_gl_type(s->stage)); const char* src=s->src; glShaderSource(s->gl,1,&src,NULL); glCompileShader(s->gl); return 1; }
 
 static GLuint prog_finish(Sh* vs, Sh* fs, GLuint p);
 static u64 prog_key(Sh* vs, Sh* fs);
@@ -1006,7 +1025,7 @@ typedef struct WJob { const char* vs; const char* fs; char* own_vs; char* own_fs
 /* uniform locations are looked up here on the compile thread's own context, on the GPU thread every
    glGetUniformLocation waited for the whole GL queue */
 static void job_locs(WJob* j, GLuint p){
-  if(j->sep){ j->loc[0]= glGetUniformLocation(p, j->stype==GL_VERTEX_SHADER? "swr_vp" : "swr_at"); j->loc[1]=-1; }
+  if(j->sep){ j->loc[0]= glGetUniformLocation(p, (j->stype==GL_VERTEX_SHADER || j->stype==GL_GEOMETRY_SHADER)? "swr_vp" : "swr_at"); j->loc[1]=-1; }
   else { j->loc[0]=glGetUniformLocation(p,"swr_vp"); j->loc[1]=glGetUniformLocation(p,"swr_at"); } }
 
 #define WQN 8192
@@ -1158,7 +1177,7 @@ static void shader_worker(void* arg){
     if(j->sep) p_glProgramParameteri(p,0x8258 /* GL_PROGRAM_SEPARABLE */,GL_TRUE);
     if(g_pcache>0) p_glProgramParameteri(p,GL_PROGRAM_BINARY_RETRIEVABLE_HINT,GL_TRUE);
     glLinkProgram(p); GLint ok=0; glGetProgramiv(p,GL_LINK_STATUS,&ok);
-    if(!ok){ GLint c=1; char e[1024]; e[0]=0; glGetShaderiv(a,GL_COMPILE_STATUS,&c); if(!c){ glGetShaderInfoLog(a,sizeof e,NULL,e); snprintf(j->log,sizeof j->log,"%s: %s",j->sep? (j->stype==GL_VERTEX_SHADER? "VS" : "FS") : "VS",e); }
+    if(!ok){ GLint c=1; char e[1024]; e[0]=0; glGetShaderiv(a,GL_COMPILE_STATUS,&c); if(!c){ glGetShaderInfoLog(a,sizeof e,NULL,e); snprintf(j->log,sizeof j->log,"%s: %s",j->sep? (j->stype==GL_VERTEX_SHADER? "VS" : j->stype==GL_GEOMETRY_SHADER? "GS" : "FS") : "VS",e); }
       else if(b && (glGetShaderiv(b,GL_COMPILE_STATUS,&c),!c)){ glGetShaderInfoLog(b,sizeof e,NULL,e); snprintf(j->log,sizeof j->log,"FS: %s",e); } else glGetProgramInfoLog(p,sizeof j->log,NULL,j->log);
       glDeleteProgram(p); p=0; }
     else if(g_pcache>0){ GLint len=0; glGetProgramiv(p,GL_PROGRAM_BINARY_LENGTH,&len);
@@ -1213,11 +1232,11 @@ static void worker_start(void){
 /* ============================================================ separable programs
    one program per shader stage, compiled once. draws just bind the stages instead of linking every vs+fs
    combination */
-static int g_sep=-1; static GLuint g_pipe; static int g_pipe_on; static GLuint g_pipe_vs, g_pipe_fs;
+static int g_sep=-1; static GLuint g_pipe; static int g_pipe_on; static GLuint g_pipe_vs, g_pipe_gs, g_pipe_fs;
 typedef void (APIENTRY*PFN_UPS_)(GLuint,GLbitfield,GLuint); typedef void (APIENTRY*PFN_BPP_)(GLuint); typedef void (APIENTRY*PFN_GPP_)(GLsizei,GLuint*);
 static PFN_UPS_ p_ups; static PFN_BPP_ p_bpp;
 
-static void sh_uloc(Sh* s){ s->uloc= s->sp? glGetUniformLocation(s->sp, s->stage==ST_VS? "swr_vp" : "swr_at") : -1; }
+static void sh_uloc(Sh* s){ s->uloc= s->sp? glGetUniformLocation(s->sp, (s->stage==ST_VS || s->stage==ST_GS)? "swr_vp" : "swr_at") : -1; }
 
 static int sh_sep_ready(Sh* s){
   if(s->sps>=2) return 1;
@@ -1226,12 +1245,12 @@ static int sh_sep_ready(Sh* s){
     if(st==1){ s->sp=j->prog; s->sps=2; pack_add_sh(j->key,s); s->uloc=j->loc[0]; free(j); return 1; }
     else { s->sp=0; s->sps=3; WARN("shader %016llx (stage %d) failed to compile: %s\n",(unsigned long long)s->hash,s->stage,j->log);
       static int nd; if(nd<16 && s->src){ nd++; plat_mkdir("captures"); plat_mkdir("captures/failed"); char fp[200];
-        snprintf(fp,sizeof fp,"captures/failed/%016llx_%s.glsl",(unsigned long long)s->hash,s->stage==ST_VS?"vs":"fs"); FILE* f=fopen(fp,"w"); if(f){ fputs(s->src,f); fclose(f); } } }
+        snprintf(fp,sizeof fp,"captures/failed/%016llx_%s.glsl",(unsigned long long)s->hash,s->stage==ST_VS?"vs":s->stage==ST_GS?"gs":"fs"); FILE* f=fopen(fp,"w"); if(f){ fputs(s->src,f); fclose(f); } } }
     free(j); sh_uloc(s); return 1; }
   s->sps=3; if(s->failed || !s->src) return 1;
   u64 key=sh_key(s); pcache_init();
   if(g_worker==1){ /* disk binary or compile, both on the compile thread */
-    struct WJob* j=calloc(1,sizeof *j); j->vs=s->src; j->key=key; j->keep=1; j->sep=1; j->stype= s->stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER;
+    struct WJob* j=calloc(1,sizeof *j); j->vs=s->src; j->key=key; j->keep=1; j->sep=1; j->stype=shader_gl_type(s->stage);
     if(g_pcache>0){ j->try_bin=1; snprintf(j->bin_path,sizeof j->bin_path,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key); }
     if(wr_push(&wq_hi,j)){ s->sj=j; s->sps=1; return 0; }
     free(j); }
@@ -1241,7 +1260,7 @@ static int sh_sep_ready(Sh* s){
           if(ok){ free(b); fclose(f); s->sp=p; s->sps=2; sh_uloc(s); pack_add_sh(key,s); return 1; } glDeleteProgram(p); }
         free(b); }
       fclose(f); } }
-  struct WJob* j=calloc(1,sizeof *j); j->vs=s->src; j->key=key; j->keep=1; j->sep=1; j->stype= s->stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER;
+  struct WJob* j=calloc(1,sizeof *j); j->vs=s->src; j->key=key; j->keep=1; j->sep=1; j->stype=shader_gl_type(s->stage);
   if(g_worker==1 && wr_push(&wq_hi,j)){ s->sj=j; s->sps=1; return 0; }
   /* no compile thread, do it inline */
   GLuint a=glCreateShader(j->stype); const char* s1=s->src; glShaderSource(a,1,&s1,NULL); glCompileShader(a);
@@ -1825,6 +1844,13 @@ static void bind_gbufs(int stage, Sh* s){
 static GLuint g_ur; static u8* g_ur_ptr; static u32 g_ur_size, g_ur_head, g_ur_align=256; static u64 g_ur_abs; static GLsync g_ur_f[UR_SEGS];
 static PFNGLFENCESYNCPROC p_fs; static PFNGLCLIENTWAITSYNCPROC p_cws; static PFNGLDELETESYNCPROC p_ds;
 static u64 st_ur_wait; static u32 g_ub_bound[64];
+static u32 g_sb_bound[64];
+
+static int cb_ssbo_binding(int stage, Sh* s, int cb){
+  int slot=stage==0? 0 : stage==4? 1 : 2, rank=0;
+  for(int i=0;i<cb;i++) if(s->si.cbuf_ssbo_mask&(1u<<i)) rank++;
+  return 24+slot*4+rank;
+}
 
 static void ur_init(void){
   if(getenv("SWR_NO_UBO_RING")) return;
@@ -1873,7 +1899,10 @@ static void upload_cbufs_ring(int stage, Sh* s){
       if(src) memcpy(dst,src,sz); else if(a) gmem_read(a,dst,sz); else memset(dst,0,sz);
       if(tail) memset(dst+sz,0,tail);
       if(a){ e->a=a; e->valid=sz; e->sz=sz+tail; e->epoch=g_submit_epoch; e->gen=g_gw_gen; e->off=off; e->abs=g_ur_abs; } }
-    if(g_ub_bound[bb+i]!=off+1){ glBindBufferRange(GL_UNIFORM_BUFFER,bb+i,g_ur,off,65536); g_ub_bound[bb+i]=off+1; } } }
+    if(s->si.cbuf_ssbo_mask&(1u<<i)){
+      int bind=cb_ssbo_binding(stage,s,i);
+      if(g_sb_bound[bind]!=off+1){ glBindBufferRange(GL_SHADER_STORAGE_BUFFER,bind,g_ur,off,65536); g_sb_bound[bind]=off+1; }
+    } else if(g_ub_bound[bb+i]!=off+1){ glBindBufferRange(GL_UNIFORM_BUFFER,bb+i,g_ur,off,65536); g_ub_bound[bb+i]=off+1; } } }
 
 static void upload_cbufs(int stage, Sh* s){
   if(g_ur_ptr){ upload_cbufs_ring(stage,s); return; }
@@ -1885,7 +1914,10 @@ static void upload_cbufs(int stage, Sh* s){
     { /* same submit/address, not written by the gpu: unchanged (games don't write while the gpu reads) */
       extern u64 g_gw_gen; extern int gpu_mem_dirty_since(u64,u64,u64); static u64 la[5][18], lg[5][18], le[5][18]; static u32 lv[5][18];
       if(a && la[stage][i]==a && lv[stage][i]==sz && le[stage][i]==g_submit_epoch && last_sz[stage][i]==sz+(s->si.cbuf_max[i]>sz?s->si.cbuf_max[i]-sz:0) && !gpu_mem_dirty_since(lg[stage][i],a,sz)){
-        st_cb_skip++; glBindBufferBase(GL_UNIFORM_BUFFER,(stage==0? 0 : stage==4? 1 : 2)*18+i,g_ubuf[stage][i]); continue; }
+        st_cb_skip++;
+        if(s->si.cbuf_ssbo_mask&(1u<<i)) glBindBufferBase(GL_SHADER_STORAGE_BUFFER,cb_ssbo_binding(stage,s,i),g_ubuf[stage][i]);
+        else glBindBufferBase(GL_UNIFORM_BUFFER,(stage==0? 0 : stage==4? 1 : 2)*18+i,g_ubuf[stage][i]);
+        continue; }
       la[stage][i]=a; lv[stage][i]=sz; lg[stage][i]=g_gw_gen; le[stage][i]=g_submit_epoch; }
     st_cb_bytes+=sz;
     u32 tail= s->si.cbuf_max[i]>sz? s->si.cbuf_max[i]-sz : 0;   /* past the bound size reads 0 */
@@ -1895,7 +1927,8 @@ static void upload_cbufs(int stage, Sh* s){
     if(last_sz[stage][i]<sz || memcmp(last[stage][i],src,sz)){      /* exact compare */
       memcpy(last[stage][i],src,sz); last_sz[stage][i]=sz;
       glBindBuffer(GL_UNIFORM_BUFFER,g_ubuf[stage][i]); glBufferData(GL_UNIFORM_BUFFER,65536,NULL,GL_STREAM_DRAW); glBufferSubData(GL_UNIFORM_BUFFER,0,sz,src); }
-    glBindBufferBase(GL_UNIFORM_BUFFER,(stage==0? 0 : stage==4? 1 : 2)*18+i,g_ubuf[stage][i]); } }
+    if(s->si.cbuf_ssbo_mask&(1u<<i)) glBindBufferBase(GL_SHADER_STORAGE_BUFFER,cb_ssbo_binding(stage,s,i),g_ubuf[stage][i]);
+    else glBindBufferBase(GL_UNIFORM_BUFFER,(stage==0? 0 : stage==4? 1 : 2)*18+i,g_ubuf[stage][i]); } }
 
 /* multi-bind (GL 4.4): a stage's textures + samplers in two calls, none if nothing changed. other glBindTexture
    users (uploads, creation) use g_scratch_unit */
@@ -2108,6 +2141,7 @@ static void bind_textures(GpuChannel* ch, int stage, Sh* s){
     /* TIC swizzle */
     if(!zc_id && t && (t->target==want || (t->view && t->view_target==want))){ static const GLint sw[8]={GL_ZERO,GL_ZERO,GL_RED,GL_GREEN,GL_BLUE,GL_ALPHA,GL_ONE,GL_ONE};
       GLint m[4]={sw[(tic[0]>>19)&7],sw[(tic[0]>>22)&7],sw[(tic[0]>>25)&7],sw[(tic[0]>>28)&7]};
+      if((t->fkey&0x7F)==0x73) m[3]=GL_ONE; /* RGBX's padding component is opaque */
       /* RTs: only swizzles with constant 0/1 get applied (like an R8 HUD mask read as 1,1,1,R). pure reorders are
          left alone since the RT format already has the host order */
       /* RTs: the TIC swizzle is in memory component order but the GL texture is in logical order, so only RTs
@@ -2448,10 +2482,21 @@ static void trace_frame(void){
 static void lsfg_pump(void); static int g_lfn;
 void cs_flush_pending(void);
 
+static u32 gs_vertices_for_topology(u32 topology){
+  switch(topology){
+    case 0: return 1;
+    case 1: case 2: case 3: return 2;
+    case 10: case 11: return 4;
+    case 12: case 13: return 6;
+    default: return 3;
+  }
+}
+
 /* fps_target 30 / 20: the game still runs 60 steps a second (normal speed) but only every 2nd / 3rd frame gets
    drawn and shown. compute, copies and clears still run, so the game's state on the gpu stays right */
 int g_opt_frame_skip;
 static int g_skip_frame;
+static int frame_skip_count(void){ extern int g_opt_fps; int n=g_opt_frame_skip; if(g_opt_fps==30 && n<1) n=1; return n; }
 
 void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count, u32 base_vertex, u32 base_instance, u32 instances){
   if(!swr_render_enabled(ch->r3d)){ static int said; if(said<4){ said++; u32* q=ch->r3d; LOG("gpu: draw skipped by render enable (modes %u/%u, override %u)\n",q[0x4e]&7,q[0x556]&7,q[0x651]&3); } return; }
@@ -2462,37 +2507,40 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
   if(!count) return;
   /* shaders */
   u64 code=((u64)r[0x582]<<32)|r[0x583];
-  Sh* vs=NULL; Sh* fs=NULL;
+  Sh* vs=NULL; Sh* gs=NULL; Sh* fs=NULL;
   u32 attr_int=0, attr_sint=0;
   for(int i=0;i<32;i++){ u32 a=r[0x458+i]; u32 ty=(a>>27)&7; if(ty==3||ty==4){ attr_int|=1u<<i; if(ty==3) attr_sint|=1u<<i; } }
   /* stage slots: 0 VertexA, 1 VertexB, 2 TessCtrl, 3 TessEval, 4 Geometry, 5 Fragment. VertexB is always on even
      with the enable bit clear (NVN doesn't set it) */
   g_last_r3d=r;
+  g_gs_input_vertices=gs_vertices_for_topology(topology);
   for(int i=1;i<6;i+=4){ u32 cfg=r[0x800+i*0x10]; if(i!=1 && !(cfg&1)) continue; u64 addr=code+r[0x801+i*0x10];
     if(i==1) TM(TM_SH,vs=shader_get(addr,ST_VS,attr_int,attr_sint));
     else { g_fsk_tex_ns=0; TM(TM_SH,fs=fs_get_keyed(ch,addr)); g_tm[TM_SH]-=g_fsk_tex_ns; g_tm[TM_TEX]+=g_fsk_tex_ns; } }
-  if((r[0x820]|r[0x830]|r[0x840])&1){ /* tess / geometry: not translated yet, draw with just VS+FS */
+  int gs_on=(r[0x840]&1)!=0;
+  if(gs_on && g_sep>0) TM(TM_SH,gs=shader_get(code+r[0x841],ST_GS,0,0));
+  if((r[0x820]|r[0x830])&1 || (gs_on && g_sep<=0)){ /* tessellation is not translated; geometry needs separable programs */
     static u64 gseen[16]; static int ng; u64 ga=code+r[0x841]; int k=0; for(;k<ng;k++) if(gseen[k]==ga) break;
     if(k==ng && ng<16){ gseen[ng++]=ga; LOG("gpu: draw uses unsupported stages:%s%s%s (gs at %llx, rt0 %ux%u layers %u 3d %u) - drawn without them\n",(r[0x820]&1)?" TessCtrl":"",(r[0x830]&1)?" TessEval":"",(r[0x840]&1)?" Geometry":"",
         (unsigned long long)ga,r[0x202],r[0x203],r[0x206]&0xFFFF,(r[0x205]>>16)&1);
-      if(r[0x840]&1){ plat_mkdir("captures"); char fp[160]; snprintf(fp,sizeof fp,"captures/gs_%02d.bin",ng); u8* b=malloc(0x8000); gmem_read(ga,b,0x8000); FILE* f=fopen(fp,"wb"); if(f){ fwrite(b,1,0x8000,f); fclose(f); } free(b); } }
+      if(gs_on && g_sep<=0){ plat_mkdir("captures"); char fp[160]; snprintf(fp,sizeof fp,"captures/gs_%02d.bin",ng); u8* b=malloc(0x8000); if(b){ gmem_read(ga,b,0x8000); FILE* f=fopen(fp,"wb"); if(f){ fwrite(b,1,0x8000,f); fclose(f); } free(b); } } }
     trace_note("WARNING: unsupported stages enabled (tess/geometry)\n"); }
   if(vs && !fs){ /* depth-only passes: use an empty FS */
     static Sh nullfs; static char nsrc[64]; if(!nullfs.gl && !nullfs.failed){ char e[512]; snprintf(nsrc,sizeof nsrc,"#version %d core\nvoid main(){}\n",g_glsl_version); nullfs.stage=ST_FS; nullfs.hash=0x4E554C4C46530001ull; nullfs.src=nsrc; nullfs.gl=compile(GL_FRAGMENT_SHADER,nsrc,e,sizeof e); if(!nullfs.gl) nullfs.failed=1; }
     fs=&nullfs; }
   if(!vs || !fs){ st_noshader++; trace_note("DRAW SKIPPED: no shader\n"); return; }
-  if(vs->failed || fs->failed){ st_shfail++; trace_note("DRAW SKIPPED: failed shader vs=%016llx(%d) fs=%016llx(%d)\n",(unsigned long long)vs->hash,vs->failed,(unsigned long long)fs->hash,fs->failed); return; }
-  Prog* p=NULL; GLuint vpp=0, atp=0; GLint vpl=-1, atl=-1;
+  if(vs->failed || fs->failed || (gs && gs->failed)){ st_shfail++; trace_note("DRAW SKIPPED: failed shader vs=%016llx(%d) gs=%016llx(%d) fs=%016llx(%d)\n",(unsigned long long)vs->hash,vs->failed,(unsigned long long)(gs?gs->hash:0),gs?gs->failed:0,(unsigned long long)fs->hash,fs->failed); return; }
+  Prog* p=NULL; GLuint vpp=0, gsp=0, atp=0; GLint vpl=-1, glp=-1, atl=-1;
   /* draws into tables (3D/array RTs, or <= 64x64) usually happen once at level load. skipping one while its shader
      compiles leaves the table empty, so we wait for the compile here (one hitch) */
   int must_wait=0;
   { u32 ctl=r[0x487]; if((ctl&15)>=1){ u32* q=&r[0x200+((ctl>>4)&7)*0x10];
       if(q[0]|q[1]){ if(((q[5]>>16)&1) || (q[6]&0xFFFF)>1 || (q[2] && q[3] && q[2]<=128 && q[3]<=128)) must_wait=1; } } }
-  if(must_wait && g_sep>0){ u64 t0=plat_ns(); while((!sh_sep_ready(vs) || !sh_sep_ready(fs)) && plat_ns()-t0<3000000000ull) plat_sleep_ns(500000); st_waited++; }
-  if(g_sep>0){ int rv, rf; TM(TM_SHREADY,(rv=sh_sep_ready(vs), rf=sh_sep_ready(fs)));
-    if(!rv || !rf){ st_compiling++; trace_note("DRAW SKIPPED: compiling\n"); return; }
-    if(!vs->sp || !fs->sp){ st_noprog++; trace_note("DRAW SKIPPED: shader without program vs=%016llx fs=%016llx\n",(unsigned long long)vs->hash,(unsigned long long)fs->hash); return; }
-    vpp=vs->sp; vpl=vs->uloc; atp=fs->sp; atl=fs->uloc; }
+  if(must_wait && g_sep>0){ u64 t0=plat_ns(); while((!sh_sep_ready(vs) || (gs && !sh_sep_ready(gs)) || !sh_sep_ready(fs)) && plat_ns()-t0<3000000000ull) plat_sleep_ns(500000); st_waited++; }
+  if(g_sep>0){ int rv, rg=1, rf; TM(TM_SHREADY,(rv=sh_sep_ready(vs), rg=gs?sh_sep_ready(gs):1, rf=sh_sep_ready(fs)));
+    if(!rv || !rg || !rf){ st_compiling++; trace_note("DRAW SKIPPED: compiling\n"); return; }
+    if(!vs->sp || (gs && !gs->sp) || !fs->sp){ st_noprog++; trace_note("DRAW SKIPPED: shader without program vs=%016llx gs=%016llx fs=%016llx\n",(unsigned long long)vs->hash,(unsigned long long)(gs?gs->hash:0),(unsigned long long)fs->hash); return; }
+    vpp=vs->sp; vpl=vs->uloc; if(gs){ gsp=gs->sp; glp=gs->uloc; } atp=fs->sp; atl=fs->uloc; }
   else {
   p=program_get(vs,fs);
   if(must_wait){ u64 t0=plat_ns(); while(!program_ready(p) && plat_ns()-t0<3000000000ull) plat_sleep_ns(500000); st_waited++; }
@@ -2501,7 +2549,7 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
   if(!p->p){ st_noprog++;
     { static int said; if(said<5){ said++; LOG("gpu: program not linked vs=%016llx fs=%016llx active stages:%s%s%s%s%s%s\n",(unsigned long long)vs->hash,(unsigned long long)fs->hash,
         (r[0x800]&1)?" VertexA":"",(r[0x810]&1)?" VertexB":"",(r[0x820]&1)?" TessCtrl":"",(r[0x830]&1)?" TessEval":"",(r[0x840]&1)?" Geometry":"",(r[0x850]&1)?" Fragment":""); } } trace_note("DRAW SKIPPED: link failed vs=%016llx fs=%016llx\n",(unsigned long long)vs->hash,(unsigned long long)fs->hash); return; } }
-  g_draw_layered=vs->si.writes_layer;
+  g_draw_layered=vs->si.writes_layer || (gs && gs->si.writes_layer);
   TM(TM_STATE,bind_framebuffer(ch));
   { extern int g_opt_diag; if(g_opt_diag) rt_note_writer(ch,fs,code); }
   if(g_nrt && g_rt[0]){ g_last_cw=g_rt[0]->w; g_last_ch=g_rt[0]->h; }
@@ -2519,19 +2567,21 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
   st_drawn++;
   if(g_sep>0){ if(!g_pipe_on){ glUseProgram(0); p_bpp(g_pipe); g_pipe_on=1; }
     if(g_pipe_vs!=vpp){ p_ups(g_pipe,0x00000001 /* VERTEX_SHADER_BIT */,vpp); g_pipe_vs=vpp; }
+    if(g_pipe_gs!=gsp){ p_ups(g_pipe,0x00000004 /* GEOMETRY_SHADER_BIT */,gsp); g_pipe_gs=gsp; }
     if(g_pipe_fs!=atp){ p_ups(g_pipe,0x00000002 /* FRAGMENT_SHADER_BIT */,atp); g_pipe_fs=atp; } }
   else glUseProgram(p->p);
   TM(TM_STATE,apply_state(ch));
   { float vt[2]; memcpy(vt,&r[0x280],8); float fl[4]={ (vt[1]<0)!=(origin_flip_h(r)!=0)? -1.f : 1.f, p_clip? 0.f : (float)(r[0x35F]&1), 0, 0 };
-    if(vpl>=0){ if(g_sep>0){ if(!vs->lu_ok || memcmp(vs->lu,fl,16)){ memcpy(vs->lu,fl,16); vs->lu_ok=1; glProgramUniform4fv(vpp,vpl,1,fl); } } else glProgramUniform4fv(vpp,vpl,1,fl); } }
+    if(vpl>=0){ if(g_sep>0){ if(!vs->lu_ok || memcmp(vs->lu,fl,16)){ memcpy(vs->lu,fl,16); vs->lu_ok=1; glProgramUniform4fv(vpp,vpl,1,fl); } } else glProgramUniform4fv(vpp,vpl,1,fl); }
+    if(glp>=0 && gs && (!gs->lu_ok || memcmp(gs->lu,fl,16))){ memcpy(gs->lu,fl,16); gs->lu_ok=1; glProgramUniform4fv(gsp,glp,1,fl); } }
   if(atl>=0){ /* alpha test: 0x4BB enable, 0x4C4 ref, 0x4C5 func (GL 0x200.. or D3D 1..8) */
     u32 fn=r[0x4C5]; int f= fn>=0x200 && fn<=0x207? (int)(fn-0x200) : fn>=1 && fn<=8? (int)fn-1 : 7; float ref; memcpy(&ref,&r[0x4C4],4);
     float at[4]={ (r[0x4BB]&1)? 1.f : 0.f, (float)f, ref, 0 };
     memcpy(g_last_at,at,16);
     if(g_sep>0){ if(!fs->lu_ok || memcmp(fs->lu,at,16)){ memcpy(fs->lu,at,16); fs->lu_ok=1; glProgramUniform4fv(atp,atl,1,at); } } else glProgramUniform4fv(atp,atl,1,at); }
-  TM(TM_CB,(upload_cbufs(0,vs), upload_cbufs(4,fs)));
-  g_ngw=0; TM(TM_GB,(bind_gbufs(0,vs), bind_gbufs(4,fs)));
-  int fs_imgs=0; TM(TM_TEX,(bind_textures(ch,0,vs), bind_textures(ch,4,fs), fs_imgs=bind_images(ch,fs)));
+  TM(TM_CB,(upload_cbufs(0,vs), gs?upload_cbufs(3,gs):(void)0, upload_cbufs(4,fs)));
+  g_ngw=0; TM(TM_GB,(bind_gbufs(0,vs), gs?bind_gbufs(3,gs):(void)0, bind_gbufs(4,fs)));
+  int fs_imgs=0; TM(TM_TEX,(bind_textures(ch,0,vs), gs?bind_textures(ch,3,gs):(void)0, bind_textures(ch,4,fs), fs_imgs=bind_images(ch,fs)));
   /* vertex attribs */
   u64 tb0_=plat_ns();
   glBindVertexArray(g_vao);
@@ -3286,6 +3336,10 @@ static void gpu_thread(void* arg){ t_gpu_thread=1;
     if(g_par){ typedef void (APIENTRY*MSCT)(GLuint); MSCT f=(MSCT)backend_gl_proc("glMaxShaderCompilerThreadsKHR"); if(!f) f=(MSCT)backend_gl_proc("glMaxShaderCompilerThreadsARB"); if(f) f(0xFFFFFFFFu); }
     LOG("shaders: parallel compilation %s\n",g_par? "enabled (no stutter: anything still compiling is drawn as soon as it is ready)" : "not available in this driver"); }
   { GLint v[6]={0}; glGetIntegerv(0x8B4D,&v[0]); glGetIntegerv(0x8872,&v[1]); glGetIntegerv(0x8A2F,&v[2]); glGetIntegerv(0x8A2B,&v[3]); glGetIntegerv(0x8A2D,&v[4]); glGetIntegerv(0x826E,&v[5]);
+    extern int g_gl_ubo_blocks[6];
+    g_gl_ubo_blocks[ST_VS]=v[3]; glGetIntegerv(0x8A2C,&g_gl_ubo_blocks[ST_GS]);
+    g_gl_ubo_blocks[ST_FS]=v[4]; glGetIntegerv(0x8E89,&g_gl_ubo_blocks[ST_TCS]);
+    glGetIntegerv(0x8E8A,&g_gl_ubo_blocks[ST_TES]); glGetIntegerv(0x91BB,&g_gl_ubo_blocks[ST_CS]);
     LOG("OpenGL limits: textures %d (per stage %d), UBO %d (VS %d, FS %d), uniform locations %d\n",v[0],v[1],v[2],v[3],v[4],v[5]); }
   if(g_verbose>=2){ typedef void (APIENTRY*DBGCB)(GLDEBUGPROC,const void*); DBGCB f=(DBGCB)backend_gl_proc("glDebugMessageCallback"); if(f){ glEnable(GL_DEBUG_OUTPUT); f(gl_dbg,NULL); } }
   glGenFramebuffers(1,&g_fbo); glGenFramebuffers(1,&g_rfbo); glGenFramebuffers(1,&g_dfbo); glGenVertexArrays(1,&g_vao); glGenVertexArrays(1,&g_scratch_vao); glGenBuffers(32,g_vbuf); glGenBuffers(1,&g_ibuf);
@@ -3375,11 +3429,12 @@ static void gpu_thread(void* arg){ t_gpu_thread=1;
         if(w.wait_id!=~0u){ extern int syncpt_wait(u32,u32,i64); extern void gpu_gl_before_syncwait(void); gpu_gl_before_syncwait();
           if(!syncpt_wait(w.wait_id,w.wait_val,2000000000)){ static int nl; if(nl<6){ nl++; LOG("gpu: submit fence %u >= %u never came (2 s), running it anyway\n",w.wait_id,w.wait_val); } } }
         gpu_submit_now(w.ent,w.n,w.syncpt); cs_kick_async(); free(w.ent); cs_submit_done(w.syncpt,w.incs); break;
-      case WK_PRESENT_CPU: g_present_guest_ns=w.sub_ns; trace_note("PRESENT CPU image %dx%d\n",w.w,w.h); present_cpu(w.px,w.w,w.h); free(w.px); g_frame++; gpu_evict_step(); frame_stats(); trace_frame(); break;
-      case WK_PRESENT_ADDR: if(g_skip_frame){ g_frame++; g_skip_frame= g_opt_frame_skip && g_frame%(g_opt_frame_skip+1); break; }
+      case WK_PRESENT_CPU: if(g_skip_frame){ free(w.px); g_frame++; g_skip_frame= g_frame%(frame_skip_count()+1); break; }
+        g_present_guest_ns=w.sub_ns; trace_note("PRESENT CPU image %dx%d\n",w.w,w.h); present_cpu(w.px,w.w,w.h); free(w.px); g_frame++; g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); gpu_evict_step(); frame_stats(); trace_frame(); break;
+      case WK_PRESENT_ADDR: if(g_skip_frame){ g_frame++; g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); break; }
         g_present_guest_ns=w.sub_ns;
         if(!present_addr(w.addr,w.w,w.h)){ extern void vi_convert_cpu(u64 a, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt, u32* out);
-          u32* px=malloc((size_t)w.w*w.h*4); vi_convert_cpu(w.addr,w.w,w.h,w.n,(w.fmt>>8)&15,(w.fmt>>12)&15,w.fmt&0xFF,px); present_cpu(px,w.w,w.h); free(px); } g_frame++; g_skip_frame= g_opt_frame_skip && g_frame%(g_opt_frame_skip+1); gpu_evict_step(); frame_stats(); trace_frame(); break;
+          u32* px=malloc((size_t)w.w*w.h*4); vi_convert_cpu(w.addr,w.w,w.h,w.n,(w.fmt>>8)&15,(w.fmt>>12)&15,w.fmt&0xFF,px); present_cpu(px,w.w,w.h); free(px); } g_frame++; g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); gpu_evict_step(); frame_stats(); trace_frame(); break;
       case WK_DUMP: dump_rts(); g_tr_arm=1; break;
       case WK_SHOT: do_screenshot(w.path[0]? w.path : NULL); __atomic_store_n(&g_shot_done,w.n,__ATOMIC_SEQ_CST); break;
     }
