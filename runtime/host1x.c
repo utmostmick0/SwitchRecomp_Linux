@@ -1,13 +1,16 @@
 /* SwitchRecomp - Copyright 2026 MZ Labs
    Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
    Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
-/* nvhost-nvdec / nvhost-vic (host1x channels). we parse the host1x stream, decode NVDEC H.264 jobs with OpenH264
-   (SPS/PPS get rebuilt from the picture setup the game fills in), and VIC jobs copy the last decoded picture into
-   the output surface. struct layouts and method offsets come from NVIDIA's open-gpu-doc (nvdec_drv.h, clc5b0.h,
-   VIC) */
+/* nvhost-nvdec / nvhost-vic (host1x channels). H.264 jobs use OpenH264 and WebM VP9 jobs use libvpx; VIC copies
+   the decoded picture into the game's output surface. struct layouts and method offsets come from NVIDIA's
+   open-gpu-doc (nvdec_drv.h, clc5b0.h, VIC). */
 #include "rt.h"
 #ifndef SWR_NO_H264
 #include "wels/codec_api.h"
+#endif
+#ifdef SWR_HAVE_VP9
+#include "vpx/vpx_decoder.h"
+#include "vpx/vp8dx.h"
 #endif
 
 u64 nvmap_addr(u32 h); u64 nvmap_addr_by_id(u32 id);
@@ -19,6 +22,22 @@ typedef struct { u32 iova, size; u64 addr; u32 h; } IoMap;
 static IoMap g_iom[1024]; static int g_niom; static u32 g_iova_next=0x10000000u; static PMutex g_hlk; static int g_hinit;
 
 static void h_init(void){ if(!g_hinit){ pm_init(&g_hlk); g_hinit=1; } }
+
+/* The game reads WebM through RomFS storage and then submits VP9 frame jobs to NVDEC. */
+#ifdef SWR_HAVE_VP9
+#define V9_FILES 64
+static const char* g_v9_recent[V9_FILES];
+int g_opt_video_async_retire;
+void vp9_note_file(const char* path){
+  if(!path || g_v9_recent[0]==path) return;
+  size_t n=strlen(path); if(n<5 || strcmp(path+n-5,".webm")) return;
+  h_init(); pm_lock(&g_hlk);
+  int k=0; for(;k<V9_FILES-1;k++) if(g_v9_recent[k]==path || !g_v9_recent[k]) break;
+  for(;k>0;k--) g_v9_recent[k]=g_v9_recent[k-1];
+  g_v9_recent[0]=path; pm_unlock(&g_hlk);
+  if(getenv("SWR_TRACE_VP9")) LOG("vp9 note: game opened %s\n",path);
+}
+#endif
 
 static u32 iova_map(u32 h){
   u64 a=nvmap_addr(h); if(!a) a=nvmap_addr_by_id(h); if(!a) return 0;
@@ -102,7 +121,38 @@ static u32 build_headers(const u8* ps, u8* out, u32 cap){
 static ISVCDecoder* g_dec;
 #endif
 static int g_dec_fail;
-static u8* g_fy; static u8* g_fuv; static u32 g_fw, g_fh, g_fcap; static u32 g_vframes;
+static u8* g_fy; static u8* g_fuv; static u32 g_fw, g_fh, g_fcap, g_fuv_cap; static u32 g_vframes;
+/* Keep VP9 pictures associated with their NVDEC output surface so VIC reads the right frame. */
+#ifdef SWR_HAVE_VP9
+typedef struct { u64 luma,display,used,owner; u8* y,*uv; u32 w,h,cap,frame; } DecodedSurface;
+static DecodedSurface decoded_surfaces[32]; static u64 decoded_clock;
+static void decoded_surface_save(u32* r,u64 owner,u32 frame,int cached){
+  u64 luma=(u64)r[0x43c/4]<<8, display=(u64)r[0x428/4]<<8;
+  if(!luma) luma=display;
+  if(!luma || !g_fw || !g_fh || !g_fy || !g_fuv) return;
+  u8* sy=g_fy,*suv=g_fuv; u32 w=g_fw,h=g_fh;
+  if(cached){ DecodedSurface* prior=NULL;
+    for(int i=0;i<32;i++) if(decoded_surfaces[i].used && decoded_surfaces[i].owner==owner){
+      if(decoded_surfaces[i].frame==frame){ prior=&decoded_surfaces[i]; break; }
+      if(!prior || decoded_surfaces[i].used>prior->used) prior=&decoded_surfaces[i];
+    }
+    if(!prior) return; sy=prior->y; suv=prior->uv; w=prior->w; h=prior->h;
+  }
+  int k=-1; for(int i=0;i<32;i++) if(decoded_surfaces[i].luma==luma){ k=i; break; }
+  if(k<0){ k=0; for(int i=1;i<32;i++) if(decoded_surfaces[i].used<decoded_surfaces[k].used) k=i; }
+  DecodedSurface* d=&decoded_surfaces[k]; u32 need=w*h;
+  if(d->cap<need){ u8* y=malloc(need),*uv=malloc(need/2+w+16); if(!y || !uv){ free(y); free(uv); return; }
+    free(d->y); free(d->uv); d->y=y; d->uv=uv; d->cap=need; }
+  d->luma=luma; d->display=display; d->w=w; d->h=h; d->owner=owner; d->frame=frame; d->used=++decoded_clock;
+  if(d->y!=sy) memcpy(d->y,sy,need);
+  if(d->uv!=suv) memcpy(d->uv,suv,(size_t)w*((h+1)/2));
+}
+static DecodedSurface* decoded_surface_find(u64 luma){
+  if(!luma) return NULL;
+  for(int i=0;i<32;i++) if(decoded_surfaces[i].used && (decoded_surfaces[i].luma==luma || decoded_surfaces[i].display==luma)) return &decoded_surfaces[i];
+  return NULL;
+}
+#endif
 static u8 g_last_hdr[512]; static u32 g_last_hdr_n;
 
 static int dec_open(void){
@@ -121,15 +171,20 @@ static int dec_open(void){
 static void keep_frame(unsigned char** pl, SBufferInfo* bi){
   u32 w=(u32)bi->UsrData.sSystemBuffer.iWidth, h=(u32)bi->UsrData.sSystemBuffer.iHeight; int sy=bi->UsrData.sSystemBuffer.iStride[0], sc=bi->UsrData.sSystemBuffer.iStride[1];
   if(!w || !h || w>4096 || h>4096) return;
-  u32 need=w*h; if(g_fcap<need){ free(g_fy); free(g_fuv); g_fy=malloc(need); g_fuv=malloc(need/2+w); g_fcap=need; }
+  u32 need=w*h; if(g_fcap<need){ free(g_fy); free(g_fuv); g_fy=malloc(need); g_fuv=malloc(need/2+w+16); g_fuv_cap=need/2+w+16; g_fcap=need; }
+  if(!g_fy || !g_fuv) return;
   for(u32 y=0;y<h;y++) memcpy(g_fy+(u64)y*w,pl[0]+(u64)y*sy,w);
   for(u32 y=0;y<h/2;y++){ u8* d=g_fuv+(u64)y*w; const u8* u=pl[1]+(u64)y*sc; const u8* v=pl[2]+(u64)y*sc; for(u32 x=0;x<w/2;x++){ d[2*x]=u[x]; d[2*x+1]=v[x]; } }
   g_fw=w; g_fh=h; g_vframes++; }
 #endif
 
-/* SET_CODEC_ID is method 0x80 (byte 0x200): 3 H.264, 5 VP8, 7 H.265, 9 VP9. only H.264 gets decoded, jobs for the
-   other codecs finish with a clean status and no picture, so the movie stays black but the player keeps going (the
-   WebM (VP9) movies in mario strikers and mario tennis aces would be H.264 garbage otherwise) */
+#ifdef SWR_HAVE_VP9
+#define SWR_NATIVE_VIDEO_RETIRE 1
+#include "vp9video.inc"
+#endif
+
+/* SET_CODEC_ID is method 0x80 (byte 0x200): 3 H.264, 5 VP8, 7 H.265, 9 VP9. Unsupported codecs finish with a
+   clean status and no picture so the game can continue past the movie. */
 static void nvdec_other(u32* r, u32 codec){
   u64 ps_iova=(u64)r[0x404/4]<<8, st_iova=(u64)r[0x424/4]<<8;
   u8* ps=iova_ptr(ps_iova,0x80); u8* sp= st_iova? iova_ptr(st_iova,16) : NULL;
@@ -137,11 +192,14 @@ static void nvdec_other(u32* r, u32 codec){
   if(ps && codec==9){ w=(u32)(u16)rd32(ps,0x60); h=(u32)(rd32(ps,0x60)>>16); }   /* Vp9PictureInfo current_frame_size */
   u32 mbs= (w && h)? ((w+15)/16)*((h+15)/16) : 1;
   if(sp){ u32 v[4]={ mbs, 0, 100000, 0 }; memcpy(sp,v,16); }
-  { static int said; if(!said){ said=1; LOG("video: the game plays a %s movie (%ux%u). Only H.264 is decoded, it stays black\n",
+  { static int said; if(!said){ said=1; LOG("video: the game plays an unsupported %s movie (%ux%u), it stays black\n",
       codec==9? "VP9" : codec==5? "VP8" : codec==7? "H.265" : "non-H.264",w,h); } } }
 
 static void nvdec_execute(u32* r){
   u32 codec=r[0x200/4];
+#ifdef SWR_HAVE_VP9
+  if(vp9_job(r,r[0x400/4]&0xF)) return;
+#endif
   if(codec && codec!=3){ nvdec_other(r,codec); return; }
   if(!dec_open()) return;
 #ifndef SWR_NO_H264
@@ -183,15 +241,22 @@ static void vic_put(u8* base, u64 off, const u8* src, u32 n, u64 lim){ if(off+n<
 
 static void vic_execute(u32* r){
   if(!g_vframes) return;
+#ifdef SWR_HAVE_VP9
+  u8* fy=g_fy; u8* fuv=g_fuv; u32 fw=g_fw, fh=g_fh;
+  DecodedSurface* picture=decoded_surface_find((u64)r[0x400/4]<<8);
+  if(picture){ fy=picture->y; fuv=picture->uv; fw=picture->w; fh=picture->h; }
+#else
+  u8* fy=g_fy; u8* fuv=g_fuv; u32 fw=g_fw, fh=g_fh;
+#endif
   { static u32 nv; nv++; if(nv%120==0) LOG("video: %u VIC jobs so far\n",nv); }
   u64 ly=(u64)r[0x720/4]<<8, lc=(u64)r[0x724/4]<<8, cfg_iova=(u64)r[0x708/4]<<8;
   u8* cs=iova_ptr(cfg_iova,0x28); u64 cfg=0; if(cs) memcpy(&cfg,cs+0x20,8);
   u32 fmt=(u32)(cfg&0x7F), blk=(u32)((cfg>>11)&15), bh=(u32)((cfg>>15)&15);
   u32 sw=(u32)((cfg>>32)&0x3FFF)+1, sh=(u32)((cfg>>46)&0x3FFF)+1;
-  if(!cs){ fmt=0x44; sw=g_fw; sh=g_fh; }
+  if(!cs){ fmt=0x44; sw=fw; sh=fh; }
   if(getenv("SWR_VIC_FMT")) fmt=(u32)strtoul(getenv("SWR_VIC_FMT"),0,0);
-  u32 w=g_fw<sw? g_fw : sw, h=g_fh<sh? g_fh : sh;
-  { static int said; if(said<3){ said++; LOG("video: VIC config %016llx: format %x, %s (block height %u), surface %ux%u, picture %ux%u\n",(unsigned long long)cfg,fmt,blk? "block linear" : "pitch linear",1u<<bh,sw,sh,g_fw,g_fh); } }
+  u32 w=fw<sw? fw : sw, h=fh<sh? fh : sh;
+  { static int said; if(said<3){ said++; LOG("video: VIC config %016llx: format %x, %s (block height %u), surface %ux%u, picture %ux%u\n",(unsigned long long)cfg,fmt,blk? "block linear" : "pitch linear",1u<<bh,sw,sh,fw,fh); } }
   if(fmt==0x1F || fmt==0x20){
     u32 pitch=sw*4; u64 lim= blk? (u64)pitch*(((sh+(8u<<bh)-1)/(8u<<bh))*(8u<<bh)) : (u64)pitch*sh;
     u8* py=iova_ptr(ly,lim); if(!py){ py=iova_ptr(ly,(u64)pitch*h); lim=(u64)pitch*h; }
@@ -199,7 +264,7 @@ static void vic_execute(u32* r){
     static u8* row; static u32 rcap; if(rcap<pitch){ row=realloc(row,pitch); rcap=pitch; }
     int ri= fmt==0x1F? 0 : 2, bi= fmt==0x1F? 2 : 0;
     for(u32 y=0;y<h;y++){
-      const u8* Y=g_fy+(u64)y*g_fw; const u8* UV=g_fuv+(u64)(y/2)*g_fw;
+      const u8* Y=fy+(u64)y*fw; const u8* UV=fuv+(u64)(y/2)*fw;
       for(u32 x=0;x<w;x++){
         /* BT.601, limited range */
         int c=((int)Y[x]-16)*298, d=(int)UV[x&~1u]-128, e=(int)UV[(x&~1u)+1]-128; u8* o=row+x*4;
@@ -214,10 +279,10 @@ static void vic_execute(u32* r){
   if(blk){ u32 gy=8u<<bh; ylim=(u64)pitch*((sh+gy-1)/gy*gy); clim=(u64)pitch*(((sh+1)/2+gy-1)/gy*gy); }
   u8* py=iova_ptr(ly,ylim); u8* pc= lc? iova_ptr(lc,clim) : NULL;
   if(!py){ static int said; if(said<4){ said++; LOG("video: VIC output luma at iova %llx not mapped\n",(unsigned long long)ly); } return; }
-  for(u32 y=0;y<h;y++){ const u8* s=g_fy+(u64)y*g_fw;
+  for(u32 y=0;y<h;y++){ const u8* s=fy+(u64)y*fw;
     if(!blk) vic_put(py,(u64)y*pitch,s,w,ylim);
     else for(u32 x=0;x<w;x+=16){ u32 n=w-x<16? w-x : 16; vic_put(py,bl_offset(x,y,0,pitch,sh,bh,0),s+x,n,ylim); } }
-  if(pc) for(u32 y=0;y<h/2;y++){ const u8* s=g_fuv+(u64)y*g_fw;
+  if(pc) for(u32 y=0;y<h/2;y++){ const u8* s=fuv+(u64)y*fw;
     if(!blk) vic_put(pc,(u64)y*pitch,s,w,clim);
     else for(u32 x=0;x<w;x+=16){ u32 n=w-x<16? w-x : 16; vic_put(pc,bl_offset(x,y,0,pitch,(sh+1)/2,bh,0),s+x,n,clim); } }
   { static int said; if(said<2){ said++; LOG("video: VIC wrote a %ux%u NV12 picture (luma iova %llx, chroma %llx, pitch %u)\n",w,h,(unsigned long long)ly,(unsigned long long)lc,pitch); } } }

@@ -146,6 +146,9 @@ int romfs_read(u64 off, void* dst, u64 size){
     if(off>=f->off+f->size){ /* inter-file padding */
       u64 nx= k+1<nrfiles? rfiles[k+1].off : rtotal; u64 n=nx>off? nx-off : size; if(n>size) n=size; if(!n) n=size; memset(d,0,n); d+=n; off+=n; size-=n; continue; }
     u64 n=f->off+f->size-off; if(n>size) n=size;
+#ifdef SWR_HAVE_VP9
+    { extern void vp9_note_file(const char* path); vp9_note_file(f->path); }
+#endif
     if(!f->logged){ f->logged=1; LOG("romfs: %s (%.1f KB)\n",f->path+g_romdir_len,(double)f->size/1024.0); }
     FILE* fp=rf_open(f->path);
     if(!fp || plat_pread(fp,d,n,off-f->off)<(int)n){ memset(d,0,n); }

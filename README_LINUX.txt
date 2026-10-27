@@ -43,6 +43,9 @@ LO QUE NO HAY EN LINUX (todavia)
   - Grabacion de video con F7 (usa Media Foundation de Windows).
   - Generacion de frames LSFG si no tienes Lossless.dll.
 
+VIDEO WEBM
+  Los videos VP9 se decodifican con libvpx incluido en el runtime; no hace falta instalar otro paquete.
+
 SI LA INTERFAZ NO ABRE
   Falta SDL3_ttf o SDL3_image: instala los paquetes de arriba. Para recompilarla desde el codigo:
     sudo apt install libsdl3-dev libsdl3-ttf-dev libsdl3-image-dev && sh SwitchRecomp/tool/src/build_tool_linux.sh

@@ -172,6 +172,22 @@ The cumulative beta patch is `patches/milestone-011-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-012-main-to-beta.patch`.
 
+## Milestone 013 — VP9 WebM playback
+
+- Added the libvpx VP9 decoder path adapted from [Metroid Dread Recomp](https://github.com/DaniSald/Metroid-Dread-Recomp/tree/main/runtime). It indexes WebM files read from RomFS, matches NVDEC jobs to frames, decodes VP9, and associates decoded frames with VIC output surfaces.
+- Vendored libvpx 1.14.1's public headers and BSD-3-Clause license, plus a static x86-64 Linux decoder archive. The runtime stays self-contained and does not need a system libvpx package.
+- Added optional VP9 linkage to the runtime build and updated the Linux notes. The change is synchronized to `flatpack`; both X11 runtimes compile with the decoder linked.
+- XCDE's earlier VP9 movie log motivated this change. The latest log has not yet been rechecked with this decoder, so movie playback and frame matching still need an in-game test. Update XCDE from `bin/runtime_linux_x11` using the launcher's **Runtime** option before testing.
+
+The cumulative beta patch is `patches/milestone-013-main-to-beta.patch`.
+
+## Milestone 014 — Game-labeled frame traces
+
+- F5 frame trace sets are now written to `captures/traces/<sanitized-game-title>_<number>/`, so captures from different games are easy to distinguish and each game's sequence starts at 1.
+- The original game title is also recorded in each `trace.txt`. Existing numeric trace folders are left intact.
+- The runtime source change is synchronized to `flatpack`, and both Linux X11 runtimes have been rebuilt. Update each installed game's runtime from the launcher before recording tagged traces.
+- Refresh the cumulative main-to-beta patch after the pending milestone 013 working changes are committed; generating it from the current branch refs would omit the uncommitted source changes.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

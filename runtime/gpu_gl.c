@@ -2253,8 +2253,8 @@ static GLuint buf_cached(GLenum target, u64 start, u64 len){
 static int g_tr_arm, g_tr_on, g_tr_n, g_tr_img; static FILE* g_tr;
 static Tex* g_tr_tex[2048]; static int g_tr_ntex;
 static u64 g_tr_sh[1024]; static int g_tr_nsh; static int g_tr_gen;
-/* every F5 gets its own folder: captures/traces/1, 2... */
-static char g_tr_dir[64]="captures/traces";
+/* each F5 gets a per-game folder: captures/traces/<game>_1, <game>_2... */
+static char g_tr_dir[160]="captures/traces";
 /* constant buffers of every draw, each distinct content once */
 static FILE* g_tr_cbf; static u64 g_tr_cbpos; static u64 g_tr_cbh[8192]; static u64 g_tr_cbo[8192];
 static GLuint g_tr_fb, g_tr_tx;
@@ -2288,13 +2288,28 @@ static void tr_thumb(Tex* t, char* out){ state_dirty();
   glBindFramebuffer(GL_READ_FRAMEBUFFER,g_tr_fb); glReadBuffer(GL_COLOR_ATTACHMENT0); glPixelStorei(GL_PACK_ALIGNMENT,1); glReadPixels(0,0,TRW,TRH,GL_RGBA,GL_UNSIGNED_BYTE,px);
   glBindFramebuffer(GL_FRAMEBUFFER,g_fbo); if(sc) glEnable(GL_SCISSOR_TEST); if(sr) glEnable(GL_FRAMEBUFFER_SRGB);
   u64 h=fast_hash(px,sizeof px,0); if(h==t->tr_last){ strcpy(out,"(no change)"); return; }
-  t->tr_last=h; char p[128]; snprintf(p,sizeof p,"%s/d%04d.ppm",g_tr_dir,g_tr_n); tr_save(p,px,TRW,TRH); g_tr_img++; snprintf(out,32,"d%04d.ppm",g_tr_n); }
+  t->tr_last=h; char p[256]; snprintf(p,sizeof p,"%s/d%04d.ppm",g_tr_dir,g_tr_n); tr_save(p,px,TRW,TRH); g_tr_img++; snprintf(out,32,"d%04d.ppm",g_tr_n); }
 
 static int tr_tex_id(Tex* t){ if(!t) return -1; for(int i=0;i<g_tr_ntex;i++) if(g_tr_tex[i]==t) return i; if(g_tr_ntex<2048){ g_tr_tex[g_tr_ntex]=t; return g_tr_ntex++; } return -1; }
 
+static void trace_game_component(char* out, size_t cap){
+  const char* name=g_mod && g_mod->title && g_mod->title[0]? g_mod->title : g_exename;
+  size_t n=0; int underscore=0;
+  if(!name) name="Game";
+  for(;*name && n+1<cap && n<80;name++){
+    unsigned char c=(unsigned char)*name;
+    int valid=(c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='_';
+    if(valid){ out[n++]=(char)c; underscore=0; }
+    else if((c==' '||c=='.'||c==':') && n && !underscore){ out[n++]='_'; underscore=1; }
+  }
+  while(n && out[n-1]=='_') n--;
+  if(!n){ memcpy(out,"Game",4); n=4; }
+  out[n]=0;
+}
+
 static void tr_shader(u64 addr, Sh* sh, int stage){
   if(!sh) return; for(int i=0;i<g_tr_nsh;i++) if(g_tr_sh[i]==sh->hash) return; if(g_tr_nsh>=1024) return; g_tr_sh[g_tr_nsh++]=sh->hash;
-  u8* b=malloc(0x8000); gmem_read(addr,b,0x8000); char p[128];
+  u8* b=malloc(0x8000); gmem_read(addr,b,0x8000); char p[256];
   snprintf(p,sizeof p,"%s/sh_%016llx_%s.bin",g_tr_dir,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); FILE* f=fopen(p,"wb"); if(f){ fwrite(b,1,0x8000,f); fclose(f); }
   ShaderInfo si; memset(&si,0,sizeof si); si.attr_int_mask=sh->si.attr_int_mask; si.attr_sint_mask=sh->si.attr_sint_mask; char* g=shader_to_glsl(b,0x8000,stage,&si);
   if(g){ snprintf(p,sizeof p,"%s/sh_%016llx_%s.glsl",g_tr_dir,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); f=fopen(p,"wb"); if(f){ fputs(g,f); fclose(f); } free(g); }
@@ -2307,7 +2322,7 @@ static void tr_shader_at(u64 addr, u64 hash, int stage){
   for(int i=0;i<g_tr_nsh;i++) if(g_tr_sh[i]==hash) return; if(g_tr_nsh>=1024) return; g_tr_sh[g_tr_nsh++]=hash;
   u8* b=malloc(0x8000); if(!b) return; gmem_read(addr,b,0x8000);
   ShaderInfo si; memset(&si,0,sizeof si); char* gl=shader_to_glsl(b,0x8000,stage,&si); free(b);
-  if(gl){ char p[128]; snprintf(p,sizeof p,"%s/sh_%016llx_%s.glsl",g_tr_dir,(unsigned long long)hash,stage==ST_VS?"vs":"fs"); FILE* f=fopen(p,"wb"); if(f){ fputs(gl,f); fclose(f); } free(gl); } }
+  if(gl){ char p[256]; snprintf(p,sizeof p,"%s/sh_%016llx_%s.glsl",g_tr_dir,(unsigned long long)hash,stage==ST_VS?"vs":"fs"); FILE* f=fopen(p,"wb"); if(f){ fputs(gl,f); fclose(f); } free(gl); } }
 
 static void tr_textures(GpuChannel* ch, int stage, Sh* sh){
   u32* r=ch->r3d; u32 tcb=r[0x982];
@@ -2462,19 +2477,20 @@ static void trace_frame(void){
         if(px){ glBindTexture(GL_TEXTURE_2D,t->id); glPixelStorei(GL_PACK_ALIGNMENT,1);
           if(tr_teximage(GL_TEXTURE_2D,GL_RGBA,GL_UNSIGNED_BYTE,(size_t)w*h*4,px)){ for(u32 y=0;y<oh;y++) for(u32 x=0;x<ow;x++) memcpy(o+((size_t)y*ow+x)*4,px+((size_t)y*st*w+x*st)*4,4); ok=1; }
           free(px); } }
-      if(ok){ char p[160]; snprintf(p,sizeof p,"%s/tex%03d_%llx_%ux%u_f%x%s.ppm",g_tr_dir,i,(unsigned long long)t->gva,t->w,t->h,t->fkey,t->is_rt?"_rt":""); tr_save(p,o,ow,oh); }
+      if(ok){ char p[256]; snprintf(p,sizeof p,"%s/tex%03d_%llx_%ux%u_f%x%s.ppm",g_tr_dir,i,(unsigned long long)t->gva,t->w,t->h,t->fkey,t->is_rt?"_rt":""); tr_save(p,o,ow,oh); }
       free(o); }
     fclose(g_tr); g_tr=NULL; g_tr_on=0; if(g_tr_cbf){ fclose(g_tr_cbf); g_tr_cbf=NULL; }
     LOG("trace: frame saved in %s (%d draws, %d images)\n",g_tr_dir,g_tr_n,g_tr_img); fflush(NULL); }
   { static int envf=-2; if(envf==-2){ const char* e=getenv("SWR_TRACE"); envf= e? atoi(e) : -1; } if(envf>=0 && (int)g_frame==envf) g_tr_arm=1; }
   if(g_tr_arm){ g_tr_arm=0; plat_mkdir("captures"); plat_mkdir("captures/traces");
-    for(int n=1;n<10000;n++){ char p[96]; snprintf(g_tr_dir,sizeof g_tr_dir,"captures/traces/%d",n); snprintf(p,sizeof p,"%s/trace.txt",g_tr_dir);
+    char game[96]; trace_game_component(game,sizeof game);
+    for(int n=1;n<1000000;n++){ char p[256]; snprintf(g_tr_dir,sizeof g_tr_dir,"captures/traces/%s_%d",game,n); snprintf(p,sizeof p,"%s/trace.txt",g_tr_dir);
       FILE* e=fopen(p,"rb"); if(!e) break; fclose(e); }
-    plat_mkdir(g_tr_dir); { char p[96]; snprintf(p,sizeof p,"%s/trace.txt",g_tr_dir); g_tr=fopen(p,"w"); snprintf(p,sizeof p,"%s/cbdata.bin",g_tr_dir); g_tr_cbf=fopen(p,"wb"); }
+    plat_mkdir(g_tr_dir); { char p[256]; snprintf(p,sizeof p,"%s/trace.txt",g_tr_dir); g_tr=fopen(p,"w"); snprintf(p,sizeof p,"%s/cbdata.bin",g_tr_dir); g_tr_cbf=fopen(p,"wb"); }
     g_tr_cbpos=0; memset(g_tr_cbh,0,sizeof g_tr_cbh);
     g_tr_on= g_tr!=NULL; g_tr_n=0; g_tr_img=0; g_tr_ntex=0; g_tr_nsh=0; g_tr_gen++;
     { extern const char* g_runtime_version; const char* v=(const char*)glGetString(GL_VENDOR); const char* r=(const char*)glGetString(GL_RENDERER); const char* x=(const char*)glGetString(GL_VERSION);
-      trace_note("runtime %s, GL: %s / %s / %s, render scale %.2f, frame %u\n",g_runtime_version,v?v:"?",r?r:"?",x?x:"?",g_draw_scale,g_frame); }
+      trace_note("game %s\nruntime %s, GL: %s / %s / %s, render scale %.2f, frame %u\n",g_mod && g_mod->title?g_mod->title:game,g_runtime_version,v?v:"?",r?r:"?",x?x:"?",g_draw_scale,g_frame); }
     for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) t->tr_last=0;
     LOG("trace: recording the next frame into %s...\n",g_tr_dir); }
 }
@@ -3773,7 +3789,7 @@ void gpu_gl_dispatch(GpuChannel* ch, const u32* q, u64 code){
   if(nimg_ok) glMemoryBarrier(0x20|0x08|0x100|0x400|0x80);   /* images -> textures, copies, fbos */
   trace_note("COMPUTE %016llx grid %ux%ux%u block %ux%ux%u buffers %d (writes %x)\n",(unsigned long long)key,gx,gy,gz,lx,ly,lz,p->si.ngbuf,p->si.gbuf_wmask);
   if(g_tr_on){ for(int i=0;i<p->si.ngbuf && i<16;i++) trace_note("  buffer %d: %llx size %x%s\n",i,(unsigned long long)sa[i],ss[i],((p->si.gbuf_wmask>>i)&1)? " (written)" : "");
-    if(p->src && p->tr_dumped!=g_tr_gen){ p->tr_dumped=g_tr_gen; char pth[200]; snprintf(pth,sizeof pth,"%s/cs_%016llx.glsl",g_tr_dir,(unsigned long long)key); FILE* f=fopen(pth,"w"); if(f){ fputs(p->src,f); fclose(f); } } }
+    if(p->src && p->tr_dumped!=g_tr_gen){ p->tr_dumped=g_tr_gen; char pth[256]; snprintf(pth,sizeof pth,"%s/cs_%016llx.glsl",g_tr_dir,(unsigned long long)key); FILE* f=fopen(pth,"w"); if(f){ fputs(p->src,f); fclose(f); } } }
   if(p->si.gbuf_wmask){ glMemoryBarrier(0x00000200|0x00002000 /* BUFFER_UPDATE | SHADER_STORAGE */);
     for(int i=0;i<p->si.ngbuf && i<16;i++) if(((p->si.gbuf_wmask>>i)&1) && sa[i]) cs_stage_push(sb[i],ss[i],sa[i],wmb,wbase[i]);
     /* fresh SSBOs for the next dispatch so it doesn't wait on these */
