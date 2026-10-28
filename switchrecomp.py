@@ -266,6 +266,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     gl = backend != 'headless'
     extra = ['gpu_gl', 'gl_load', 'shader', 'shader_proc', 'astc', 'glq', 'glq_gen'] if gl else ['gpu_nogl', 'shader_proc']
     srcs = [os.path.join(RT, s + '.c') for s in RUNTIME_SRC + extra] + [os.path.join(RT, 'backend_%s.c' % backend), os.path.join(RT, 'entry.c')]
+    if backend == 'x11': srcs += [os.path.join(RT, 'vk_output_x11.c'), os.path.join(RT, 'trace_zip.c')]
     if gl: srcs += [os.path.join(RT, 'bcn', 'bcn.cpp'), os.path.join(RT, 'bcn', 'bcdec.cpp')]
     # LSFG (uses the user's Lossless.dll), desktop GL only
     spvc = None
@@ -306,7 +307,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
         if backend == 'win32': cmd += ['-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32']
     else:
         cmd += ['-lpthread', '-ldl', '-lm', '-rdynamic']
-        if backend == 'x11': cmd += ['-lX11', '-lGL']
+        if backend == 'x11': cmd += ['-lX11', '-lGL', '-DSWR_TRACE_ZIP']
     err = run_cc(cmd, cc)
     if err: raise SystemExit('Runtime build failed:\n' + err[-4000:])
 

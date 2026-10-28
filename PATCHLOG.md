@@ -188,6 +188,23 @@ The cumulative beta patch is `patches/milestone-013-main-to-beta.patch`.
 - The runtime source change is synchronized to `flatpack`, and both Linux X11 runtimes have been rebuilt. Update each installed game's runtime from the launcher before recording tagged traces.
 - The cumulative beta patch is `patches/milestone-014-main-to-beta.patch`; it is generated from the committed `main..beta` history and excludes previous patch files.
 
+## Milestone 015 — Linux Vulkan output prototype
+
+- Added `renderer=vulkan` on the Linux X11 backend while keeping the existing OpenGL game renderer. The backend reads
+  each completed GL frame into host memory, uploads it through a Vulkan staging buffer, and presents it with an Xlib
+  swapchain. Startup and fallback reasons are logged; Vulkan is loaded only when requested.
+- This first path is for compatibility and can cost significant CPU time. It does not use the Dread Windows-only
+  zero-copy interop path and has not yet been tested in-game. Use `renderer=opengl` to restore the default path.
+- The source and usage notes are synchronized to `flatpack`; both X11 runtime binaries were rebuilt. Installed games
+  still need their runtime updated before testing. The cumulative patch is `patches/milestone-015-main-to-beta.patch`.
+
+## Milestone 016 — Automatic trace archives
+
+- Completed Linux X11 F5 traces now produce a sibling `.zip` archive automatically. The original trace folder stays in place, and the archive is written without an external `zip` utility so the Flatpak build can do the same.
+- The ZIP uses the standard store method (no compression): it groups the trace files into one portable file, but does not reduce their total size.
+- Runtime and build changes are synchronized between `beta` and `flatpack`. Rebuild/update the Linux X11 runtime before the feature is available in installed games.
+- The cumulative beta patch is `patches/milestone-016-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

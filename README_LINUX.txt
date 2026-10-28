@@ -35,7 +35,9 @@ CON EL APPIMAGE (un solo archivo)
 
 LO MISMO QUE EN WINDOWS
   Cada juego tiene su <nombre>.ini (resolucion, modo dock, idioma, controles...).
-  Teclas: F1 ayuda, F3 captura, F4 limite de FPS, F5 traza, F8 captura a resolucion completa, F11 pantalla completa.
+  renderer=opengl usa salida OpenGL (predeterminada); renderer=vulkan intenta presentar por Vulkan en X11.
+  La salida Vulkan experimental copia cada fotograma por CPU y puede reducir los FPS. Detalles: VULKAN_OUTPUT.md.
+  Teclas: F1 ayuda, F3 captura, F4 limite de FPS, F5 traza (tambien crea un .zip sin compresion), F8 captura a resolucion completa, F11 pantalla completa.
   Actualizar un juego al runtime nuevo = copiar bin/runtime_linux_x11 encima de games/<nombre>
   (la interfaz lo hace sola en "Runtime"). Partidas, opciones y codigo del juego no se tocan.
 
@@ -49,7 +51,7 @@ VIDEO WEBM
 SI LA INTERFAZ NO ABRE
   Falta SDL3_ttf o SDL3_image: instala los paquetes de arriba. Para recompilarla desde el codigo:
     sudo apt install libsdl3-dev libsdl3-ttf-dev libsdl3-image-dev && sh SwitchRecomp/tool/src/build_tool_linux.sh
-  El runtime tambien se puede recompilar (necesita libx11-dev y libgl-dev):
+  El runtime tambien se puede recompilar (necesita libx11-dev, libgl-dev y libvulkan-dev):
     python3 SwitchRecomp/switchrecomp.py --build-runtime --target linux --backend x11 --cc gcc
 
 LICENCIA
