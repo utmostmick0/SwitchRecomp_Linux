@@ -735,7 +735,15 @@ static void swr_svc_(CPU* c, u32 imm){
   case 0x15: { KTmem* m=calloc(1,sizeof *m); m->o.type=KO_TMEM; m->o.destroy=tmem_destroy; m->o.name="tmem"; m->addr=x[1]; m->size=x[2]; m->perm=(u32)x[3];
     x[0]=0; x[1]=h_new(&m->o); return; }
   case 0x16: x[0]=((u32)x[0]==H_CUR_THREAD||(u32)x[0]==H_CUR_PROC)? 0 : (u32)h_close((u32)x[0]); return;
-  case 0x18: { u32 idx=0; u32 r=svc_wait_sync(t,x[1],(u32)x[2],(i64)x[3],&idx); x[0]=r; x[1]=idx; return; }
+  case 0x18: { u32 idx=0; i64 timeout=(i64)x[3]; u32 r=svc_wait_sync(t,x[1],(u32)x[2],timeout,&idx);
+    /* A zero-timeout WaitSynchronization is a guest polling operation. If it repeatedly
+       finds every object unsignaled, give other host workers a scheduling opportunity
+       after the kernel lock has been released by svc_wait_sync. Blocking waits are already
+       parked on the host condition variable and must not be delayed here. */
+    if(t){ if(timeout==0 && r==R_TIMEOUT){ if(++t->sync_poll_spins>=64){ static u32 poll_yield_reports; t->sync_poll_spins=0; plat_yield();
+        if(!__atomic_fetch_add(&poll_yield_reports,1,__ATOMIC_RELAXED)) LOG("kernel: yielded after 64 consecutive zero-timeout WaitSynchronization polls (thread %llu)\n",(unsigned long long)t->id); } }
+      else t->sync_poll_spins=0; }
+    x[0]=r; x[1]=idx; return; }
   case 0x19: { KThread* n=(KThread*)h_get_type((u32)x[0],KO_THREAD); if(!n){ x[0]=R_BADHANDLE; return; }
     pm_lock(&g_klock); if(n->wait_kind==1) wake(n,R_CANCELLED); n->cancel=1; pm_unlock(&g_klock); x[0]=0; return; }
   case 0x1A: x[0]=svc_arbitrate_lock(t,(u32)x[0],x[1],(u32)x[2]); return;

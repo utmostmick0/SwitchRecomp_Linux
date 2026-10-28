@@ -143,6 +143,12 @@ static GlFmt tic_format(u32 w0, int srgb){
    stored as half float, the transfers still convert from/to the game's snorm data */
 static int g_snorm_fb;
 
+/* Format 0x17 is observed while the guest is updating an RT register packet.
+   Skip incomplete descriptors before they reach rt_format's warning path. */
+static int rt_format17_transient(u32 f, u64 gva, u32 w, u32 h){
+  return f==0x17 && (!w || !h || !gva || !gmmu_translate(gva));
+}
+
 static GlFmt rt_format(u32 f){
   switch(f){
     case 0xC0: return F(GL_RGBA32F,GL_RGBA,GL_FLOAT,16);
@@ -193,6 +199,9 @@ static GlFmt rt_format(u32 f){
     case 0x0A: return FD(GL_DEPTH_COMPONENT32F,GL_DEPTH_COMPONENT,GL_FLOAT,4);
     case 0x13: return FD(GL_DEPTH_COMPONENT16,GL_DEPTH_COMPONENT,GL_UNSIGNED_SHORT,2);
     case 0x14: case 0x15: case 0x16: case 0x18: return FD(GL_DEPTH24_STENCIL8,GL_DEPTH_STENCIL,GL_UNSIGNED_INT_24_8,4);
+    /* Tegra DepthFormat::S8_UINT is a stencil-only attachment (0x10017 in
+       the RT cache key), not a floating-point color target. */
+    case 0x17: return FD(GL_STENCIL_INDEX8,GL_STENCIL_INDEX,GL_UNSIGNED_BYTE,1);
     case 0x19: return FD(GL_DEPTH32F_STENCIL8,GL_DEPTH_STENCIL,GL_FLOAT_32_UNSIGNED_INT_24_8_REV,8);
   }
   WARN("gpu: unsupported render target format %x\n",f);
@@ -1350,6 +1359,7 @@ static Tex* g_rt[8]; static Tex* g_zt; static int g_nrt;
 
 /* RT memory signature, if the cpu or DMA overwrote it something else lives there now */
 static Tex* rt_texture(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth){
+  if(rt_format17_transient(fmt,gva,w,h)) return NULL;
   GlFmt f= rt_format(fmt);
   u32 fkey=fmt|(depth? 0x10000 : 0);
   for(Tex* t=texh[hkey(gva)];t;t=t->next) if(t->gva==gva && t->is_rt && t->w==w && t->h==h && t->fkey==fkey){ t->last_used=g_frame; return t; }
@@ -1476,7 +1486,8 @@ static void bind_framebuffer(GpuChannel* ch){
     float ds=target? TS(target) : g_scale;
     if(ds!=g_draw_scale){ g_draw_scale=ds; rs_update(); }
   }
-  GLenum att= g_zt? (g_zt->f.fmt==GL_DEPTH_STENCIL? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT) : GL_DEPTH_STENCIL_ATTACHMENT;
+  GLenum att= g_zt? (g_zt->f.ifmt==GL_STENCIL_INDEX8? GL_STENCIL_ATTACHMENT :
+                     g_zt->f.fmt==GL_DEPTH_STENCIL? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT) : GL_DEPTH_STENCIL_ATTACHMENT;
   sig[8]= g_zt? g_zt->id : 0; sig[9]=att;
   if(g_fb_sig_ok && !memcmp(sig,g_fb_sig,sizeof sig) && !memcmp(lay,g_fb_lay,sizeof lay)){ st_fb_skip++; return; }
   g_tmap_gen++;
@@ -2013,7 +2024,10 @@ static u32 sh_tex_handle(int stage, u32 tcb, const ShTex* st){
 static u64 g_fsk_tex_ns;
 static Sh* fs_get_keyed(GpuChannel* ch, u64 addr){
   u32* r=ch->r3d; u32 ctl=r[0x487]; u32 count=ctl&15; if(count>8) count=8; u32 rm=0, rs=0;
-  for(u32 i=0;i<count;i++){ u32 idx=(ctl>>(4+i*3))&7; u32* rt=&r[0x200+idx*0x10]; if(!rt[4]) continue; GlFmt f=rt_format(rt[4]); if(f.is_int){ rm|=1u<<i; if(ifmt_signed(f.ifmt)) rs|=1u<<i; } }
+  for(u32 i=0;i<count;i++){ u32 idx=(ctl>>(4+i*3))&7; u32* rt=&r[0x200+idx*0x10]; if(!rt[4]) continue;
+    u64 gva=((u64)rt[0]<<32)|rt[1];
+    if(rt_format17_transient(rt[4],gva,rt[2],rt[3])) continue;
+    GlFmt f=rt_format(rt[4]); if(f.is_int){ rm|=1u<<i; if(ifmt_signed(f.ifmt)) rs|=1u<<i; } }
   g_fs_rtk=0; g_fs_rtm=0; g_fs_rts=0;
   Sh* s0=shader_get(addr,ST_FS,0,0); if(!s0) return s0;
   u32 tm=0, ts=0; int nt=s0->si.ntex; if(nt>32) nt=32;
@@ -2167,7 +2181,7 @@ static void bind_textures(GpuChannel* ch, int stage, Sh* s){
 static u8* g_stage_buf; static size_t g_stage_cap;
 /* buffer cache keyed by guest range, validated once per submit */
 u32 g_submit_epoch;
-typedef struct VbC { u64 start, len, hash, cpu; u32 epoch, used; GLuint id; struct VbC* next; u32 stable, chk_epoch; int dirty; u32 csseen; u64 shash; u32 schk; } VbC;
+typedef struct VbC { u64 start, len, hash, cpu; u32 epoch, used; GLuint id; struct VbC* next; u32 stable, chk_epoch; int dirty; u32 csseen; u64 shash; u32 schk; u8* mirror; } VbC;
 
 /* 64K blocks (by gpu va, hashed) that got compute output, with a generation. a cached buffer on one of them gets
    read again, so we don't walk the whole cache on every compute result */
@@ -2176,7 +2190,7 @@ static u32 g_csblk[65536], g_csgen;
 static int cs_blk_dirty(u64 a, u64 n, u32 seen){ if(g_csgen==seen) return 0; for(u64 b=a>>16, e=(a+n-1)>>16; b<=e; b++) if(g_csblk[b&0xFFFF]>seen) return 1; return 0; }
 
 static VbC* vbc[2048];
-static u64 g_vbc_bytes, g_vbc_n;   /* what the buffer cache holds (driver memory) */
+static u64 g_vbc_bytes, g_vbc_n, g_vbc_mirror_bytes;   /* driver buffers and exact CPU-side mirrors */
 /* write-watch generation per 64K block; untouched ranges skip the reread/hash */
 static u32* g_cgen; static int g_ww=-1; static u64 st_ww_skip; static int g_va_inval;
 static void ww_touch(u64 cpu);
@@ -2206,6 +2220,41 @@ static u64 sample_hash(u64 gva, u64 len){
   return fast_hash(tmp,n,7); }
 
 static int g_nosample=-1;
+static void vbc_delta_free(VbC* e){ if(e->mirror){ free(e->mirror); e->mirror=NULL; if(g_vbc_mirror_bytes>=e->len) g_vbc_mirror_bytes-=e->len; else g_vbc_mirror_bytes=0; } }
+/* Compare the guest bytes against an exact host-side mirror before considering
+   any upload. This avoids hash collisions and lets identical high-draw ranges
+   bypass the driver transfer path entirely. Changed data is uploaded by dirty
+   64 KiB runs; the mirror is then updated to the exact bytes sent to GL. */
+static int vbc_delta_upload(GLenum target, VbC* e, const u8* src){
+  const u64 block=(64u<<10);
+  if(e->len>SIZE_MAX) return 0;
+  if(!e->mirror){
+    /* Bound extra host RAM to the same budget as the GPU-side buffer cache.
+       If full, retain the existing hash fallback rather than growing without limit. */
+    const u64 mirror_budget=512ull<<20;
+    if(e->len>mirror_budget-g_vbc_mirror_bytes) return 0;
+    e->mirror=malloc((size_t)e->len);
+    if(!e->mirror) return 0;
+    memcpy(e->mirror,src,(size_t)e->len); g_vbc_mirror_bytes+=e->len;
+    glBufferData(target,(GLsizeiptr)e->len,src,GL_STATIC_DRAW);
+    e->hash=~0ull; st_vb_hashed+=e->len; st_vb_up+=e->len; e->stable=0; return 1;
+  }
+  st_vb_hashed+=e->len;
+  if(!memcmp(e->mirror,src,(size_t)e->len)){ if(e->stable<100000) e->stable++; return 1; }
+  u64 changed=0;
+  for(u64 off=0;off<e->len;off+=block){ u64 n=e->len-off; if(n>block) n=block; if(memcmp(e->mirror+off,src+off,(size_t)n)) changed+=n; }
+  if(changed>=e->len/2){ glBufferSubData(target,0,(GLsizeiptr)e->len,src); memcpy(e->mirror,src,(size_t)e->len); st_vb_up+=e->len; }
+  else {
+    u64 off=0;
+    while(off<e->len){ u64 n=e->len-off; if(n>block) n=block;
+      if(!memcmp(e->mirror+off,src+off,(size_t)n)){ off+=n; continue; }
+      u64 first=off, end=off+n; off=end;
+      while(off<e->len){ n=e->len-off; if(n>block) n=block; if(!memcmp(e->mirror+off,src+off,(size_t)n)) break; end=off+n; off=end; }
+      glBufferSubData(target,(GLintptr)first,(GLsizeiptr)(end-first),src+first); memcpy(e->mirror+first,src+first,(size_t)(end-first)); st_vb_up+=end-first;
+    }
+  }
+  e->hash=~0ull; e->stable=0; return 1;
+}
 /* range fully inside a compute result that didn't land in guest memory yet: copy gpu to gpu instead of waiting,
    reading back and uploading again (SMO particles hit this every frame) */
 static int cs_gpu_src(u64 a, u64 n, GLuint* buf, u32* off);
@@ -2221,7 +2270,7 @@ static GLuint buf_cached(GLenum target, u64 start, u64 len){
       glBindBuffer(GL_COPY_WRITE_BUFFER,e->id); glBufferData(GL_COPY_WRITE_BUFFER,(GLsizeiptr)len,NULL,GL_STATIC_DRAW);
       glBindBuffer(GL_COPY_READ_BUFFER,sb); glCopyBufferSubData(GL_COPY_READ_BUFFER,GL_COPY_WRITE_BUFFER,so,0,(GLsizeiptr)len);
       /* the cpu side copy lands later (cs_apply marks the block) and the reread finds the same data */
-      e->hash=~0ull; e->stable=0; e->epoch=g_submit_epoch; e->chk_epoch=g_submit_epoch; e->csseen=g_csgen; e->cpu=0;
+      vbc_delta_free(e); e->hash=~0ull; e->stable=0; e->epoch=g_submit_epoch; e->chk_epoch=g_submit_epoch; e->csseen=g_csgen; e->cpu=0;
       st_cs_gpucopy++; { static int said; if(!said){ said=1; LOG("gpu: compute results reused on the GPU (no wait for the readback)\n"); } }
       glBindBuffer(target,e->id); return e->id; }
     cs_mem_need(start,len); }
@@ -2234,21 +2283,23 @@ static GLuint buf_cached(GLenum target, u64 start, u64 len){
   if(e && g_ww>0 && e->cpu && g_submit_epoch-e->chk_epoch<240 && gmmu_translate(start)==e->cpu && !ww_dirty(e->cpu,len,e->chk_epoch)){
     e->epoch=g_submit_epoch; st_ww_skip++; glBindBuffer(target,e->id); return e->id; }
   /* big buffers that never changed (static geometry): check every 8 submits */
-  if(e && g_ww<=0 && e->stable>=16 && len>=(64u<<10) && g_submit_epoch-e->chk_epoch<8){ e->epoch=g_submit_epoch; glBindBuffer(target,e->id); return e->id; }
-  if(e && g_ww<=0 && e->stable>=32 && len<(64u<<10) && g_submit_epoch-e->chk_epoch<4){ e->epoch=g_submit_epoch; glBindBuffer(target,e->id); return e->id; }
+  if(e && !e->mirror && g_ww<=0 && e->stable>=16 && len>=(64u<<10) && g_submit_epoch-e->chk_epoch<8){ e->epoch=g_submit_epoch; glBindBuffer(target,e->id); return e->id; }
+  if(e && !e->mirror && g_ww<=0 && e->stable>=32 && len<(64u<<10) && g_submit_epoch-e->chk_epoch<4){ e->epoch=g_submit_epoch; glBindBuffer(target,e->id); return e->id; }
   /* buffers stable for a long time: full check every 64/240 submits, sampled every 4 in between. there's no write
      tracking on proton/linux and without this the deck hashed ~9 MB of vertices a frame */
   if(g_nosample<0) g_nosample=getenv("SWR_NO_SAMPLE_CHECK")!=NULL;
-  if(e && g_ww<=0 && !g_nosample && e->stable>=64 && len>=4096 && g_submit_epoch-e->chk_epoch<(e->stable>=256? 240u : 64u)){
+  if(e && !e->mirror && g_ww<=0 && !g_nosample && e->stable>=64 && len>=4096 && g_submit_epoch-e->chk_epoch<(e->stable>=256? 240u : 64u)){
     if(g_submit_epoch-e->schk<4){ e->epoch=g_submit_epoch; glBindBuffer(target,e->id); return e->id; }
     u64 sh=sample_hash(start,len); e->schk=g_submit_epoch; st_vb_hashed+=2048;
     if(sh==e->shash){ e->epoch=g_submit_epoch; glBindBuffer(target,e->id); return e->id; } }
   u8* src=gmem_ptr(start,len); u64 cpu= src? (u64)(src-g_mem) : 0;
   if(!src){ if(g_stage_cap<len){ u8* nb=realloc(g_stage_buf,len); if(!nb) return 0; g_stage_buf=nb; g_stage_cap=len; } gmem_read(start,g_stage_buf,len); src=g_stage_buf; }
-  u64 h=fast_hash(src,len,0); st_vb_hashed+=len;
-  if(!e){ e=calloc(1,sizeof *e); e->start=start; e->len=len; e->csseen=g_csgen; e->used=1; glGenBuffers(1,&e->id); e->next=vbc[k]; vbc[k]=e; e->hash=h^1; g_vbc_bytes+=len; g_vbc_n++; }
+  if(!e){ e=calloc(1,sizeof *e); e->start=start; e->len=len; e->csseen=g_csgen; e->used=1; glGenBuffers(1,&e->id); e->next=vbc[k]; vbc[k]=e; e->hash=~0ull; g_vbc_bytes+=len; g_vbc_n++; }
   glBindBuffer(target,e->id);
-  if(e->hash!=h){ e->hash=h; glBufferData(target,(GLsizeiptr)len,src,GL_STATIC_DRAW); st_vb_up+=len; e->stable=0; } else if(e->stable<100000) e->stable++;
+  if(!vbc_delta_upload(target,e,src)){
+    u64 h=fast_hash(src,len,0); st_vb_hashed+=len;
+    if(e->hash!=h){ e->hash=h; glBufferData(target,(GLsizeiptr)len,src,GL_STATIC_DRAW); st_vb_up+=len; e->stable=0; } else if(e->stable<100000) e->stable++;
+  } else e->hash=0;
   if(e->stable>=63 && len>=4096){ e->shash=sample_hash(start,len); e->schk=g_submit_epoch; }
   e->cpu=cpu; e->epoch=g_submit_epoch; e->chk_epoch=g_submit_epoch; return e->id; }
 
@@ -3029,7 +3080,17 @@ static int lsfg_frame(GLuint tex, const float* xf, int tw, int th){
 static void blit_to_screen(GLuint tex, int flip, int tw, int th){ state_dirty();
   /* game-requested crop (e.g. 1280x720 inside a 1920x1080 buffer) */
   float u0=0, v0=0, u1=1, v1=1; { i32 l=g_vi_crop[0], t=g_vi_crop[1], r=g_vi_crop[2], b=g_vi_crop[3];
-    if(r>l && b>t && tw>0 && th>0 && r<=tw*4 && b<=th*4){ u0=(float)l/tw; u1=(float)r/tw; v0=(float)t/th; v1=(float)b/th; tw=r-l; th=b-t; } }
+    if(tw>0 && th>0){ i32 fw=tw, fh=th;
+      /* An empty vi:crop means the guest has not requested a crop. Use the complete
+         active image rather than letting an empty viewport reach the window blitter. */
+      if(l==0 && t==0 && r==0 && b==0){ l=0; t=0; r=fw; b=fh; }
+      else {
+        if(l<0) l=0; if(t<0) t=0; if(r<0) r=0; if(b<0) b=0;
+        if(l>fw) l=fw; if(r>fw) r=fw; if(t>fh) t=fh; if(b>fh) b=fh;
+        if(r<=l || b<=t){ l=0; t=0; r=fw; b=fh; }
+      }
+      u0=(float)l/fw; u1=(float)r/fw; v0=(float)t/fh; v1=(float)b/fh; tw=r-l; th=b-t;
+    } }
   if(g_vi_transform&2){ float x=v0; v0=v1; v1=x; }   /* FLIP_V */
   if(g_vi_transform&1){ float x=u0; u0=u1; u1=x; }   /* FLIP_H */
   float xf[4]; if(flip){ xf[0]=u0; xf[1]=v1; xf[2]=u1-u0; xf[3]=v0-v1; } else { xf[0]=u0; xf[1]=1-v1; xf[2]=u1-u0; xf[3]=v1-v0; }
@@ -3061,26 +3122,29 @@ static void gpu_evict_step(void){
       int old= t->is_rt? (t->gva==~0ull && age>300) : (age>2400);
       if(old && !busy){ *pp=t->next; tex_free(t); st_tex_evict++; any=1; } else pp=&t->next; } }
   if(any){ mb_reset(); g_fb_sig_ok=0; memset(g_tdc,0,sizeof g_tdc); g_tmap_gen++; }
-  /* buffer cache, counted in frames: a range that never gets used again goes after 8 frames, anything unused for
-     600, and over the budget anything unused for 30. xenoblade 2 submits once a frame and streams ~16 MB of new
-     vertex ranges every frame, counting submits it got to 16 GB of ram in 3 minutes */
+  /* Buffer cache limits are counted in active frames. Keep the normal short-lived
+     and long-lived cleanup policies, but sharply trim stale ranges once the cache
+     crosses the host allocation budget. */
   static u32 ep_hist[1024]; ep_hist[g_frame&1023]=g_submit_epoch;
-  static u64 budget; if(!budget){ const char* b=getenv("SWR_VB_BUDGET_MB"); budget=(u64)(b? atoi(b) : 1536)<<20; if(budget<(64u<<20)) budget=64u<<20; }
+  const u64 budget=512ull<<20;
   int over= g_vbc_bytes>budget;
-  u32 thr1= g_frame>8? ep_hist[(g_frame-8)&1023] : 0, thr2= g_frame>600? ep_hist[(g_frame-600)&1023] : 0, thr3= g_frame>30? ep_hist[(g_frame-30)&1023] : 0;
+  u32 thr1= g_frame>8? ep_hist[(g_frame-8)&1023] : 0, thr2= g_frame>600? ep_hist[(g_frame-600)&1023] : 0;
+  u32 thr_over= g_frame>2? ep_hist[(g_frame-2)&1023] : 0;
   int vany=0, nb= over? 2048 : 512;
   for(int n=0;n<nb;n++,vcur=(vcur+1)&2047){
     for(VbC** pp=&vbc[vcur];*pp;){ VbC* e=*pp;
-      int stale= g_submit_epoch-e->epoch>4800 || (thr2 && (i32)(e->epoch-thr2)<0) || (e->used<=1 && thr1 && (i32)(e->epoch-thr1)<0) || (over && thr3 && (i32)(e->epoch-thr3)<0);
-      if(stale && e->epoch!=g_submit_epoch){ *pp=e->next; glDeleteBuffers(1,&e->id); g_vbc_bytes-=e->len; g_vbc_n--; free(e); st_vb_evict++; vany=1; } else pp=&e->next; } }
-  if(over){ static int said; if(said<3){ said++; LOG("gpu: buffer cache over %llu MB, dropping what wasn't used in the last 30 frames\n",(unsigned long long)(budget>>20)); } }
+      int stale= g_submit_epoch-e->epoch>4800 || (thr2 && (i32)(e->epoch-thr2)<0) || (e->used<=1 && thr1 && (i32)(e->epoch-thr1)<0) || (over && thr_over && (i32)(e->epoch-thr_over)<0);
+      if(stale && e->epoch!=g_submit_epoch){ *pp=e->next; glDeleteBuffers(1,&e->id); g_vbc_bytes-=e->len; g_vbc_n--; vbc_delta_free(e); free(e); st_vb_evict++; vany=1; } else pp=&e->next; } }
+  if(over){ static int said; if(said<3){ said++; LOG("gpu: buffer cache over %llu MB, pruning ranges unused for 2 active frames\n",(unsigned long long)(budget>>20)); } }
   if(vany) g_va_inval=1; }
 
 static int present_addr(u64 cpu_addr, int w, int h){
   /* find the RT whose gva maps this memory */
-  Tex* best=NULL;
-  for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && gmmu_translate(t->gva)==cpu_addr){ if(!best || (t->w==(u32)w && t->h==(u32)h) || t->last_used>best->last_used) best=t; }
-  trace_note("PRESENT %llx %dx%d -> %s %llx\n",(unsigned long long)cpu_addr,w,h,best?"rt":"(none, CPU)",(unsigned long long)(best?best->gva:0));
+  Tex* best=NULL; int best_exact=0;
+  for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && gmmu_translate(t->gva)==cpu_addr){
+    int exact=t->w==(u32)w && t->h==(u32)h;
+    if(!best || (exact && !best_exact) || (exact==best_exact && t->last_used>best->last_used)){ best=t; best_exact=exact; } }
+  trace_note("PRESENT %llx %dx%d -> %s %llx tex=%u %ux%u exact=%d\n",(unsigned long long)cpu_addr,w,h,best?"rt":"(none, CPU)",(unsigned long long)(best?best->gva:0),best?best->id:0,best?best->w:0,best?best->h:0,best_exact);
   if(best){ best->last_used=g_frame; g_blit_rt=1; blit_to_screen(best->id,1,(int)best->w,(int)best->h); g_blit_rt=0; g_last_is_rt=1; st_pres_rt++; return 1; }
   st_pres_cpu++;
   static int said; if(said<3){ said++;
@@ -3243,9 +3307,10 @@ static void rt_rescale(float ns){
     u32 ow=(u32)(t->w*old+0.5f), oh=(u32)(t->h*old+0.5f), nw=(u32)(t->w*ns+0.5f), nh=(u32)(t->h*ns+0.5f); if(!ow) ow=1; if(!oh) oh=1; if(!nw) nw=1; if(!nh) nh=1;
     GLuint nt=0; glGenTextures(1,&nt); glBindTexture(GL_TEXTURE_2D,nt); glTexStorage2D(GL_TEXTURE_2D,1,t->f.ifmt,nw,nh);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAX_LEVEL,0); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+    int stencil_only=t->f.ifmt==GL_STENCIL_INDEX8;
     int ds= t->f.depth && t->f.fmt==GL_DEPTH_STENCIL;
-    GLenum att= t->f.depth? (ds? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT) : GL_COLOR_ATTACHMENT0;
-    GLbitfield mask= t->f.depth? (GL_DEPTH_BUFFER_BIT|(ds? GL_STENCIL_BUFFER_BIT : 0)) : GL_COLOR_BUFFER_BIT;
+    GLenum att= stencil_only? GL_STENCIL_ATTACHMENT : t->f.depth? (ds? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT) : GL_COLOR_ATTACHMENT0;
+    GLbitfield mask= stencil_only? GL_STENCIL_BUFFER_BIT : t->f.depth? (GL_DEPTH_BUFFER_BIT|(ds? GL_STENCIL_BUFFER_BIT : 0)) : GL_COLOR_BUFFER_BIT;
     GLenum none=GL_NONE, c0=GL_COLOR_ATTACHMENT0;
     glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,0,0); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,0,0);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER,att,GL_TEXTURE_2D,t->id,0); glReadBuffer(t->f.depth? GL_NONE : GL_COLOR_ATTACHMENT0);
@@ -3398,7 +3463,7 @@ static void gpu_thread(void* arg){ t_gpu_thread=1;
           (unsigned long long)st_clears,(unsigned long long)st_shaders,(unsigned long long)st_pres_rt,(unsigned long long)st_pres_cpu,
           (unsigned long long)st_tex_ok,(unsigned long long)st_tex_rt,(unsigned long long)st_tex_null,(unsigned long long)st_tex_mismatch,(unsigned long long)g_dma_copies,(unsigned long long)g_compute_launches,(unsigned long long)st_compiling);
         { u64 tn=0, tb=0, rn=0, rb=0; for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next){ u64 b=(u64)t->w*t->h*(t->d? t->d : 1)*(t->f.bpp && !t->f.compressed? t->f.bpp : 4); if(t->is_rt){ rn++; rb+=b; } else { tn++; tb+=b; } }
-          LOG("gpu memory: buffer cache %llu buffers %llu MB, textures %llu (~%llu MB), render targets %llu (~%llu MB at x1)\n",(unsigned long long)g_vbc_n,(unsigned long long)(g_vbc_bytes>>20),
+          LOG("gpu memory: buffer cache %llu buffers %llu MB + %llu MB exact mirrors, textures %llu (~%llu MB), render targets %llu (~%llu MB at x1)\n",(unsigned long long)g_vbc_n,(unsigned long long)(g_vbc_bytes>>20),(unsigned long long)(g_vbc_mirror_bytes>>20),
             (unsigned long long)tn,(unsigned long long)(tb>>20),(unsigned long long)rn,(unsigned long long)(rb>>20)); }
         static u64 last_frames_pf;
         { static u64 last_t, last_busy, last_frames; u64 dt=now-last_t; if(last_t && dt){

@@ -205,6 +205,26 @@ The cumulative beta patch is `patches/milestone-013-main-to-beta.patch`.
 - Runtime and build changes are synchronized between `beta` and `flatpack`. Rebuild/update the Linux X11 runtime before the feature is available in installed games.
 - The cumulative beta patch is `patches/milestone-016-main-to-beta.patch`.
 
+## Milestone 017 — Exact vertex buffer mirror checks
+
+- Completed the recent graphics performance and presentation changes: 512 MiB buffer-cache pruning after two inactive
+  frames over budget, 64 KiB delta uploads, transient RT format warning suppression, safe crop defaults, and a more
+  exact render-target match for presentation. Stencil-only format 0x17 uses a stencil attachment.
+- Added a host yield after 64 consecutive zero-timeout synchronization polls, outside the kernel wait lock.
+- Replaced hash-only delta validation with a byte-exact CPU mirror for cached guest buffer ranges. When a range is
+  checked, identical bytes bypass OpenGL uploads; changed 64 KiB runs use `glBufferSubData`, with a full sub-data
+  upload when most of the range changed. This prevents hash collisions from silently treating changed geometry as
+  unchanged.
+- Exact mirrors are capped at 512 MiB of host RAM. If that budget is reached or allocation fails, the existing hash
+  fallback remains available. Compute-generated buffer copies invalidate their CPU mirrors before the later guest
+  memory reread.
+- Disabled the sampled/stability shortcuts for ranges with an exact mirror so every mirror-backed validation uses
+  the complete byte comparison. Added mirror usage to periodic GPU memory telemetry.
+- Rebuilt `bin/runtime_linux_x11` successfully with the Linux X11 backend. In-game performance and memory usage still
+  need validation.
+
+The cumulative beta patch is `patches/milestone-017-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

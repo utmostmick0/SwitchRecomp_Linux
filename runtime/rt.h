@@ -174,6 +174,7 @@ struct KThread {
   int is_main;
   void* jmpbuf;
   u64 sleep_lr, sleep_n, sleep_x[31];   /* for threads.txt: catches SleepThread polling loops */
+  u32 sync_poll_spins;           /* consecutive zero-timeout WaitSynchronization polls */
   struct { u32 imm, res, n, h0; u64 lr, a[4]; } svc_hist[24]; u32 svc_hist_n;   /* threads.txt: this thread's last SVCs */
   void* host;                  /* host thread handle: the stall dump samples where it runs */
 };
