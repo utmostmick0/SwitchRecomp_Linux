@@ -1865,6 +1865,18 @@ static int cb_ssbo_binding(int stage, Sh* s, int cb){
   return 24+slot*4+rank;
 }
 
+static void ur_rebind_after_orphan(void){
+  /* Reassert both generic targets and indexed ranges after replacing the data
+     store. Invalidate the software cache so later uploads bind their new slice. */
+  glBindBuffer(GL_UNIFORM_BUFFER,g_ur);
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER,g_ur);
+  for(u32 i=0;i<64;i++){
+    if(g_ub_bound[i]) glBindBufferRange(GL_UNIFORM_BUFFER,i,g_ur,g_ub_bound[i]-1,65536);
+    if(g_sb_bound[i]) glBindBufferRange(GL_SHADER_STORAGE_BUFFER,i,g_ur,g_sb_bound[i]-1,65536);
+    g_ub_bound[i]=g_sb_bound[i]=0;
+  }
+}
+
 static void ur_init(void){
   p_fs=(PFNGLFENCESYNCPROC)backend_gl_proc("glFenceSync"); p_cws=(PFNGLCLIENTWAITSYNCPROC)backend_gl_proc("glClientWaitSync"); p_ds=(PFNGLDELETESYNCPROC)backend_gl_proc("glDeleteSync");
   if(getenv("SWR_NO_UBO_RING")) return;
@@ -1884,6 +1896,7 @@ static u32 ur_alloc(u32 sz){
     g_ur_abs+=g_ur_size-off; off=0; g_ur_head=0; g_ur_store++; st_ur_wrap++;
     glBindBuffer(GL_UNIFORM_BUFFER,g_ur);
     glBufferData(GL_UNIFORM_BUFFER,(GLsizeiptr)g_ur_size+65536,NULL,GL_STREAM_DRAW);
+    ur_rebind_after_orphan();
   }
   g_ur_head=off+need; g_ur_abs+=need; return off; }
 

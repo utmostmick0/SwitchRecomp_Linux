@@ -265,6 +265,16 @@ The cumulative beta patch is `patches/milestone-019-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-020-main-to-beta.patch`.
 
+## Milestone 021 — Rebind uniform ranges after orphaning
+
+- After orphaning the uniform arena, the runtime now rebinds the arena to both generic UBO and SSBO targets,
+  then reasserts previously cached indexed ranges. It clears the software range cache so subsequent constant
+  uploads explicitly bind their newly populated slices.
+- Rebuilt `bin/runtime_linux_x11` successfully. This is a driver-state workaround; a fresh game run is needed
+  to confirm whether it resolves the reported black screen.
+
+The cumulative beta patch is `patches/milestone-021-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep
