@@ -275,6 +275,23 @@ The cumulative beta patch is `patches/milestone-020-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-021-main-to-beta.patch`.
 
+## Milestone 022 — DMA block-linear bounds validation
+
+- Added checked block-linear row-pitch and surface-footprint calculations for DMA uploads. Dimensions above
+  16384, block-height/depth exponents above 5, overflow-sized rows, and layouts above 256 MiB are rejected
+  before span lookup or copy.
+- DMA rectangles are clipped to the declared block-linear source and destination width/height. Linear row
+  copies with a pitch shorter than the copied row are rejected. GOB pitches are normalized to 64-byte
+  boundaries; this preserves the block-linear address calculation while making the footprint arithmetic
+  explicit and overflow checked.
+- The available Balatro trace shows valid `lin->bl` transfers into a 2048x1024 surface with block-height
+  exponent 4; these rows stay within its bounds. The FFRS log has no frame submissions or DMA copies, so
+  it does not identify this path as the confirmed cause of its black screen.
+- Rebuilt `bin/runtime_linux_x11` successfully. Fresh Balatro and FFRS runs are still needed to verify the
+  guarded path and investigate any remaining presentation failure.
+
+The cumulative beta patch is `patches/milestone-022-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep
