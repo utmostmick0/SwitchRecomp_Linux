@@ -225,6 +225,19 @@ The cumulative beta patch is `patches/milestone-013-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-017-main-to-beta.patch`.
 
+## Milestone 018 — Combined buffer and mirror cache pruning
+
+- The two-frame stale buffer sweep now activates when GPU buffer allocations plus exact CPU mirror allocations
+  exceed 512 MiB. Previously the trigger counted only GPU buffers, even though mirror memory could add another
+  512 MiB.
+- The pruning diagnostic reports the combined allocation total. Entries touched within the last two active frames
+  remain protected; stale entries release both the GL buffer and its exact mirror.
+- Rebuilt the beta Linux X11 runtime. The latest Balatro trace remains GPU-bound in heavy scenes (11–16 FPS at
+  86–91% GPU busy), with 180–232 MiB of geometry uploaded per frame. This cache change addresses memory pressure;
+  it does not reduce geometry that changes every frame.
+
+The cumulative beta patch is `patches/milestone-018-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

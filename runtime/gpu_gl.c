@@ -3123,11 +3123,12 @@ static void gpu_evict_step(void){
       if(old && !busy){ *pp=t->next; tex_free(t); st_tex_evict++; any=1; } else pp=&t->next; } }
   if(any){ mb_reset(); g_fb_sig_ok=0; memset(g_tdc,0,sizeof g_tdc); g_tmap_gen++; }
   /* Buffer cache limits are counted in active frames. Keep the normal short-lived
-     and long-lived cleanup policies, but sharply trim stale ranges once the cache
-     crosses the host allocation budget. */
+     and long-lived cleanup policies, but sharply trim stale ranges once the GPU
+     buffers plus their CPU-side mirrors cross the host allocation budget. */
   static u32 ep_hist[1024]; ep_hist[g_frame&1023]=g_submit_epoch;
   const u64 budget=512ull<<20;
-  int over= g_vbc_bytes>budget;
+  u64 cache_bytes=g_vbc_bytes+g_vbc_mirror_bytes;
+  int over= cache_bytes>budget;
   u32 thr1= g_frame>8? ep_hist[(g_frame-8)&1023] : 0, thr2= g_frame>600? ep_hist[(g_frame-600)&1023] : 0;
   u32 thr_over= g_frame>2? ep_hist[(g_frame-2)&1023] : 0;
   int vany=0, nb= over? 2048 : 512;
@@ -3135,7 +3136,7 @@ static void gpu_evict_step(void){
     for(VbC** pp=&vbc[vcur];*pp;){ VbC* e=*pp;
       int stale= g_submit_epoch-e->epoch>4800 || (thr2 && (i32)(e->epoch-thr2)<0) || (e->used<=1 && thr1 && (i32)(e->epoch-thr1)<0) || (over && thr_over && (i32)(e->epoch-thr_over)<0);
       if(stale && e->epoch!=g_submit_epoch){ *pp=e->next; glDeleteBuffers(1,&e->id); g_vbc_bytes-=e->len; g_vbc_n--; vbc_delta_free(e); free(e); st_vb_evict++; vany=1; } else pp=&e->next; } }
-  if(over){ static int said; if(said<3){ said++; LOG("gpu: buffer cache over %llu MB, pruning ranges unused for 2 active frames\n",(unsigned long long)(budget>>20)); } }
+  if(over){ static int said; if(said<3){ said++; LOG("gpu: buffer cache plus exact mirrors over %llu MB (%llu MB total), pruning ranges unused for 2 active frames\n",(unsigned long long)(budget>>20),(unsigned long long)(cache_bytes>>20)); } }
   if(vany) g_va_inval=1; }
 
 static int present_addr(u64 cpu_addr, int w, int h){
