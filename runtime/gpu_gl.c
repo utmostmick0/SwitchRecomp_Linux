@@ -1832,7 +1832,7 @@ void r3d_cb_bind_gl(GpuChannel* ch, int stage, u32 v){
 #define GL_SHADER_STORAGE_BUFFER 0x90D2
 #endif
 static GLuint g_sbuf[3][8];
-static GLuint buf_cached(GLenum target, u64 start, u64 len);
+static GLuint buf_cached(GLenum target, u64 start, u64 len, u32 stride);
 static int cs_gpu_src(u64 a, u64 n, GLuint* buf, u32* off); static void cs_stage_push(GLuint src, u32 size, u64 addr, GLuint wmb, u32 wbase);
 extern volatile int g_cs_any;
 /* buffers a draw's shaders write (atomics, stores) go back to guest memory after the draw, same as compute output.
@@ -1857,7 +1857,7 @@ static void bind_gbufs(int stage, Sh* s){
     u64 addr=0; u32 size=16; if(cb0){ u32 v[3]; gmem_read(cb0+s->si.gbuf_cbuf_off[i],v,12); addr=((u64)v[1]<<32)|v[0]; size=v[2]; }
     if(!size) size=16; if(size>(16u<<20)) size=16u<<20; size=(size+3)&~3u;
     { static int nc=-1; if(nc<0) nc=getenv("SWR_NO_SSBO_CACHE")!=NULL;
-      if(!nc && addr && !((s->si.gbuf_wmask>>i)&1)){ GLuint id=buf_cached(GL_SHADER_STORAGE_BUFFER,addr,size); if(id){ glBindBufferBase(GL_SHADER_STORAGE_BUFFER,slot*8+i,id); continue; } } }
+      if(!nc && addr && !((s->si.gbuf_wmask>>i)&1)){ GLuint id=buf_cached(GL_SHADER_STORAGE_BUFFER,addr,size,0); if(id){ glBindBufferBase(GL_SHADER_STORAGE_BUFFER,slot*8+i,id); continue; } } }
     int wr= addr && ((s->si.gbuf_wmask>>i)&1);
     { GLuint gsb; u32 gso;   /* a compute (or draw) result not read back yet: copy it on the GPU */
       if(wr && g_cs_any && cs_gpu_src(addr,size,&gsb,&gso)){
@@ -2263,12 +2263,13 @@ static u64 sample_hash(u64 gva, u64 len){
 
 static int g_nosample=-1;
 static void vbc_delta_free(VbC* e){ if(e->mirror){ free(e->mirror); e->mirror=NULL; if(g_vbc_mirror_bytes>=e->len) g_vbc_mirror_bytes-=e->len; else g_vbc_mirror_bytes=0; } }
-/* Compare the guest bytes against an exact host-side mirror before considering
-   any upload. This avoids hash collisions and lets identical high-draw ranges
-   bypass the driver transfer path entirely. Changed data is uploaded by dirty
-   64 KiB runs; the mirror is then updated to the exact bytes sent to GL. */
-static int vbc_delta_upload(GLenum target, VbC* e, const u8* src){
-  const u64 block=(64u<<10);
+/* Compare in 64 KiB blocks, aligned to a vertex's stride when available. Dense
+   changes switch to one full transfer after half the range is dirty; sparse
+   blocks are refined to stride-sized runs before sub-range upload. */
+static int vbc_delta_upload(GLenum target, VbC* e, const u8* src, u32 stride){
+  const u64 base_block=(64u<<10);
+  u64 gran=stride && stride<=4096? stride : base_block;
+  u64 block=base_block-(base_block%gran); if(!block) block=gran;
   if(e->len>SIZE_MAX) return 0;
   if(!e->mirror){
     /* Bound extra host RAM to the same budget as the GPU-side buffer cache.
@@ -2282,19 +2283,19 @@ static int vbc_delta_upload(GLenum target, VbC* e, const u8* src){
     e->hash=~0ull; st_vb_hashed+=e->len; st_vb_up+=e->len; e->stable=0; return 1;
   }
   st_vb_hashed+=e->len;
-  if(!memcmp(e->mirror,src,(size_t)e->len)){ if(e->stable<100000) e->stable++; return 1; }
   u64 changed=0;
-  for(u64 off=0;off<e->len;off+=block){ u64 n=e->len-off; if(n>block) n=block; if(memcmp(e->mirror+off,src+off,(size_t)n)) changed+=n; }
-  if(changed>=e->len/2){ glBufferSubData(target,0,(GLsizeiptr)e->len,src); memcpy(e->mirror,src,(size_t)e->len); st_vb_up+=e->len; }
-  else {
-    u64 off=0;
-    while(off<e->len){ u64 n=e->len-off; if(n>block) n=block;
-      if(!memcmp(e->mirror+off,src+off,(size_t)n)){ off+=n; continue; }
-      u64 first=off, end=off+n; off=end;
-      while(off<e->len){ n=e->len-off; if(n>block) n=block; if(!memcmp(e->mirror+off,src+off,(size_t)n)) break; end=off+n; off=end; }
-      glBufferSubData(target,(GLintptr)first,(GLsizeiptr)(end-first),src+first); memcpy(e->mirror+first,src+first,(size_t)(end-first)); st_vb_up+=end-first;
-    }
+  for(u64 off=0;off<e->len;off+=block){ u64 n=e->len-off; if(n>block) n=block;
+    if(memcmp(e->mirror+off,src+off,(size_t)n)){ changed+=n;
+      if(changed>=e->len/2){ glBufferSubData(target,0,(GLsizeiptr)e->len,src); memcpy(e->mirror,src,(size_t)e->len); st_vb_up+=e->len; e->hash=~0ull; e->stable=0; return 1; } } }
+  if(!changed){ if(e->stable<100000) e->stable++; return 1; }
+  u64 run=~0ull, end=0;
+  for(u64 bo=0;bo<e->len;bo+=block){ u64 bn=e->len-bo; if(bn>block) bn=block;
+    if(!memcmp(e->mirror+bo,src+bo,(size_t)bn)){ if(run!=~0ull){ glBufferSubData(target,(GLintptr)run,(GLsizeiptr)(end-run),src+run); memcpy(e->mirror+run,src+run,(size_t)(end-run)); st_vb_up+=end-run; run=~0ull; } continue; }
+    for(u64 off=bo;off<bo+bn;off+=gran){ u64 n=bo+bn-off; if(n>gran) n=gran;
+      if(!memcmp(e->mirror+off,src+off,(size_t)n)){ if(run!=~0ull){ glBufferSubData(target,(GLintptr)run,(GLsizeiptr)(end-run),src+run); memcpy(e->mirror+run,src+run,(size_t)(end-run)); st_vb_up+=end-run; run=~0ull; } }
+      else { if(run==~0ull) run=off; end=off+n; } }
   }
+  if(run!=~0ull){ glBufferSubData(target,(GLintptr)run,(GLsizeiptr)(end-run),src+run); memcpy(e->mirror+run,src+run,(size_t)(end-run)); st_vb_up+=end-run; }
   e->hash=~0ull; e->stable=0; return 1;
 }
 /* range fully inside a compute result that didn't land in guest memory yet: copy gpu to gpu instead of waiting,
@@ -2302,7 +2303,7 @@ static int vbc_delta_upload(GLenum target, VbC* e, const u8* src){
 static int cs_gpu_src(u64 a, u64 n, GLuint* buf, u32* off);
 static u64 st_cs_gpucopy, st_cs_sync, st_cs_sync_ns;
 
-static GLuint buf_cached(GLenum target, u64 start, u64 len){
+static GLuint buf_cached(GLenum target, u64 start, u64 len, u32 stride){
   if(g_cs_any){ GLuint sb; u32 so;
     if(cs_gpu_src(start,len,&sb,&so)){
       u32 k=(u32)((start>>6)^(start>>20)^len)&2047;
@@ -2338,7 +2339,7 @@ static GLuint buf_cached(GLenum target, u64 start, u64 len){
   if(!src){ if(g_stage_cap<len){ u8* nb=realloc(g_stage_buf,len); if(!nb) return 0; g_stage_buf=nb; g_stage_cap=len; } gmem_read(start,g_stage_buf,len); src=g_stage_buf; }
   if(!e){ e=calloc(1,sizeof *e); e->start=start; e->len=len; e->csseen=g_csgen; e->used=1; glGenBuffers(1,&e->id); e->next=vbc[k]; vbc[k]=e; e->hash=~0ull; g_vbc_bytes+=len; g_vbc_n++; }
   glBindBuffer(target,e->id);
-  if(!vbc_delta_upload(target,e,src)){
+  if(!vbc_delta_upload(target,e,src,stride)){
     u64 h=fast_hash(src,len,0); st_vb_hashed+=len;
     if(e->hash!=h){ e->hash=h; glBufferData(target,(GLsizeiptr)len,src,GL_STATIC_DRAW); st_vb_up+=len; e->stable=0; } else if(e->stable<100000) e->stable++;
   } else e->hash=0;
@@ -2716,8 +2717,9 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
     u64 start=((u64)va[1]<<32)|va[2]; u64 lim=((u64)r[0x7C0+buf*2]<<32)|r[0x7C1+buf*2]; u32 stride=va[0]&0xFFF;
     u64 len= lim>=start? lim-start+1 : 0; if(len>64u<<20) len=64u<<20;
     if(!len) { VA_OFF(i); continue; }
-    GLuint vbid=buf_cached(GL_ARRAY_BUFFER,start,len);
     u32 cnt=attr_count(size), bits=attr_bits(size);
+    u32 vstride=stride? stride : (cnt*bits+7)/8; if(!vstride) vstride=1;
+    GLuint vbid=buf_cached(GL_ARRAY_BUFFER,start,len,vstride);
     GLenum gt; GLboolean norm= ty==1||ty==2;
     if(size==0x30) gt= ty==1? GL_INT_2_10_10_10_REV : GL_UNSIGNED_INT_2_10_10_10_REV;
     else if(size==0x31) gt=GL_UNSIGNED_INT_10F_11F_11F_REV;
@@ -2759,7 +2761,7 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
       glBufferData(GL_ELEMENT_ARRAY_BUFFER,(GLsizeiptr)nq*24,idx,GL_STREAM_DRAW); free(idx);
       glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES,nq*6,GL_UNSIGNED_INT,0,instances,(GLint)base_vertex,base_instance);
     } else {
-      buf_cached(GL_ELEMENT_ARRAY_BUFFER,ia+(u64)first*isz,(u64)count*isz);   /* just this draw's range */
+      buf_cached(GL_ELEMENT_ARRAY_BUFFER,ia+(u64)first*isz,(u64)count*isz,0);   /* just this draw's range */
       glDrawElementsInstancedBaseVertexBaseInstance(mode,count,it,(void*)0,instances,(GLint)base_vertex,base_instance);
     }
   } else {

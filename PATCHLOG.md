@@ -339,3 +339,12 @@ The cumulative beta patch is `patches/milestone-024-main-to-beta.patch`.
 - Rebuilt beta's `bin/runtime_linux_x11` successfully. This has not yet been verified in a fresh FFRS run; the current logs need to show whether the delayed-link checkpoint triggers and whether frame output resumes.
 
 The cumulative beta patch is `patches/milestone-025-main-to-beta.patch`.
+
+## Milestone 026 — Stride-aware vertex buffer delta uploads
+
+- Balatro's available log reports 202,140.4 KiB of vertex/index data checked and 202,100.4 KiB uploaded per frame at 12.5 FPS, with GPU-thread busy time at 90%. The cache path previously compared the full mirror, scanned it again in 64 KiB blocks, and issued a full-range update when at least half of those blocks differed.
+- Added stride-aware scanning for vertex attributes. The 64 KiB scan blocks are stride aligned; sparse changed blocks are refined to individual vertex-stride runs and adjacent changed strides are coalesced into `glBufferSubData` sub-range uploads. If at least half the range is dirty by block, it stops scanning and uses one full update. This avoids per-vertex GL calls and keeps guest range/cache keys unchanged.
+- Index and shader-storage buffers retain non-stride scanning. This is intended to reduce repeated comparison work and sparse uploads; the existing Balatro log shows most bytes were changing, so a fresh run is needed to determine how much this improves its frame rate.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. No in-game performance result is available yet.
+
+The cumulative beta patch is `patches/milestone-026-main-to-beta.patch`.
