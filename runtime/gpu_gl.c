@@ -3520,12 +3520,12 @@ static void gpu_thread(void* arg){ t_gpu_thread=1;
         if(w.wait_id!=~0u){ extern int syncpt_wait(u32,u32,i64); extern void gpu_gl_before_syncwait(void); gpu_gl_before_syncwait();
           if(!syncpt_wait(w.wait_id,w.wait_val,2000000000)){ static int nl; if(nl<6){ nl++; LOG("gpu: submit fence %u >= %u never came (2 s), running it anyway\n",w.wait_id,w.wait_val); } } }
         gpu_submit_now(w.ent,w.n,w.syncpt); cs_kick_async(); free(w.ent); cs_submit_done(w.syncpt,w.incs); break;
-      case WK_PRESENT_CPU: if(g_skip_frame){ free(w.px); g_frame++; g_skip_frame= g_frame%(frame_skip_count()+1); break; }
-        g_present_guest_ns=w.sub_ns; trace_note("PRESENT CPU image %dx%d\n",w.w,w.h); present_cpu(w.px,w.w,w.h); free(w.px); g_frame++; g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); gpu_evict_step(); frame_stats(); trace_frame(); break;
-      case WK_PRESENT_ADDR: if(g_skip_frame){ g_frame++; g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); break; }
+      case WK_PRESENT_CPU: if(g_skip_frame){ free(w.px); g_frame++; gmem_ptr_frame_advance(); g_skip_frame= g_frame%(frame_skip_count()+1); break; }
+        g_present_guest_ns=w.sub_ns; trace_note("PRESENT CPU image %dx%d\n",w.w,w.h); present_cpu(w.px,w.w,w.h); free(w.px); g_frame++; gmem_ptr_frame_advance(); g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); gpu_evict_step(); frame_stats(); trace_frame(); break;
+      case WK_PRESENT_ADDR: if(g_skip_frame){ g_frame++; gmem_ptr_frame_advance(); g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); break; }
         g_present_guest_ns=w.sub_ns;
         if(!present_addr(w.addr,w.w,w.h)){ extern void vi_convert_cpu(u64 a, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt, u32* out);
-          u32* px=malloc((size_t)w.w*w.h*4); vi_convert_cpu(w.addr,w.w,w.h,w.n,(w.fmt>>8)&15,(w.fmt>>12)&15,w.fmt&0xFF,px); present_cpu(px,w.w,w.h); free(px); } g_frame++; g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); gpu_evict_step(); frame_stats(); trace_frame(); break;
+          u32* px=malloc((size_t)w.w*w.h*4); vi_convert_cpu(w.addr,w.w,w.h,w.n,(w.fmt>>8)&15,(w.fmt>>12)&15,w.fmt&0xFF,px); present_cpu(px,w.w,w.h); free(px); } g_frame++; gmem_ptr_frame_advance(); g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); gpu_evict_step(); frame_stats(); trace_frame(); break;
       case WK_DUMP: dump_rts(); g_tr_arm=1; break;
       case WK_SHOT: do_screenshot(w.path[0]? w.path : NULL); __atomic_store_n(&g_shot_done,w.n,__ATOMIC_SEQ_CST); break;
     }

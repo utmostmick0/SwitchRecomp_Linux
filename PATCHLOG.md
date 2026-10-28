@@ -238,6 +238,18 @@ The cumulative beta patch is `patches/milestone-017-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-018-main-to-beta.patch`.
 
+## Milestone 019 — Cached contiguous GVA validation
+
+- Added a per-thread, exact-range cache for successful `gmem_ptr()` contiguous GMMU validations. Repeated guest
+  virtual address and size pairs can bypass the page-by-page translation walk for up to 30 rendered frames.
+- GMMU map and unmap operations advance a generation counter; cached ranges are rejected while a mapping update is
+  in progress and invalidated immediately when the generation changes.
+- Kept byte-exact buffer mirror comparisons enabled. Linux does not track every direct guest CPU store in this
+  runtime, so skipping content checks based only on a repeated address could render stale geometry.
+- Rebuilt beta's Linux X11 runtime successfully. Frame-rate impact needs a fresh Balatro run.
+
+The cumulative beta patch is `patches/milestone-019-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

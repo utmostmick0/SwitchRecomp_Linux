@@ -27,12 +27,39 @@ int gmem_write(u64 gva, const void* src, u64 size){
   gpu_mem_written(g0,s0);
   return 0; }
 
+typedef struct { u64 gva, size, cpu; u32 map_gen, frame; } GvaRange;
+#define GVA_RANGE_CACHE_N 4096
+static __thread GvaRange g_gva_ranges[GVA_RANGE_CACHE_N];
+static __thread u32 g_gva_frame;
+
+void gmem_ptr_frame_advance(void){ g_gva_frame++; }
+
 u8* gmem_ptr(u64 gva, u64 size){
-  /* host pointer, only if the whole range is contiguous */
+  /* GPU buffers commonly reuse the same guest range for many consecutive frames.
+     Cache successful contiguous-range validations, invalidate them on every GMMU
+     map/unmap, and require a fresh page walk after at most 30 rendered frames. */
   if(g_cs_any) cs_mem_need(gva,size);
-  u64 c0=gmmu_translate(gva); if(!c0) return NULL;
-  for(u64 o=(0x1000-(gva&0xFFF));o<size;o+=0x1000){ if(gmmu_translate(gva+o)!=c0+o) return NULL; }
-  return GP(c0); }
+  u32 slot=(u32)((gva>>12)^(gva>>32)^(size>>12)^size)&(GVA_RANGE_CACHE_N-1);
+  GvaRange* e=&g_gva_ranges[slot];
+  for(int retry=0;retry<3;retry++){
+    u32 gen=gmmu_generation();
+    if(gen&1) continue; /* mapping update in progress */
+    if(e->cpu && e->gva==gva && e->size==size && e->map_gen==gen && (u32)(g_gva_frame-e->frame)<30){
+      if(gmmu_generation()==gen) return GP(e->cpu);
+    }
+    /* host pointer is valid only if every page in the guest range maps to the
+       same contiguous host span. Retry if a mapping changed during validation. */
+    u64 c0=gmmu_translate(gva); int contiguous=c0!=0;
+    if(contiguous) for(u64 o=(0x1000-(gva&0xFFF));o<size;o+=0x1000){
+      if(gmmu_translate(gva+o)!=c0+o){ contiguous=0; break; } }
+    u32 after=gmmu_generation();
+    if(after!=gen || (after&1)) continue;
+    if(!contiguous) return NULL;
+    e->gva=gva; e->size=size; e->cpu=c0; e->map_gen=gen; e->frame=g_gva_frame;
+    return GP(c0);
+  }
+  return NULL;
+}
 
 u32 gmem_r32(u64 gva){ u32 v=0; gmem_read(gva,&v,4); return v; }
 

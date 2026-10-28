@@ -27,6 +27,7 @@ extern GpuState g_gpu;
 int gmem_read(u64 gva, void* dst, u64 size);
 int gmem_write(u64 gva, const void* src, u64 size);
 u8* gmem_ptr(u64 gva, u64 size);
+void gmem_ptr_frame_advance(void);
 u32 gmem_r32(u64 gva); void gmem_w32(u64 gva, u32 v); void gmem_w64(u64 gva, u64 v);
 u64 bl_offset(u32 x_bytes, u32 y, u32 z, u32 width_bytes, u32 height, u32 bh_log2, u32 bd_log2);
 void deswizzle(u8* dst, u32 dst_pitch, const u8* src, u32 w_bytes, u32 h, u32 bh_log2);

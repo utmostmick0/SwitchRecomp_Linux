@@ -23,16 +23,22 @@ u64 nvmap_addr_by_id(u32 id){ u32 h=nvmap_from_id(id); if(!h) h=id<8192? id : 0;
 #define GPAGE_BITS 12
 #define GL1 (1u<<16)     /* 40-12 = 28 bits, split 16 + 12 */
 static u64** gmmu; /* gmmu[i] -> 4096 entries of (guest addr | 1) */
+static u32 gmmu_gen;
+u32 gmmu_generation(void){ return __atomic_load_n(&gmmu_gen,__ATOMIC_ACQUIRE); }
 u64 gmmu_translate(u64 gva){
   u64 p=gva>>GPAGE_BITS; u32 i=(u32)(p>>12)&(GL1-1), j=(u32)p&0xFFF;
   u64* t=gmmu[i]; if(!t) return 0; u64 e=t[j]; if(!(e&1)) return 0; return (e&~1ull)+(gva&0xFFF); }
 
 static void gmmu_map(u64 gva, u64 cpu, u64 size){
+  if(size) __atomic_add_fetch(&gmmu_gen,1,__ATOMIC_ACQ_REL); /* odd: a mapping update is in progress */
   for(u64 o=0;o<size;o+=0x1000){ u64 p=(gva+o)>>GPAGE_BITS; u32 i=(u32)(p>>12)&(GL1-1), j=(u32)p&0xFFF;
-    if(!gmmu[i]) gmmu[i]=calloc(4096,8); gmmu[i][j]=(cpu+o)|1; } }
+    if(!gmmu[i]) gmmu[i]=calloc(4096,8); gmmu[i][j]=(cpu+o)|1; }
+  if(size) __atomic_add_fetch(&gmmu_gen,1,__ATOMIC_RELEASE); /* even: mapping is stable */ }
 
 static void gmmu_unmap(u64 gva, u64 size){
-  for(u64 o=0;o<size;o+=0x1000){ u64 p=(gva+o)>>GPAGE_BITS; u32 i=(u32)(p>>12)&(GL1-1), j=(u32)p&0xFFF; if(gmmu[i]) gmmu[i][j]=0; } }
+  if(size) __atomic_add_fetch(&gmmu_gen,1,__ATOMIC_ACQ_REL);
+  for(u64 o=0;o<size;o+=0x1000){ u64 p=(gva+o)>>GPAGE_BITS; u32 i=(u32)(p>>12)&(GL1-1), j=(u32)p&0xFFF; if(gmmu[i]) gmmu[i][j]=0; }
+  if(size) __atomic_add_fetch(&gmmu_gen,1,__ATOMIC_RELEASE); }
 
 typedef struct { u64 gva, size; u32 h; u64 off; } GMap;
 
