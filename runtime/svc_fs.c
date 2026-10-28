@@ -123,21 +123,44 @@ void romfs_init(void){
 
 u64 romfs_size(void){ return rtotal; }
 
-/* cache of open host files */
+/* Cache metadata is protected briefly; file contents are read with explicit offsets
+   outside the lock. refs prevent the LRU from closing a descriptor during pread. */
 #define NOPEN 48
-static struct { const char* path; FILE* f; u64 last; } openf[NOPEN]; static u64 openclk;
+static struct { const char* path; FILE* f; u64 last; u32 refs; } openf[NOPEN]; static u64 openclk;
 
-static FILE* rf_open(const char* path){
-  int lru=0;
-  for(int i=0;i<NOPEN;i++){ if(openf[i].path==path){ openf[i].last=++openclk; return openf[i].f; } if(openf[i].last<openf[lru].last) lru=i; }
-  if(openf[lru].f) fclose(openf[lru].f);
-  openf[lru].f=fopen(path,"rb"); openf[lru].path=path; openf[lru].last=++openclk; return openf[lru].f; }
+static FILE* rf_acquire(const char* path, int* cached_slot){
+  int lru=-1;
+  pm_lock(&g_romlock);
+  for(int i=0;i<NOPEN;i++){
+    if(openf[i].f && openf[i].path==path){ openf[i].last=++openclk; openf[i].refs++; *cached_slot=i; FILE* f=openf[i].f; pm_unlock(&g_romlock); return f; }
+    if(!openf[i].refs && (lru<0 || openf[i].last<openf[lru].last)) lru=i;
+  }
+  if(lru>=0){
+    if(openf[lru].f) fclose(openf[lru].f);
+    openf[lru].f=fopen(path,"rb"); openf[lru].path=path; openf[lru].last=++openclk; openf[lru].refs=openf[lru].f? 1 : 0;
+    FILE* f=openf[lru].f; if(f) *cached_slot=lru; pm_unlock(&g_romlock); return f;
+  }
+  /* All cached descriptors are in use. An uncached descriptor avoids waiting
+     behind unrelated archive reads and is closed by rf_read after its pread. */
+  pm_unlock(&g_romlock); *cached_slot=-1; return fopen(path,"rb");
+}
+
+static int rf_read(const char* path, void* dst, u64 size, u64 off){
+  int slot=-1; FILE* f=rf_acquire(path,&slot); if(!f) return -1;
+  int n=plat_pread(f,dst,size,off);
+  if(slot>=0){ pm_lock(&g_romlock); if(openf[slot].refs) openf[slot].refs--; pm_unlock(&g_romlock); }
+  else fclose(f);
+  return n;
+}
+
+static int rf_log_once(RFile* f){
+  pm_lock(&g_romlock); int log=!f->logged; if(log) f->logged=1; pm_unlock(&g_romlock); return log;
+}
 
 int romfs_read(u64 off, void* dst, u64 size){
   u8* d=dst;
-  if(rraw){ pm_lock(&g_romlock); int r=plat_pread(rraw,d,size,off); pm_unlock(&g_romlock); return r<0? -1 : 0; }
+  if(rraw){ int r=plat_pread(rraw,d,size,off); return r<0? -1 : 0; }
   if(off<rmeta_size){ u64 n=rmeta_size-off; if(n>size) n=size; memcpy(d,rmeta+off,n); d+=n; off+=n; size-=n; }
-  pm_lock(&g_romlock);
   while(size){
     int lo=0, hi=nrfiles-1, k=-1;
     while(lo<=hi){ int m=(lo+hi)/2; if(rfiles[m].off<=off){ k=m; lo=m+1; } else hi=m-1; }
@@ -149,12 +172,10 @@ int romfs_read(u64 off, void* dst, u64 size){
 #ifdef SWR_HAVE_VP9
     { extern void vp9_note_file(const char* path); vp9_note_file(f->path); }
 #endif
-    if(!f->logged){ f->logged=1; LOG("romfs: %s (%.1f KB)\n",f->path+g_romdir_len,(double)f->size/1024.0); }
-    FILE* fp=rf_open(f->path);
-    if(!fp || plat_pread(fp,d,n,off-f->off)<(int)n){ memset(d,0,n); }
+    if(rf_log_once(f)) LOG("romfs: %s (%.1f KB)\n",f->path+g_romdir_len,(double)f->size/1024.0);
+    if(rf_read(f->path,d,n,off-f->off)<(int)n){ memset(d,0,n); }
     d+=n; off+=n; size-=n;
   }
-  pm_unlock(&g_romlock);
   return 0;
 }
 

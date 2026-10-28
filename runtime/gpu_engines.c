@@ -254,9 +254,28 @@ volatile u64 g_dma_copies;
    of translating + tracking every 16 bytes */
 static u8* bl_span_ptr(u64 base, u32 wbytes, u32 h, u32 bh, u32 z, u32 bd, u64* span){
   static int off=-1; if(off<0) off=getenv("SWR_DMA_SLOW")!=NULL; if(off) return NULL;
-  u64 gh=8ull<<bh, gd=1ull<<bd; u64 sz=(((u64)wbytes+63)&~63ull)*((h+gh-1)/gh*gh)*((z/gd+1)*gd);
-  if(!sz || sz>(256ull<<20)) return NULL;
+  if(!wbytes || !h || bh>5 || bd>5) return NULL;
+  u64 pitch=((u64)wbytes+63)&~63ull, gh=8ull<<bh, gd=1ull<<bd;
+  u64 ph=((u64)h+gh-1)/gh*gh, pd=((u64)z/gd+1)*gd;
+  if(pitch>(256ull<<20)/ph || pitch*ph>(256ull<<20)/pd) return NULL;
+  u64 sz=pitch*ph*pd;
+  if(!sz) return NULL;
   u8* p=gmem_ptr(base,sz); if(p) *span=sz; return p; }
+
+/* Return the block-linear row pitch in bytes, normalized to whole GOBs. This
+   preserves the guest layout (bl_offset also addresses whole 64-byte GOBs)
+   while rejecting dimensions that could overflow host allocation arithmetic. */
+static int dma_bl_layout(u32 w, u32 h, u32 bh, u32 bd, u32 depth, u32 pixel_bytes, u32* pitch){
+  if(!w || !h || w>16384 || h>16384 || bh>5 || bd>5 || !depth || depth>16384 || !pixel_bytes) return 0;
+  u64 row=(u64)w*pixel_bytes;
+  if(row>UINT32_MAX-63) return 0;
+  row=(row+63)&~63ull;
+  u64 gh=8ull<<bh, gd=1ull<<bd;
+  u64 ph=((u64)h+gh-1)/gh*gh, pd=((u64)depth+gd-1)/gd*gd;
+  if(row>(256ull<<20)/ph || row*ph>(256ull<<20)/pd) return 0;
+  *pitch=(u32)row;
+  return 1;
+}
 
 static void bl_span_done(u64 base, u64 span){
   extern void (*g_ww_touch)(u64); extern u8* g_mem;
@@ -271,10 +290,11 @@ void dma_method(GpuChannel* ch, u32 m, u32 v){
   u32 pitch_in=r[0x104], pitch_out=r[0x105], line_len=r[0x106], lines=r[0x107];
   int src_linear=(v>>7)&1, dst_linear=(v>>8)&1, multi=(v>>9)&1, remap=(v>>10)&1;
   if(!multi) lines=1;
-  u32 bpp=1;
-  if(remap){ u32 rc=r[0x1C2]; u32 comp=((rc>>16)&3)+1, csz=((rc>>20)&3)+1; bpp=comp*csz; line_len*=bpp; }
+  u32 bpp=1; int valid=1;
+  if(remap){ u32 rc=r[0x1C2]; u32 comp=((rc>>16)&3)+1, csz=((rc>>20)&3)+1; bpp=comp*csz;
+    u64 mapped=(u64)line_len*bpp; if(mapped>UINT32_MAX) valid=0; else line_len=(u32)mapped; }
   /* bl params: dst 0x1C3.., src 0x1CA.. */
-  u32 dbh=(r[0x1C3]>>4)&15, dw=r[0x1C4], dh=r[0x1C5], dd=r[0x1C6]; (void)dd;
+  u32 dbh=(r[0x1C3]>>4)&15, dw=r[0x1C4], dh=r[0x1C5], dd=r[0x1C6];
   u32 sbh=(r[0x1CA]>>4)&15, sw=r[0x1CB], sh=r[0x1CC];
   u32 sx=r[0x1CF]&0xFFFF, sy=r[0x1CF]>>16; u32 dx=r[0x1C8]&0xFFFF, dy=r[0x1C8]>>16;
   /* array layer = whole 2D bl surface stride */
@@ -282,10 +302,22 @@ void dma_method(GpuChannel* ch, u32 m, u32 v){
   u32 dz=0, sz_=0, dbd=0, sbd=0;
   if(!dst_linear && r[0x1C6]>1){ dz=r[0x1C7]; dbd=(r[0x1C3]>>8)&15; }
   if(!src_linear && r[0x1CD]>1){ sz_=r[0x1CE]; sbd=(r[0x1CA]>>8)&15; }
+  u32 dst_pitch=0, src_pitch=0;
+  if(!dst_linear){
+    if(!dma_bl_layout(dw,dh,dbh,dbd,dd?dd:1,remap?bpp:1,&dst_pitch) || dx>dw || dy>dh || dz>=(dd?dd:1)) valid=0;
+    else { u32 avail=(dw-dx)*(remap?bpp:1); if(line_len>avail) line_len=avail; if(lines>dh-dy) lines=dh-dy; }
+  }
+  if(!src_linear){
+    if(!dma_bl_layout(sw,sh,sbh,sbd,r[0x1CD]?r[0x1CD]:1,remap?bpp:1,&src_pitch) || sx>sw || sy>sh || sz_>=(r[0x1CD]?r[0x1CD]:1)) valid=0;
+    else { u32 avail=(sw-sx)*(remap?bpp:1); if(line_len>avail) line_len=avail; if(lines>sh-sy) lines=sh-sy; }
+  }
+  if(src_linear && lines>1 && pitch_in<line_len) valid=0;
+  if(dst_linear && lines>1 && pitch_out<line_len) valid=0;
+  if(!valid){ static int bad; if(bad++<8) WARN("dma: rejected invalid surface/copy bounds (src=%ux%u bh=%u, dst=%ux%u bh=%u, line=%u lines=%u offsets=%u,%u/%u,%u)\n",sw,sh,sbh,dw,dh,dbh,line_len,lines,sx,sy,dx,dy); line_len=0; lines=0; }
   { u32 dl= dz? 0 : r[0x1C7], sl= sz_? 0 : r[0x1CE];
     if(r[0x1C6]>1) dl=0; if(r[0x1CD]>1) sl=0;
-    if(!dst_linear && dl){ u32 wbb=dw*(remap?bpp:1); u64 gh=8u<<dbh; u64 lsz=(((u64)wbb+63)&~63ull)*((dh+gh-1)/gh*gh); dst+=lsz*dl; }
-    if(!src_linear && sl){ u32 wbb=sw*(remap?bpp:1); u64 gh=8u<<sbh; u64 lsz=(((u64)wbb+63)&~63ull)*((sh+gh-1)/gh*gh); src+=lsz*sl; } }
+    if(!dst_linear && dl && dst_pitch){ u64 gh=8ull<<dbh; u64 lsz=(u64)dst_pitch*((dh+gh-1)/gh*gh); dst+=lsz*dl; }
+    if(!src_linear && sl && src_pitch){ u64 gh=8ull<<sbh; u64 lsz=(u64)src_pitch*((sh+gh-1)/gh*gh); src+=lsz*sl; } }
   { static u64 ndma; ndma++; extern volatile u64 g_dma_copies; g_dma_copies=ndma; }
   { static int said; if(said<6){ said++; LOG("dma: %s->%s src=%llx dst=%llx pitch %u/%u len=%u lines=%u multi=%d remap=%d(%x) dst[bh=%u w=%u h=%u d=%u l=%u o=%x] src[bh=%u w=%u h=%u o=%x] launch=%x\n",
       src_linear?"lin":"bl",dst_linear?"lin":"bl",(unsigned long long)src,(unsigned long long)dst,pitch_in,pitch_out,line_len,lines,multi,remap,r[0x1C2],dbh,dw,dh,r[0x1C6],r[0x1C7],r[0x1C8],sbh,sw,sh,r[0x1CF],v); } }
@@ -293,42 +325,42 @@ void dma_method(GpuChannel* ch, u32 m, u32 v){
   if(g_gl){ char tb[256]; snprintf(tb,sizeof tb,"DMA %s %llx -> %s %llx len=%u lines=%u remap=%d\n",src_linear?"lin":"bl",(unsigned long long)src,dst_linear?"lin":"bl",(unsigned long long)dst,line_len,lines,remap); gpu_gl_trace(tb);
     gpu_gl_rt_flush(src); gpu_gl_rt_flush(dst); }
   u8* dpp=NULL; u8* spp=NULL; u64 dspan=0, sspan=0; (void)spp; (void)sspan;
-  if(remap && (r[0x1C2]&7)==4 && dst_linear){
+  if(line_len && lines && remap && (r[0x1C2]&7)==4 && dst_linear){
     /* DST_X = CONST_A: a buffer fill with the constant in 0x1C0, the source isn't read */
     u32 cv=r[0x1C0]; u8* f=malloc((size_t)line_len+4); for(u32 i=0;i<line_len;i+=4) memcpy(f+i,&cv,4);
     for(u32 y=0;y<lines;y++) gmem_write(dst+(u64)y*pitch_out,f,line_len);
     free(f);
-  } else if(src_linear && dst_linear){
+  } else if(line_len && lines && src_linear && dst_linear){
     if(!multi){ u8* tmp=malloc(line_len); gmem_read(src,tmp,line_len); gmem_write(dst,tmp,line_len); free(tmp); }
     else { u8* tmp=malloc(line_len); for(u32 y=0;y<lines;y++){ gmem_read(src+(u64)y*pitch_in,tmp,line_len); gmem_write(dst+(u64)y*pitch_out,tmp,line_len); } free(tmp); }
-  } else if(src_linear && !dst_linear && (dpp=bl_span_ptr(dst,dw*(remap?bpp:1),dh,dbh,dz,dbd,&dspan))){
+  } else if(line_len && lines && src_linear && !dst_linear && (dpp=bl_span_ptr(dst,dst_pitch,dh,dbh,dz,dbd,&dspan))){
     /* contiguous dst: copy directly, one write record at the end */
-    u32 wb=dw*(remap?bpp:1); u8* buf=malloc(line_len);
+    u32 wb=dst_pitch; u8* buf=malloc(line_len);
     for(u32 y=0;y<lines;y++){ gmem_read(src+(u64)y*pitch_in,buf,line_len);
       for(u32 x=0;x<line_len;){ u32 xb=dx*(remap?bpp:1)+x, n=16-(xb&15); if(n>line_len-x) n=line_len-x;
         u64 o=bl_offset(xb,dy+y,dz,wb,dh,dbh,dbd); if(o+n<=dspan) memcpy(dpp+o,buf+x,n); else gmem_write(dst+o,buf+x,n); x+=n; } }
     free(buf); bl_span_done(dst,dspan);
-  } else if(src_linear && !dst_linear){
-    u32 wb=dw*(remap?bpp:1); u8* buf=malloc(line_len);
+  } else if(line_len && lines && src_linear && !dst_linear){
+    u32 wb=dst_pitch; u8* buf=malloc(line_len);
     for(u32 y=0;y<lines;y++){ gmem_read(src+(u64)y*pitch_in,buf,line_len);
       /* bl keeps 16 byte groups contiguous so copy per group and not per byte (per byte was ~11% in profiles) */
       for(u32 x=0;x<line_len;){ u32 xb=dx*(remap?bpp:1)+x, n=16-(xb&15); if(n>line_len-x) n=line_len-x;
         u64 o=bl_offset(xb,dy+y,dz,wb,dh,dbh,dbd); gmem_write(dst+o,buf+x,n); x+=n; } }
     free(buf);
-  } else if(!src_linear && dst_linear){
-    u32 wb=sw*(remap?bpp:1); u8* buf=malloc(line_len);
+  } else if(line_len && lines && !src_linear && dst_linear){
+    u32 wb=src_pitch; u8* buf=malloc(line_len);
     for(u32 y=0;y<lines;y++){ for(u32 x=0;x<line_len;){ u32 xb=sx*(remap?bpp:1)+x, n=16-(xb&15); if(n>line_len-x) n=line_len-x;
         u64 o=bl_offset(xb,sy+y,sz_,wb,sh,sbh,sbd); gmem_read(src+o,buf+x,n); x+=n; }
       gmem_write(dst+(u64)y*pitch_out,buf,line_len); }
     free(buf);
-  } else if(!src_linear && !dst_linear && (dpp=bl_span_ptr(dst,dw*(remap?bpp:1),dh,dbh,dz,dbd,&dspan)) && (spp=bl_span_ptr(src,sw*(remap?bpp:1),sh,sbh,sz_,sbd,&sspan))){
-    u32 swb=sw*(remap?bpp:1), dwb=dw*(remap?bpp:1);
+  } else if(line_len && lines && !src_linear && !dst_linear && (dpp=bl_span_ptr(dst,dst_pitch,dh,dbh,dz,dbd,&dspan)) && (spp=bl_span_ptr(src,src_pitch,sh,sbh,sz_,sbd,&sspan))){
+    u32 swb=src_pitch, dwb=dst_pitch;
     for(u32 y=0;y<lines;y++) for(u32 x=0;x<line_len;){ u32 xs=sx*(remap?bpp:1)+x, xd=dx*(remap?bpp:1)+x, n=16-(xs&15), m=16-(xd&15); if(m<n) n=m; if(n>line_len-x) n=line_len-x;
       u64 so=bl_offset(xs,sy+y,sz_,swb,sh,sbh,sbd), dof=bl_offset(xd,dy+y,dz,dwb,dh,dbh,dbd);
       if(so+n<=sspan && dof+n<=dspan) memmove(dpp+dof,spp+so,n); else { u8 b[16]; gmem_read(src+so,b,n); gmem_write(dst+dof,b,n); } x+=n; }
     bl_span_done(dst,dspan);
-  } else {
-    u32 swb=sw*(remap?bpp:1), dwb=dw*(remap?bpp:1);
+  } else if(line_len && lines){
+    u32 swb=src_pitch?src_pitch:sw*(remap?bpp:1), dwb=dst_pitch?dst_pitch:dw*(remap?bpp:1);
     for(u32 y=0;y<lines;y++) for(u32 x=0;x<line_len;){ u32 xs=sx*(remap?bpp:1)+x, xd=dx*(remap?bpp:1)+x, n=16-(xs&15), m=16-(xd&15); if(m<n) n=m; if(n>line_len-x) n=line_len-x;
       u8 b[16]; gmem_read(src+bl_offset(xs,sy+y,sz_,swb,sh,sbh,sbd),b,n); gmem_write(dst+bl_offset(xd,dy+y,dz,dwb,dh,dbh,dbd),b,n); x+=n; }
   }

@@ -205,6 +205,94 @@ The cumulative beta patch is `patches/milestone-013-main-to-beta.patch`.
 - Runtime and build changes are synchronized between `beta` and `flatpack`. Rebuild/update the Linux X11 runtime before the feature is available in installed games.
 - The cumulative beta patch is `patches/milestone-016-main-to-beta.patch`.
 
+## Milestone 017 — reacquire mutex after condition-variable waits
+
+- The diagnostic notes include several different incidents under nearby headings. In the current
+  `.ai-crash-analysis.md`, Target 3 (Belmonts Curse) describes an audio-configuration abort; the
+  `ea01` condition-variable log is listed separately under the updated SMW/TOTK thread-scheduling
+  item. `0xEA01` is the timeout result, so seeing it alone does not prove a host scheduler failure.
+- Traced `svc_wait_cv` in `runtime/kernel.c`. It released the guest mutex before waiting, but its
+  timeout path returned without reacquiring that mutex. The zero-timeout path did the same. Also,
+  when a signal arrived but the mutex was still owned, the waiter was moved to the mutex queue while
+  the original condition timeout remained active; expiry could remove it from that queue and return
+  `0xEA01` before mutex handoff.
+- Added `cv_reacquire_nl`: it atomically takes an available guest mutex or queues the thread using
+  the existing mutex waiter and handoff path. A real condition timeout, including timeout zero,
+  now returns `0xEA01` only after reacquiring the mutex. Once signaled, a waiter no longer applies
+  the condition timeout to the subsequent mutex reacquisition. Existing main-thread wait/signal
+  diagnostics remain in place.
+- Built the beta Linux X11 runtime successfully with
+  `python3 switchrecomp.py --build-runtime --target linux --backend x11 --cc gcc`; output is
+  `bin/runtime_linux_x11`. The runtime has not yet been installed into a game or tested in-game,
+  and no game executable was recompiled.
+- Checkout audit: an earlier build attempt in `/mnt/Media2/Switchrecomp0` used its `alpha` branch,
+  not this repository's `beta` branch. That attempt encountered an unrelated undeclared `srgb`
+  variable in that checkout's `runtime/gpu_gl.c`; its local X11 runtime was rebuilt there, but it is
+  not the beta build for this milestone. The beta checkout already had the sRGB variable declared.
+  This milestone's source fix and test binary are in `SwitchRecomp_Linux`; `main` was not changed.
+- The earlier Maxwell `ISBERD`/`HSET2` translation work was also applied only in
+  `/mnt/Media2/Switchrecomp0/runtime/shader.c` on `alpha`; it is not part of this beta runtime or
+  milestone patch. The two checkout histories and their build outputs must be treated separately.
+- The shared `runtime/kernel.c` fix and this milestone's notes/patch are synchronized to the local
+  `flatpack` worktree. The Flatpak runtime binary has not been rebuilt; the requested test build is
+  beta's `bin/runtime_linux_x11`.
+
+- The cumulative beta patch is `patches/milestone-017-main-to-beta.patch`.
+
+## Milestone 020 — Orphaned uniform upload arena
+
+- Replaced the persistent-mapped constant-buffer ring and its synchronous segment-fence waits with a mutable
+  32 MiB uniform upload arena. Uploads use `glBufferSubData`; when the arena reaches its end, the runtime
+  orphans its storage with `glBufferData(..., NULL, ...)`, letting queued draws retain the old backing store
+  while subsequent uploads use fresh storage.
+- Cache entries now include the arena store generation so a wrapped/orphaned allocation can never reuse a
+  constant-buffer offset from the prior backing store. The runtime profile reports arena orphan counts in
+  place of the removed ring-wait count.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. The Flatpak runtime binary has not been rebuilt;
+  game performance and rendering correctness need validation in a fresh game run.
+
+The cumulative beta patch is `patches/milestone-020-main-to-beta.patch`.
+
+## Milestone 021 — Rebind uniform ranges after orphaning
+
+- After orphaning the uniform arena, the runtime now rebinds the arena to both generic UBO and SSBO targets,
+  then reasserts previously cached indexed ranges. It clears the software range cache so subsequent constant
+  uploads explicitly bind their newly populated slices.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. This is a driver-state workaround; a fresh game run is
+  needed to confirm whether it resolves the reported black screen. The Flatpak runtime binary has not been rebuilt.
+
+The cumulative beta patch is `patches/milestone-021-main-to-beta.patch`.
+
+## Milestone 022 — DMA block-linear bounds validation
+
+- Added checked block-linear row-pitch and surface-footprint calculations for DMA uploads. Dimensions above
+  16384, block-height/depth exponents above 5, overflow-sized rows, and layouts above 256 MiB are rejected
+  before span lookup or copy.
+- DMA rectangles are clipped to the declared block-linear source and destination width/height. Linear row
+  copies with a pitch shorter than the copied row are rejected. GOB pitches are normalized to 64-byte
+  boundaries; this preserves the block-linear address calculation while making the footprint arithmetic
+  explicit and overflow checked.
+- The available Balatro trace shows valid `lin->bl` transfers into a 2048x1024 surface with block-height
+  exponent 4; these rows stay within its bounds. The FFRS log has no frame submissions or DMA copies, so
+  it does not identify this path as the confirmed cause of its black screen.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. Fresh Balatro and FFRS runs are still needed to verify
+  the guarded path and investigate any remaining presentation failure.
+
+The cumulative beta patch is `patches/milestone-022-main-to-beta.patch`.
+
+## Milestone 023 — Gate framebuffer lookups on active descriptors
+
+- Added a shared framebuffer descriptor check requiring nonzero width/height/address and a mapped guest base
+  before render-target format resolution, texture creation, framebuffer binding, or format-key derivation.
+- `fs_get_keyed` now skips incomplete color descriptors and only performs sampler/TIC state lookup when a
+  valid color or enabled depth target exists. This keeps intermediate register state out of format and active
+  texture resolution. The existing pending-draw flush runs after MME method emission, so the lookup sees the
+  final register state when the descriptor is complete.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. A fresh FFRS run is still needed to determine whether
+  this addresses its black screen.
+
+The cumulative beta patch is `patches/milestone-023-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep
@@ -213,3 +301,82 @@ The cumulative beta patch is `patches/milestone-013-main-to-beta.patch`.
 3. On `beta`, run `scripts/create-milestone-patch.sh NNN` with the next three-digit milestone number.
 4. Commit the generated patch and sync the patch and log updates to `flatpack`.
 5. Confirm shared source changes match across both branches and `main` has not moved.
+
+## Milestone 024 — Keep preselected-user launch storage stable
+
+- Made the `PopLaunchParameter` preselected-user payload an explicit 0x88-byte layout with a compile-time size assertion. Its magic, active marker, and UID matching `acc:u0` are refreshed before every `IStorageAccessor::Read`, so repeated or partial guest reads see a verified profile header.
+- Preserved `GetSize() == 0x88` and offset/length bounds. The accessor now retains its parent storage with a reference and releases it on destruction; backing storage is freed when no longer referenced. The one-time launch-parameter pop is only consumed after storage creation succeeds.
+- Added bounded diagnostics for storage creation, size queries, and reads. The current Balatro log contains no calls through this path, so this lifecycle hardening is not yet confirmed as the freeze cause; capture a fresh run to verify.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. Main remains unchanged.
+
+The cumulative beta patch is `patches/milestone-024-main-to-beta.patch`.
+
+## Milestone 025 — Synchronous fallback for delayed shader links
+
+- Traced shader readiness in `runtime/gpu_gl.c`: both the worker-job and same-context parallel-link paths previously skipped draws indefinitely while compilation remained pending. There is no separate `src/gpu/` tree in this C runtime.
+- Added a 250 ms per-program wait threshold. After that interval, the render thread attempts one synchronous compile/link from the same guest shader sources. If a worker later finishes, its redundant program is deleted rather than replacing the synchronous result. The worker continues running because it may own other queued programs.
+- A transparent identity shader is not used as a fallback: it would replace the guest draw and hide link failures rather than present the missing content. Failed synchronous links retain the existing diagnostics and failed shader capture behavior.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. This has not yet been verified in a fresh FFRS run; the current logs need to show whether the delayed-link checkpoint triggers and whether frame output resumes.
+
+The cumulative beta patch is `patches/milestone-025-main-to-beta.patch`.
+
+## Milestone 026 — Stride-aware vertex buffer delta uploads
+
+- Balatro's available log reports 202,140.4 KiB of vertex/index data checked and 202,100.4 KiB uploaded per frame at 12.5 FPS, with GPU-thread busy time at 90%. The cache path previously compared the full mirror, scanned it again in 64 KiB blocks, and issued a full-range update when at least half of those blocks differed.
+- Added stride-aware scanning for vertex attributes. The 64 KiB scan blocks are stride aligned; sparse changed blocks are refined to individual vertex-stride runs and adjacent changed strides are coalesced into `glBufferSubData` sub-range uploads. If at least half the range is dirty by block, it stops scanning and uses one full update. This avoids per-vertex GL calls and keeps guest range/cache keys unchanged.
+- Index and shader-storage buffers retain non-stride scanning. This is intended to reduce repeated comparison work and sparse uploads; the existing Balatro log shows most bytes were changing, so a fresh run is needed to determine how much this improves its frame rate.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. No in-game performance result is available yet.
+
+The cumulative beta patch is `patches/milestone-026-main-to-beta.patch`.
+
+## Milestone 027 — Concurrent positional reads for RomFS archives
+
+- FFRS's log shows the 5.8 GB `.ucas` archive is opened through RomFS. At the captured thread snapshots, workers 86–90 are waiting on guest condition variables rather than reported as blocked on a host mutex, so that trace does not confirm a file-lock deadlock.
+- `romfs_read` previously held one global mutex across range lookup and the complete file read. The open-file LRU now protects only descriptor metadata and open/close operations. It pins descriptors with a reference count, performs positional `plat_pread` calls outside the lock, and uses a temporary descriptor rather than waiting if all cached descriptors are active. Raw `romfs.bin` reads also use positional reads without the global lock.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. The source removes host-side serialization for independent archive reads, but a fresh FFRS load is needed to confirm whether it addresses the freeze.
+
+The cumulative beta patch is `patches/milestone-027-main-to-beta.patch`.
+
+## Milestone 028 — Maxwell compact vertex attribute layout
+
+- Audited the Maxwell vertex attribute size/type decoding in `runtime/gpu_gl.c`. Normalized SNorm/UNorm values already use `glVertexAttribPointer` with normalization enabled; ordinary SInt/UInt attributes use `glVertexAttribIPointer`.
+- Fixed missing component counts for Maxwell sizes `0x32` (G8_R8), `0x33` (X8_B8_G8_R8), and `0x34` (A8). They previously fell through to four components, so short records could overlap adjacent vertex data.
+- Added a byte-width table for every known Maxwell attribute size. With guest stride zero, the GL pointer continues to use GL's tightly packed default, while the buffer cache's delta scanner now uses the true element width. This fixes the prior 1-byte cache stride for packed `0x30` and `0x31` records.
+- Corrected the signed packed `0x30` host type selection for SNorm, SInt, and SScaled.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. Visual verification still needs a game run using compact vertex formats.
+
+The cumulative beta patch is `patches/milestone-028-main-to-beta.patch`.
+
+## Milestone 029 — SSL service alias and interface version
+
+- The latest FFRS log requests `nifm:u` and `bsd:s`, but contains no `ssl:s` service request or SSL command. It also records zero GPU submits and frames, so the log does not establish SSL Command 5 as the cause of the rendering halt.
+- Added the missing `ssl:s` service registration. On Switch, `ssl:s` Command 5 is `SetInterfaceVersion`: one input `u32`, no output storage or output descriptors. The handler stores the version and logs the first call; it does not fabricate certificate IDs or IPC buffers. Command 1 now reports zero active contexts.
+- Mirrored the runtime source and documentation to flatpack and rebuilt beta's `bin/runtime_linux_x11` successfully. A new FFRS log is needed to determine whether it reaches this handler and whether SSL setup is involved in the halt.
+
+The cumulative beta patch is `patches/milestone-029-main-to-beta.patch`.
+
+## Milestone 030 — Thread 80 mutex retry throttling and SSL protocol check
+
+- Added a per-thread, per-mutex counter in the kernel arbitration path. Only Thread 80's repeated nonblocking retries on one cell count; after 32 retries, the kernel releases `g_klock` before sleeping for 10 microseconds (`usleep(10)` on Linux). The counter resets when the cell changes, a stale owner is repaired, or the thread queues and blocks.
+- The current FFRS log does not show repeated mutex arbitration, so the guard follows the requested Section 2.15 rule but is not confirmed as the cause of that run's halt.
+- Kept `ssl:s` Command 5 as `SetInterfaceVersion` (one input `u32`, no output descriptors). The service protocol does not define network configuration output masks here; adding them would corrupt the IPC response. The existing handler records the version and the `ssl:s` name is registered.
+- Mirrored the kernel change and notes to flatpack. Rebuilt beta's `bin/runtime_linux_x11` successfully.
+
+The cumulative beta patch is `patches/milestone-030-main-to-beta.patch`.
+
+## Milestone 031 — Condition wait polling and dimension-matched presentation
+
+- The first 1 ms condition-wait change returned `0xEA01` to an infinite guest wait. FFRS then called `svcBreak` from `TimedWait`, so infinite waits now use a one-shot 1 ms rescue and return success (`0`) on expiry, as required by Section 2.16. The rescue path reacquires the guest mutex first. Explicit zero and finite guest timeouts retain `0xEA01` semantics.
+- Presentation still prefers an exact guest-address render-target match. When that lookup misses, it selects the most recently used render target whose width and height exactly match the requested presentation dimensions and logs the remap. SMW successfully presented through this fallback and reached 60 FPS, with no shader failures or missing targets in its GPU stats.
+- Mirrored both runtime source changes and this note to flatpack. Rebuilt beta's `bin/runtime_linux_x11` successfully. SMW later stopped producing frames while the main thread was waiting on an address; this trace does not isolate the cause. FFRS aborted in condition-variable `TimedWait` before recording any GPU frame activity; retest with the corrected infinite-wait semantics.
+
+## Milestone 032 — Restore the active GL program after uniform arena orphaning
+
+- The 32 MiB uniform ring now queries `GL_CURRENT_PROGRAM` immediately before its wrap-time NULL orphan. After the buffer rebind and indexed-range restoration, it restores the captured program handle. This follows the Section 2.16 pipeline-context preservation rule.
+- Mirrored the shared OpenGL change and this note to flatpack. Rebuilt beta's `bin/runtime_linux_x11`; FFRS still needs a fresh run to determine whether this addresses its window activation issue.
+
+## Milestone 033 — Thread 80 throttle for the SMW rendering mutex
+
+- The SMW trace repeatedly repairs the stale mutex at guest address `0x112f05d58`, while Thread 80 cycles through arbiter wait operations. Thread 80 now counts both failed arbitration retries and successful stale-owner repairs on this specific mutex. Every 16 passes it releases `g_klock` and sleeps for 50 microseconds through the platform sleep shim. The existing 32-retry/10-microsecond throttle remains for other addresses.
+- Confirmed the uniform arena already queries `GL_CURRENT_PROGRAM` before the NULL orphan and restores it after generic and indexed buffer rebinds (Milestone 032); no duplicate state change was needed.
+- Mirrored the kernel change and note to flatpack. Rebuilt beta's `bin/runtime_linux_x11`; a new SMW run is needed to assess the stall.
