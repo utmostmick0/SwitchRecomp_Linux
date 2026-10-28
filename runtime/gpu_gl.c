@@ -143,10 +143,17 @@ static GlFmt tic_format(u32 w0, int srgb){
    stored as half float, the transfers still convert from/to the game's snorm data */
 static int g_snorm_fb;
 
+/* Register writes can temporarily expose a partial framebuffer descriptor.
+   Only inspect its format or host texture state once its base address maps and
+   both dimensions are populated. */
+static int rt_descriptor_active(u64 gva, u32 w, u32 h){
+  return gva && w && h && gmmu_translate(gva)!=0;
+}
+
 /* Format 0x17 is observed while the guest is updating an RT register packet.
    Skip incomplete descriptors before they reach rt_format's warning path. */
 static int rt_format17_transient(u32 f, u64 gva, u32 w, u32 h){
-  return f==0x17 && (!w || !h || !gva || !gmmu_translate(gva));
+  return f==0x17 && !rt_descriptor_active(gva,w,h);
 }
 
 static GlFmt rt_format(u32 f){
@@ -1359,6 +1366,7 @@ static Tex* g_rt[8]; static Tex* g_zt; static int g_nrt;
 
 /* RT memory signature, if the cpu or DMA overwrote it something else lives there now */
 static Tex* rt_texture(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth){
+  if(!rt_descriptor_active(gva,w,h)) return NULL;
   if(rt_format17_transient(fmt,gva,w,h)) return NULL;
   GlFmt f= rt_format(fmt);
   u32 fkey=fmt|(depth? 0x10000 : 0);
@@ -1464,7 +1472,7 @@ static void bind_framebuffer(GpuChannel* ch){
     Tex* t=NULL; lay[i]=-2;
     if(i<count){ u32 idx=(ctl>>(4+i*3))&7; u32* rt=&r[0x200+idx*0x10]; u64 a=((u64)rt[0]<<32)|rt[1];
       { static int dbg=-1; if(dbg<0) dbg=getenv("SWR_RTDBG")!=0; if(dbg) LOG("rtdbg %d: %llx %ux%u fmt=%x tile=%x arr=%x stride=%x base=%x\n",i,(unsigned long long)a,rt[2],rt[3],rt[4],rt[5],rt[6],rt[7],rt[8]); }
-      if(a && rt[4] && rt[2] && rt[3]) t=rt_texture(a,rt[2],rt[3],rt[4],rt[5],0);
+      if(rt[4] && rt_descriptor_active(a,rt[2],rt[3])) t=rt_texture(a,rt[2],rt[3],rt[4],rt[5],0);
       u32 dep=rt[6]&0xFFFF; int is3d=(rt[5]>>16)&1;
       if(t && !t->f.depth && dep>1 && dep<=2048 && !getenv("SWR_NO_RTVOL")){ Tex* v=rt_vol(t,dep,is3d);
         if(v){ v->wgen++; v->last_used=g_frame;
@@ -1477,7 +1485,7 @@ static void bind_framebuffer(GpuChannel* ch){
   g_nrt=n;
   g_zt=NULL;
   if(r[0x54E]){ u64 za=((u64)r[0x3F8]<<32)|r[0x3F9]; u32 zw=r[0x48A], zh=r[0x48B];
-    if(za && zw && zh) g_zt=rt_texture(za,zw,zh,r[0x3FA],r[0x3FB],1); }
+    if(rt_descriptor_active(za,zw,zh)) g_zt=rt_texture(za,zw,zh,r[0x3FA],r[0x3FB],1); }
   if(anylay && g_zt){ g_zt=NULL; static int said; if(!said){ said=1; LOG("gpu: layered draw with depth: drawn without depth\n"); } }
   if(g_zt) g_zt->wgen++;
   { Tex* target=NULL;
@@ -2033,13 +2041,19 @@ static u32 sh_tex_handle(int stage, u32 tcb, const ShTex* st){
 
 static u64 g_fsk_tex_ns;
 static Sh* fs_get_keyed(GpuChannel* ch, u64 addr){
-  u32* r=ch->r3d; u32 ctl=r[0x487]; u32 count=ctl&15; if(count>8) count=8; u32 rm=0, rs=0;
+  u32* r=ch->r3d; u32 ctl=r[0x487]; u32 count=ctl&15; if(count>8) count=8; u32 rm=0, rs=0; int valid_fb=0;
   for(u32 i=0;i<count;i++){ u32 idx=(ctl>>(4+i*3))&7; u32* rt=&r[0x200+idx*0x10]; if(!rt[4]) continue;
     u64 gva=((u64)rt[0]<<32)|rt[1];
-    if(rt_format17_transient(rt[4],gva,rt[2],rt[3])) continue;
+    if(!rt_descriptor_active(gva,rt[2],rt[3])) continue;
+    valid_fb=1;
     GlFmt f=rt_format(rt[4]); if(f.is_int){ rm|=1u<<i; if(ifmt_signed(f.ifmt)) rs|=1u<<i; } }
+  if(r[0x54E]){ u64 za=((u64)r[0x3F8]<<32)|r[0x3F9]; if(rt_descriptor_active(za,r[0x48A],r[0x48B])) valid_fb=1; }
   g_fs_rtk=0; g_fs_rtm=0; g_fs_rts=0;
   Sh* s0=shader_get(addr,ST_FS,0,0); if(!s0) return s0;
+  /* Don't resolve sampler TICs against an intermediate draw packet with no
+     committed, addressable framebuffer descriptor. The draw flush path runs
+     after MME register emission, so complete descriptors are visible here. */
+  if(!valid_fb) return s0;
   u32 tm=0, ts=0; int nt=s0->si.ntex; if(nt>32) nt=32;
   if(nt){ u32 tcb=r[0x982]; u64 tic_base=((u64)r[0x55D]<<32)|r[0x55E]; u64 cba=g_cb.cb[4][tcb&31]; g_tic_base=tic_base; g_tic_lim=r[0x55F];
     for(int i=0;i<nt;i++){ ShTex* st=&s0->si.tex[i]; if(st->shadow) continue; u32 handle=sh_tex_handle(4,tcb,st); (void)cba;

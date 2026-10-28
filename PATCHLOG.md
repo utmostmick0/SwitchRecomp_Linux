@@ -292,6 +292,19 @@ The cumulative beta patch is `patches/milestone-021-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-022-main-to-beta.patch`.
 
+## Milestone 023 — Gate framebuffer lookups on active descriptors
+
+- Added a shared framebuffer descriptor check requiring nonzero width/height/address and a mapped guest base
+  before render-target format resolution, texture creation, framebuffer binding, or format-key derivation.
+- `fs_get_keyed` now skips incomplete color descriptors and only performs sampler/TIC state lookup when a
+  valid color or enabled depth target exists. This keeps intermediate register state out of format and active
+  texture resolution. The existing pending-draw flush runs after MME method emission, so the lookup sees the
+  final register state when the descriptor is complete.
+- Rebuilt `bin/runtime_linux_x11` successfully. A fresh FFRS run is still needed to determine whether this
+  addresses its black screen.
+
+The cumulative beta patch is `patches/milestone-023-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep
