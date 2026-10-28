@@ -6,14 +6,14 @@ QUE NECESITAS
   - Una distro con glibc 2.34 o mas nueva (Ubuntu 22.04+, Debian 12+, Fedora 35+, Arch, Mint 21+...).
   - Una GPU con OpenGL 4.5 (Mesa reciente, NVIDIA o AMD).
   - Para recompilar juegos: python3 y gcc.
-  - Para la interfaz: SDL2, SDL2_ttf y SDL2_image. Para elegir carpetas: zenity o kdialog.
+  - Para la interfaz: SDL3, SDL3_ttf y SDL3_image. Para elegir carpetas: zenity o kdialog.
 
   Ubuntu / Debian / Mint:
-    sudo apt install python3 gcc libsdl2-2.0-0 libsdl2-ttf-2.0-0 libsdl2-image-2.0-0 zenity
+    sudo apt install python3 gcc libsdl3-0 libsdl3-ttf0 libsdl3-image0 zenity
   Fedora:
-    sudo dnf install python3 gcc SDL2 SDL2_ttf SDL2_image zenity
+    sudo dnf install python3 gcc SDL3-devel SDL3_ttf-devel SDL3_image-devel zenity
   Arch:
-    sudo pacman -S python gcc sdl2 sdl2_ttf sdl2_image zenity
+    sudo pacman -S python gcc sdl3 sdl3_ttf sdl3_image zenity
 
 COMO SE USA
   1. Descomprime:  tar xzf SwitchRecomp_v190_linux.tar.gz
@@ -31,11 +31,13 @@ CON EL APPIMAGE (un solo archivo)
   porque la interfaz guarda los juegos, opciones y caches junto a si misma. Los juegos quedan en
   ~/.local/share/SwitchRecomp/games. Un AppImage nuevo se descomprime encima: cambia el programa, tus juegos y
   partidas se quedan. Para usar otra carpeta: SWITCHRECOMP_HOME=/otra/carpeta ./SwitchRecomp-v190-x86_64.AppImage
-  No necesita FUSE. Las dependencias de arriba (python3, gcc, SDL2...) siguen haciendo falta.
+  No necesita FUSE. Las dependencias de arriba (python3, gcc, SDL3...) siguen haciendo falta.
 
 LO MISMO QUE EN WINDOWS
   Cada juego tiene su <nombre>.ini (resolucion, modo dock, idioma, controles...).
-  Teclas: F1 ayuda, F3 captura, F4 limite de FPS, F5 traza, F8 captura a resolucion completa, F11 pantalla completa.
+  renderer=opengl usa salida OpenGL (predeterminada); renderer=vulkan intenta presentar por Vulkan en X11.
+  La salida Vulkan experimental copia cada fotograma por CPU y puede reducir los FPS. Detalles: VULKAN_OUTPUT.md.
+  Teclas: F1 ayuda, F3 captura, F4 limite de FPS, F5 traza (tambien crea un .zip sin compresion), F8 captura a resolucion completa, F11 pantalla completa.
   Actualizar un juego al runtime nuevo = copiar bin/runtime_linux_x11 encima de games/<nombre>
   (la interfaz lo hace sola en "Runtime"). Partidas, opciones y codigo del juego no se tocan.
 
@@ -46,18 +48,10 @@ LO QUE NO HAY EN LINUX (todavia)
 VIDEO WEBM
   Los videos VP9 se decodifican con libvpx incluido en el runtime; no hace falta instalar otro paquete.
 
-FLATPAK / STEAM DECK (BORRADOR)
-  Hay un manifiesto inicial en org.mzlabs.SwitchRecomp.yml. La interfaz guarda por defecto los juegos en
-  $XDG_DATA_HOME/SwitchRecomp/games (en Flatpak, dentro de ~/.var/app/org.mzlabs.SwitchRecomp/data),
-  y los ajustes en $XDG_CONFIG_HOME/SwitchRecomp. El directorio de instalacion se mantiene solo para lectura.
-  Para compilar el Flatpak: flatpak-builder --user --install --force-clean build-dir org.mzlabs.SwitchRecomp.yml
-  Este manifiesto es una base de empaquetado, no un Flatpak listo para publicar. Todavia hay que integrar
-  SDL2_image/SDL2_ttf, Python, gcc/clang y un selector de archivos compatible con el portal de Flatpak.
-
 SI LA INTERFAZ NO ABRE
-  Falta SDL2_ttf o SDL2_image: instala los paquetes de arriba. Para recompilarla desde el codigo:
-    sudo apt install libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev && sh SwitchRecomp/tool/src/build_tool_linux.sh
-  El runtime tambien se puede recompilar (necesita libx11-dev y libgl-dev):
+  Falta SDL3_ttf o SDL3_image: instala los paquetes de arriba. Para recompilarla desde el codigo:
+    sudo apt install libsdl3-dev libsdl3-ttf-dev libsdl3-image-dev && sh SwitchRecomp/tool/src/build_tool_linux.sh
+  El runtime tambien se puede recompilar (necesita libx11-dev, libgl-dev y libvulkan-dev):
     python3 SwitchRecomp/switchrecomp.py --build-runtime --target linux --backend x11 --cc gcc
 
 LICENCIA

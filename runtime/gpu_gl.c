@@ -5,6 +5,9 @@
    pushbuffers, we run them and signal the syncpoints. textures, buffers and shaders get translated once and cached */
 #include "gpu.h"
 #include "render_condition.h"
+#ifdef SWR_TRACE_ZIP
+#include "trace_zip.h"
+#endif
 #include <time.h>
 #include <math.h>
 #include "glfn.h"
@@ -2480,7 +2483,12 @@ static void trace_frame(void){
       if(ok){ char p[256]; snprintf(p,sizeof p,"%s/tex%03d_%llx_%ux%u_f%x%s.ppm",g_tr_dir,i,(unsigned long long)t->gva,t->w,t->h,t->fkey,t->is_rt?"_rt":""); tr_save(p,o,ow,oh); }
       free(o); }
     fclose(g_tr); g_tr=NULL; g_tr_on=0; if(g_tr_cbf){ fclose(g_tr_cbf); g_tr_cbf=NULL; }
-    LOG("trace: frame saved in %s (%d draws, %d images)\n",g_tr_dir,g_tr_n,g_tr_img); fflush(NULL); }
+    LOG("trace: frame saved in %s (%d draws, %d images)\n",g_tr_dir,g_tr_n,g_tr_img);
+#ifdef SWR_TRACE_ZIP
+    { char archive[256]; if(trace_zip_create(g_tr_dir,archive,sizeof archive)) LOG("trace: archive saved in %s\n",archive);
+      else LOG("trace: could not create ZIP archive for %s\n",g_tr_dir); }
+#endif
+    fflush(NULL); }
   { static int envf=-2; if(envf==-2){ const char* e=getenv("SWR_TRACE"); envf= e? atoi(e) : -1; } if(envf>=0 && (int)g_frame==envf) g_tr_arm=1; }
   if(g_tr_arm){ g_tr_arm=0; plat_mkdir("captures"); plat_mkdir("captures/traces");
     char game[96]; trace_game_component(game,sizeof game);

@@ -20,6 +20,11 @@ static volatile int g_ww=1280, g_wh=720; static int g_fullscreen=0, g_want_fs=1;
 static int g_seconds=0, g_maxframes=-1; static char g_shot[1024]; static u64 g_start; static u64 g_press=0, g_press_at=0, g_press_len=300;
 static char g_script[1024]; static char g_title[256]; static volatile int g_shot_req;
 static u64 keys_held;
+static int g_want_vk;
+int swr_vk_output_x11_init(void* display, u64 window);
+int swr_vk_output_x11_active(void);
+int swr_vk_output_x11_present(void);
+void swr_vk_output_x11_shutdown(void);
 extern int g_opt_fps;
 
 void backend_ini(const char* k, const char* v){
@@ -30,6 +35,7 @@ void backend_ini(const char* k, const char* v){
   else if(!strcmp(k,"press")) g_press=strtoull(v,NULL,16);
   else if(!strcmp(k,"press_at")) g_press_at=strtoull(v,NULL,10);
   else if(!strcmp(k,"press_len")) g_press_len=strtoull(v,NULL,10);
+  else if(!strcmp(k,"renderer")){ g_want_vk=!strcmp(v,"vulkan"); if(strcmp(v,"vulkan") && strcmp(v,"opengl")) LOG("renderer: unknown value '%s'; using OpenGL\n",v); }
   else if(!strcmp(k,"script")) strncpy(g_script,v,1023);
 }
 
@@ -151,6 +157,7 @@ int backend_gl_create(void){
   XSetErrorHandler(old);
   if(!ctx){ fatal("Your graphics driver does not support OpenGL 4.3.\nPlease update Mesa or your GPU driver."); return 0; }
   glXMakeCurrent(dpy,win,ctx);
+  if(g_want_vk) swr_vk_output_x11_init(dpy,(u64)win);
   extern int g_opt_vsync;
   typedef void (*SIE)(Display*,GLXDrawable,int); typedef int (*SIM)(unsigned);
   SIE sie=(SIE)glXGetProcAddressARB((const GLubyte*)"glXSwapIntervalEXT"); SIM sim=(SIM)glXGetProcAddressARB((const GLubyte*)"glXSwapIntervalMESA");
@@ -159,7 +166,14 @@ int backend_gl_create(void){
 
 void* backend_gl_proc(const char* n){ return (void*)glXGetProcAddressARB((const GLubyte*)n); }
 
-void backend_gl_swap(void){ glXSwapBuffers(dpy,win); }
+void backend_gl_swap(void){
+  if(swr_vk_output_x11_active()){
+    if(swr_vk_output_x11_present()) return;
+    WARN("vulkan output: presentation failed; restoring OpenGL output\n");
+    swr_vk_output_x11_shutdown();
+  }
+  glXSwapBuffers(dpy,win);
+}
 
 /* each compile thread takes the next shared context */
 int backend_gl_worker_current(void){

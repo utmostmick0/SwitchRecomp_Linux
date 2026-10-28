@@ -24,6 +24,7 @@ modules:
       - install -Dm644 tools_sym.py /app/share/switchrecomp/tools_sym.py
       - install -Dm644 LICENSE.txt /app/share/licenses/switchrecomp/LICENSE.txt
       - install -Dm644 NOTICE.txt /app/share/licenses/switchrecomp/NOTICE.txt
+      - install -Dm644 VULKAN_OUTPUT.md /app/share/doc/switchrecomp/VULKAN_OUTPUT.md
       - cp -a tool bin runtime /app/share/switchrecomp/
       - install -Dm644 org.mzlabs.SwitchRecomp.desktop /app/share/applications/org.mzlabs.SwitchRecomp.desktop
       - install -Dm644 org.mzlabs.SwitchRecomp.metainfo.xml /app/share/metainfo/org.mzlabs.SwitchRecomp.metainfo.xml
