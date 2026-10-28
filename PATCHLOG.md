@@ -348,3 +348,11 @@ The cumulative beta patch is `patches/milestone-025-main-to-beta.patch`.
 - Rebuilt beta's `bin/runtime_linux_x11` successfully. No in-game performance result is available yet.
 
 The cumulative beta patch is `patches/milestone-026-main-to-beta.patch`.
+
+## Milestone 027 — Concurrent positional reads for RomFS archives
+
+- FFRS's log shows the 5.8 GB `.ucas` archive is opened through RomFS. At the captured thread snapshots, workers 86–90 are waiting on guest condition variables rather than reported as blocked on a host mutex, so that trace does not confirm a file-lock deadlock.
+- `romfs_read` previously held one global mutex across range lookup and the complete file read. The open-file LRU now protects only descriptor metadata and open/close operations. It pins descriptors with a reference count, performs positional `plat_pread` calls outside the lock, and uses a temporary descriptor rather than waiting if all cached descriptors are active. Raw `romfs.bin` reads also use positional reads without the global lock.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. The source removes host-side serialization for independent archive reads, but a fresh FFRS load is needed to confirm whether it addresses the freeze.
+
+The cumulative beta patch is `patches/milestone-027-main-to-beta.patch`.
