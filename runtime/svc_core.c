@@ -967,9 +967,22 @@ static int bsd_disp(SvcObj* o, IpcCtx* c){ (void)o;
 
 static SvcObj* new_bsd(void){ return svcobj_new("bsd",bsd_disp,0); }
 
-static int ssl_disp(SvcObj* o, IpcCtx* c){ if(c->cmd==0){ out_obj(c,quiet("ISslContext")); return 0; } return quiet_ok(o,c); }
+typedef struct { u32 interface_version; } SslServiceData;
+static int ssl_disp(SvcObj* o, IpcCtx* c){
+  SslServiceData* d=o->data;
+  switch(c->cmd){
+    case 0: out_obj(c,quiet("ISslContext")); return 0; /* CreateContext */
+    case 1: out32(c,0); return 0;                       /* GetContextCount */
+    case 5: {                                           /* SetInterfaceVersion: u32 in, no output */
+      u32 version=in32(c,0); if(d) d->interface_version=version;
+      static int said; if(!said++){ LOG("ssl: SetInterfaceVersion(%u)\n",version); }
+      return 0;
+    }
+  }
+  return quiet_ok(o,c);
+}
 
-static SvcObj* new_ssl(void){ return svcobj_new("ssl",ssl_disp,0); }
+static SvcObj* new_ssl(void){ return svcobj_new("ssl",ssl_disp,sizeof(SslServiceData)); }
 
 static int prepo_disp(SvcObj* o, IpcCtx* c){ (void)o; (void)c; return 0; }
 
@@ -1173,7 +1186,7 @@ void svc_core_init(void){
   svc_register("friend:u",new_friend); svc_register("friend:a",new_friend); svc_register("friend:v",new_friend);
   svc_register("ns:am2",new_ns); svc_register("ns:ec",new_ns); svc_register("ns:rid",new_ns); svc_register("ns:rt",new_ns); svc_register("ns:web",new_ns); svc_register("ns:ro",new_ns);
   svc_register("audren:u",new_audren); svc_register("audout:u",new_audout); svc_register("audin:u",new_audout); svc_register("hwopus",new_hwopus);
-  svc_register("bsd:u",new_bsd); svc_register("bsd:s",new_bsd); svc_register("ssl",new_ssl);
+  svc_register("bsd:u",new_bsd); svc_register("bsd:s",new_bsd); svc_register("ssl",new_ssl); svc_register("ssl:s",new_ssl);
   svc_register("prepo:u",new_prepo); svc_register("prepo:a",new_prepo); svc_register("prepo:a2",new_prepo); svc_register("psm",new_psm);
   svc_register("fatal:u",new_fatal); svc_register("csrng",new_csrng); svc_register("mm:u",new_mm);
   svc_register("nfp:user",new_nfp); svc_register("nfc:user",new_nfp); svc_register("caps:u",new_caps); svc_register("caps:a",new_caps); svc_register("caps:su",new_caps); svc_register("caps:ss",new_caps);

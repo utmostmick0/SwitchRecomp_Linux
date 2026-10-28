@@ -356,3 +356,51 @@ The cumulative beta patch is `patches/milestone-026-main-to-beta.patch`.
 - Rebuilt beta's `bin/runtime_linux_x11` successfully. The source removes host-side serialization for independent archive reads, but a fresh FFRS load is needed to confirm whether it addresses the freeze.
 
 The cumulative beta patch is `patches/milestone-027-main-to-beta.patch`.
+
+## Milestone 028 — Maxwell compact vertex attribute layout
+
+- Audited the Maxwell vertex attribute size/type decoding in `runtime/gpu_gl.c`. Normalized SNorm/UNorm values already use `glVertexAttribPointer` with normalization enabled; ordinary SInt/UInt attributes use `glVertexAttribIPointer`.
+- Fixed missing component counts for Maxwell sizes `0x32` (G8_R8), `0x33` (X8_B8_G8_R8), and `0x34` (A8). They previously fell through to four components, so short records could overlap adjacent vertex data.
+- Added a byte-width table for every known Maxwell attribute size. With guest stride zero, the GL pointer continues to use GL's tightly packed default, while the buffer cache's delta scanner now uses the true element width. This fixes the prior 1-byte cache stride for packed `0x30` and `0x31` records.
+- Corrected the signed packed `0x30` host type selection for SNorm, SInt, and SScaled.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. Visual verification still needs a game run using compact vertex formats.
+
+The cumulative beta patch is `patches/milestone-028-main-to-beta.patch`.
+
+## Milestone 029 — SSL service alias and interface version
+
+- The latest FFRS log requests `nifm:u` and `bsd:s`, but contains no `ssl:s` service request or SSL command. It also records zero GPU submits and frames, so the log does not establish SSL Command 5 as the cause of the rendering halt.
+- Added the missing `ssl:s` service registration. On Switch, `ssl:s` Command 5 is `SetInterfaceVersion`: one input `u32`, no output storage or output descriptors. The handler stores the version and logs the first call; it does not fabricate certificate IDs or IPC buffers. Command 1 now reports zero active contexts.
+- Mirrored the runtime source and documentation to flatpack and rebuilt beta's `bin/runtime_linux_x11` successfully. A new FFRS log is needed to determine whether it reaches this handler and whether SSL setup is involved in the halt.
+
+The cumulative beta patch is `patches/milestone-029-main-to-beta.patch`.
+
+## Milestone 030 — Thread 80 mutex retry throttling and SSL protocol check
+
+- Added a per-thread, per-mutex counter in the kernel arbitration path. Only Thread 80's repeated nonblocking retries on one cell count; after 32 retries, the kernel releases `g_klock` before sleeping for 10 microseconds (`usleep(10)` on Linux). The counter resets when the cell changes, a stale owner is repaired, or the thread queues and blocks.
+- The current FFRS log does not show repeated mutex arbitration, so the guard follows the requested Section 2.15 rule but is not confirmed as the cause of that run's halt.
+- Kept `ssl:s` Command 5 as `SetInterfaceVersion` (one input `u32`, no output descriptors). The service protocol does not define network configuration output masks here; adding them would corrupt the IPC response. The existing handler records the version and the `ssl:s` name is registered.
+- Mirrored the kernel change and notes to flatpack. Rebuilt beta's `bin/runtime_linux_x11` successfully.
+
+The cumulative beta patch is `patches/milestone-030-main-to-beta.patch`.
+
+## Milestone 031 — Condition wait polling and dimension-matched presentation
+
+- The first 1 ms condition-wait change returned `0xEA01` to an infinite guest wait. FFRS then called `svcBreak` from `TimedWait`, so infinite waits now use a one-shot 1 ms rescue and return success (`0`) on expiry, as required by Section 2.16. The rescue path reacquires the guest mutex first. Explicit zero and finite guest timeouts retain `0xEA01` semantics.
+- Presentation still prefers an exact guest-address render-target match. When that lookup misses, it selects the most recently used render target whose width and height exactly match the requested presentation dimensions and logs the remap. SMW successfully presented through this fallback and reached 60 FPS, with no shader failures or missing targets in its GPU stats.
+- Mirrored both runtime source changes and this note to flatpack. Rebuilt beta's `bin/runtime_linux_x11` successfully. SMW later stopped producing frames while the main thread was waiting on an address; this trace does not isolate the cause. FFRS aborted in condition-variable `TimedWait` before recording any GPU frame activity; retest with the corrected infinite-wait semantics.
+
+## Milestone 032 — Restore the active GL program after uniform arena orphaning
+
+- The 32 MiB uniform ring now queries `GL_CURRENT_PROGRAM` immediately before its wrap-time NULL orphan. After the buffer rebind and indexed-range restoration, it restores the captured program handle. This follows the Section 2.16 pipeline-context preservation rule.
+- Mirrored the shared OpenGL change and this note to flatpack. Rebuilt beta's `bin/runtime_linux_x11`; FFRS still needs a fresh run to determine whether this addresses its window activation issue.
+
+The cumulative beta patch is `patches/milestone-032-main-to-beta.patch`.
+
+## Milestone 033 — Thread 80 throttle for the SMW rendering mutex
+
+- The SMW trace repeatedly repairs the stale mutex at guest address `0x112f05d58`, while Thread 80 cycles through arbiter wait operations. Thread 80 now counts both failed arbitration retries and successful stale-owner repairs on this specific mutex. Every 16 passes it releases `g_klock` and sleeps for 50 microseconds through the platform sleep shim. The existing 32-retry/10-microsecond throttle remains for other addresses.
+- Confirmed the uniform arena already queries `GL_CURRENT_PROGRAM` before the NULL orphan and restores it after generic and indexed buffer rebinds (Milestone 032); no duplicate state change was needed.
+- Mirrored the kernel change and note to flatpack. Rebuilt beta's `bin/runtime_linux_x11`; a new SMW run is needed to assess the stall.
+
+The cumulative beta patch is `patches/milestone-033-main-to-beta.patch`.

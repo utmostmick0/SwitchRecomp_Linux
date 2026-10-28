@@ -208,16 +208,45 @@ static int owner_is_stale_nl(u32 tagv, u64 addr){
 static void heal_note(const char* what, u64 addr, u32 v){
   if(g_heal_n++<20 || !(g_heal_n&1023)) WARN("kernel: mutex %llx repaired (%s, value %x) [%d times]\n",(unsigned long long)addr,what,v,g_heal_n); }
 
+static int mutex_retry_brake_due(KThread* t, u64 addr){
+  if(!t || t->id!=80) return 0;
+  if(t->mutex_retry_addr!=addr){ t->mutex_retry_addr=addr; t->mutex_retry_spins=0; }
+  u32 limit=addr==0x112f05d58ull?16:32;
+  if(++t->mutex_retry_spins<=limit) return 0;
+  t->mutex_retry_spins=0;
+  return 1;
+}
+
+static void mutex_retry_brake(u64 addr){
+  static int said;
+  if(addr==0x112f05d58ull){
+    static int nested_said;
+    if(!__atomic_exchange_n(&nested_said,1,__ATOMIC_RELAXED)) LOG("kernel: throttled thread 80 after 16 nested mutex retries at %llx\n",(unsigned long long)addr);
+    plat_sleep_ns(50000);
+    return;
+  }
+  if(!__atomic_exchange_n(&said,1,__ATOMIC_RELAXED)) LOG("kernel: throttled thread 80 after 32 repeated mutex retries at %llx\n",(unsigned long long)addr);
+#if defined(_WIN32)
+  plat_sleep_ns(10000);
+#else
+  usleep(10);
+#endif
+}
+
 static u32 svc_arbitrate_lock(KThread* t, u32 owner, u64 addr, u32 tag){
   if(addr&3) return R_BADADDR;
   pm_lock(&g_klock);
   u32 v=__atomic_load_n(U32(addr),__ATOMIC_SEQ_CST);
-  if(v!=(owner|HANDLE_WAIT)){ pm_unlock(&g_klock); return 0; }
+  if(v!=(owner|HANDLE_WAIT)){ int brake=mutex_retry_brake_due(t,addr); pm_unlock(&g_klock); if(brake) mutex_retry_brake(addr); return 0; }
   if(owner_is_stale_nl(v,addr)){
     /* already released: hand it to us, keep the waiters bit if anyone else is queued */
     u32 nv=tag|(wl_count(2,addr)? HANDLE_WAIT : 0);
-    if(__atomic_compare_exchange_n(U32(addr),&v,nv,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)) heal_note("on request",addr,v);
-    pm_unlock(&g_klock); return 0; }   /* caller rereads the word and retries */
+    int repaired=__atomic_compare_exchange_n(U32(addr),&v,nv,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST);
+    int brake=0;
+    if(repaired){ heal_note("on request",addr,v); brake=mutex_retry_brake_due(t,addr); }
+    if(t && addr!=0x112f05d58ull){ t->mutex_retry_addr=0; t->mutex_retry_spins=0; }
+    pm_unlock(&g_klock); if(brake) mutex_retry_brake(addr); return 0; }   /* caller rereads the word and retries */
+  t->mutex_retry_addr=0; t->mutex_retry_spins=0;
   t->wait_kind=2; t->wait_addr=addr; t->wait_tag=tag; t->woken=0; wl_add(t);
   sleep_nl(t,-1);
   u32 r=t->wait_result; pm_unlock(&g_klock); return r; }
@@ -226,17 +255,61 @@ static u32 svc_arbitrate_unlock(u64 addr){
   if(addr&3) return R_BADADDR;
   pm_lock(&g_klock); unlock_nl(addr); pm_unlock(&g_klock); return 0; }
 
+/* WaitProcessWideKeyAtomic reacquires the guest mutex before returning,
+   including when the bounded condition wait expires. Called with g_klock. */
+static void cv_reacquire_nl(KThread* t, u64 addr, u32 tag){
+  for(;;){
+    u32 v=__atomic_load_n(U32(addr),__ATOMIC_SEQ_CST);
+    if(v==0){
+      u32 z=0;
+      if(__atomic_compare_exchange_n(U32(addr),&z,tag,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)){
+        t->wait_kind=0; return;
+      }
+      continue;
+    }
+    if(__atomic_compare_exchange_n(U32(addr),&v,v|HANDLE_WAIT,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST)){
+      t->wait_kind=2; t->wait_addr=addr; t->wait_tag=tag; t->woken=0; wl_add(t);
+      sleep_nl(t,-1);
+      return;
+    }
+  }
+}
+
 static u32 svc_wait_cv(KThread* t, u64 maddr, u64 key, u32 tag, i64 timeout){
   pm_lock(&g_klock);
   unlock_nl(maddr);
-  if(timeout==0){ pm_unlock(&g_klock); return R_TIMEOUT; }
-  t->wait_kind=3; t->wait_key=key; t->wait_addr=maddr; t->wait_tag=tag; t->woken=0; wl_add(t);
-  __atomic_store_n(U32(key),1,__ATOMIC_SEQ_CST);
-  int ok=sleep_nl(t,timeout);
-  u32 r;
-  if(!ok){ if(wl_has(t)){ wl_del(t); } t->wait_kind=0; r=R_TIMEOUT;
-    if(!wl_count(3,key)) __atomic_store_n(U32(key),0,__ATOMIC_SEQ_CST); }
-  else r=t->wait_result;
+  int timed_out=timeout==0;
+  int rescue_expired=0;
+  if(!timed_out){
+    /* Poll once at 1 ms for infinite setup waits; report a spurious success to the SDK. */
+    u64 deadline=timeout>0?plat_ns()+(u64)timeout:0;
+    t->wait_kind=3; t->wait_key=key; t->wait_addr=maddr; t->wait_tag=tag; t->woken=0; wl_add(t);
+    __atomic_store_n(U32(key),1,__ATOMIC_SEQ_CST);
+    for(;;){
+      i64 slice;
+      if(timeout<0) slice=1000000;
+      else { u64 now=plat_ns(); if(now>=deadline){ slice=0; } else slice=(i64)(deadline-now); }
+      int ok=slice>0 && sleep_nl(t,slice);
+      if(ok) break;
+      if(t->wait_kind==3 && wl_has(t)){
+        wl_del(t); t->wait_kind=0;
+        if(timeout<0) rescue_expired=1;
+        else timed_out=1;
+        if(!wl_count(3,key)) __atomic_store_n(U32(key),0,__ATOMIC_SEQ_CST);
+        break;
+      }
+      if(t->wait_kind==2 && wl_has(t)){
+        /* The condition was signaled; its deadline no longer limits mutex reacquisition. */
+        sleep_nl(t,-1);
+      }
+      break;
+    }
+  }
+  if(timed_out || rescue_expired){
+    if(!wl_count(3,key)) __atomic_store_n(U32(key),0,__ATOMIC_SEQ_CST);
+    cv_reacquire_nl(t,maddr,tag);
+  }
+  u32 r=timed_out?R_TIMEOUT:rescue_expired?0:t->wait_result;
   pm_unlock(&g_klock); return r; }
 
 static u32 svc_signal_cv(u64 key, i32 count){

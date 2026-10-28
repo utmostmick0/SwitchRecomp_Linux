@@ -1811,9 +1811,15 @@ static void apply_state(GpuChannel* ch){
 
 /* ============================================================ drawing */
 static u32 attr_count(u32 size){ switch(size){ case 0x01: return 4; case 0x02: return 3; case 0x03: return 4; case 0x04: return 2; case 0x05: return 3; case 0x0A: return 4; case 0x0F: return 2;
-  case 0x12: return 1; case 0x13: return 3; case 0x18: return 2; case 0x1B: return 1; case 0x1D: return 1; case 0x30: return 4; case 0x31: return 3; } return 4; }
+  case 0x12: return 1; case 0x13: return 3; case 0x18: case 0x32: return 2; case 0x1B: case 0x1D: case 0x34: return 1; case 0x30: case 0x33: return 4; case 0x31: return 3; } return 4; }
 
 static u32 attr_bits(u32 size){ switch(size){ case 0x01: case 0x02: case 0x04: case 0x12: return 32; case 0x03: case 0x05: case 0x0F: case 0x1B: return 16; case 0x30: case 0x31: return 0; } return 8; }
+/* Maxwell Size includes packed records with no single per-component width. */
+static u32 attr_bytes(u32 size){ switch(size){
+  case 0x01: return 16; case 0x02: return 12; case 0x03: case 0x04: return 8; case 0x05: return 6;
+  case 0x0A: case 0x12: case 0x30: case 0x31: case 0x33: return 4;
+  case 0x0F: return 4; case 0x13: return 3; case 0x18: case 0x32: case 0x1B: return 2;
+  case 0x1D: case 0x34: return 1; default: return 4; } }
 
 static GLenum topo(u32 t){ switch(t){ case 0: return GL_POINTS; case 1: return GL_LINES; case 2: return GL_LINE_LOOP; case 3: return GL_LINE_STRIP; case 4: return GL_TRIANGLES; case 5: return GL_TRIANGLE_STRIP;
   case 6: return GL_TRIANGLE_FAN; case 10: return GL_LINES_ADJACENCY; case 11: return GL_LINE_STRIP_ADJACENCY; case 12: return GL_TRIANGLES_ADJACENCY; case 13: return GL_TRIANGLE_STRIP_ADJACENCY; case 14: return GL_PATCHES; } return GL_TRIANGLES; }
@@ -1920,9 +1926,12 @@ static u32 ur_alloc(u32 sz){
   u32 off=g_ur_head;
   if(off+need>g_ur_size){
     g_ur_abs+=g_ur_size-off; off=0; g_ur_head=0; g_ur_store++; st_ur_wrap++;
+    GLint active_program=0;
+    glGetIntegerv(GL_CURRENT_PROGRAM,&active_program);
     glBindBuffer(GL_UNIFORM_BUFFER,g_ur);
     glBufferData(GL_UNIFORM_BUFFER,(GLsizeiptr)g_ur_size+65536,NULL,GL_STREAM_DRAW);
     ur_rebind_after_orphan();
+    glUseProgram((GLuint)active_program);
   }
   g_ur_head=off+need; g_ur_abs+=need; return off; }
 
@@ -2718,10 +2727,11 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
     u64 len= lim>=start? lim-start+1 : 0; if(len>64u<<20) len=64u<<20;
     if(!len) { VA_OFF(i); continue; }
     u32 cnt=attr_count(size), bits=attr_bits(size);
-    u32 vstride=stride? stride : (cnt*bits+7)/8; if(!vstride) vstride=1;
+    /* GL stride 0 means tightly packed. The cache still needs the real record width. */
+    u32 vstride=stride? stride : attr_bytes(size);
     GLuint vbid=buf_cached(GL_ARRAY_BUFFER,start,len,vstride);
     GLenum gt; GLboolean norm= ty==1||ty==2;
-    if(size==0x30) gt= ty==1? GL_INT_2_10_10_10_REV : GL_UNSIGNED_INT_2_10_10_10_REV;
+    if(size==0x30) gt= (ty==1||ty==3||ty==6)? GL_INT_2_10_10_10_REV : GL_UNSIGNED_INT_2_10_10_10_REV;
     else if(size==0x31) gt=GL_UNSIGNED_INT_10F_11F_11F_REV;
     else if(ty==7) gt= bits==32? GL_FLOAT : GL_HALF_FLOAT;
     else if(ty==1||ty==3||ty==6) gt= bits==32? GL_INT : bits==16? GL_SHORT : GL_BYTE;
@@ -3189,7 +3199,17 @@ static int present_addr(u64 cpu_addr, int w, int h){
   for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && gmmu_translate(t->gva)==cpu_addr){
     int exact=t->w==(u32)w && t->h==(u32)h;
     if(!best || (exact && !best_exact) || (exact==best_exact && t->last_used>best->last_used)){ best=t; best_exact=exact; } }
-  trace_note("PRESENT %llx %dx%d -> %s %llx tex=%u %ux%u exact=%d\n",(unsigned long long)cpu_addr,w,h,best?"rt":"(none, CPU)",(unsigned long long)(best?best->gva:0),best?best->id:0,best?best->w:0,best?best->h:0,best_exact);
+  int dimension_fallback=0;
+  if(!best && w>0 && h>0){
+    /* Presentation descriptors can use an address alias that differs from the
+       render-target cache key. Reuse the most recently used exact-layout RT. */
+    for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && t->w==(u32)w && t->h==(u32)h){
+      if(!best || t->last_used>best->last_used) best=t;
+    }
+    dimension_fallback=best!=NULL;
+  }
+  trace_note("PRESENT %llx %dx%d -> %s %llx tex=%u %ux%u exact=%d dimension_fallback=%d\n",(unsigned long long)cpu_addr,w,h,best?"rt":"(none, CPU)",(unsigned long long)(best?best->gva:0),best?best->id:0,best?best->w:0,best?best->h:0,best_exact,dimension_fallback);
+  if(dimension_fallback){ static int said; if(said<4){ said++; LOG("gpu: presentation address %llx did not match a render target; remapping to latest %ux%u target gva=%llx tex=%u\n",(unsigned long long)cpu_addr,(u32)w,(u32)h,(unsigned long long)best->gva,best->id); } }
   if(best){ best->last_used=g_frame; g_blit_rt=1; blit_to_screen(best->id,1,(int)best->w,(int)best->h); g_blit_rt=0; g_last_is_rt=1; st_pres_rt++; return 1; }
   st_pres_cpu++;
   static int said; if(said<3){ said++;
