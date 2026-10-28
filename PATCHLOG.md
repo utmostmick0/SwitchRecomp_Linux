@@ -250,6 +250,21 @@ The cumulative beta patch is `patches/milestone-018-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-019-main-to-beta.patch`.
 
+## Milestone 020 — Orphaned uniform upload arena
+
+- Replaced the persistent-mapped constant-buffer ring and its synchronous segment-fence waits with a mutable
+  32 MiB uniform upload arena. Uploads use `glBufferSubData`; when the arena reaches its end, the runtime
+  orphans its storage with `glBufferData(..., NULL, ...)`, letting queued draws retain the old backing store
+  while subsequent uploads use fresh storage.
+- Cache entries now include the arena store generation so a wrapped/orphaned allocation can never reuse a
+  constant-buffer offset from the prior backing store. The runtime profile reports arena orphan counts in
+  place of the removed ring-wait count.
+- Rebuilt `bin/runtime_linux_x11` successfully with the Linux X11 backend. Game performance and rendering
+  correctness need validation in a fresh game run; replacing persistent mapping with `glBufferSubData` may
+  change upload throughput on some drivers.
+
+The cumulative beta patch is `patches/milestone-020-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

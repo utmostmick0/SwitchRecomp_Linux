@@ -1852,12 +1852,11 @@ static void bind_gbufs(int stage, Sh* s){
       glBindBuffer(GL_SHADER_STORAGE_BUFFER,g_gwmb[slot]); glBufferData(GL_SHADER_STORAGE_BUFFER,nw*4,wm,GL_DYNAMIC_COPY);
       glBindBufferBase(GL_SHADER_STORAGE_BUFFER,slot*8+s->si.ngbuf,g_gwmb[slot]); } } }
 
-/* persistent ring for cbufs (GL 4.4 buffer_storage): memcpy + glBindBufferRange, no 64K realloc on every update.
-   fences per segment so we never overwrite something the gpu is still reading */
-#define UR_SEGS 4
-static GLuint g_ur; static u8* g_ur_ptr; static u32 g_ur_size, g_ur_head, g_ur_align=256; static u64 g_ur_abs; static GLsync g_ur_f[UR_SEGS];
+/* Mutable uniform arena: orphan the store at wrap so queued draws keep the old
+   backing allocation while new uploads go into fresh storage. */
+static GLuint g_ur; static u32 g_ur_size, g_ur_head, g_ur_align=256; static u64 g_ur_abs, g_ur_store;
+static u8* g_ur_scratch; static u64 st_ur_wrap; static u32 g_ub_bound[64];
 static PFNGLFENCESYNCPROC p_fs; static PFNGLCLIENTWAITSYNCPROC p_cws; static PFNGLDELETESYNCPROC p_ds;
-static u64 st_ur_wait; static u32 g_ub_bound[64];
 static u32 g_sb_bound[64];
 
 static int cb_ssbo_binding(int stage, Sh* s, int cb){
@@ -1867,33 +1866,28 @@ static int cb_ssbo_binding(int stage, Sh* s, int cb){
 }
 
 static void ur_init(void){
-  if(getenv("SWR_NO_UBO_RING")) return;
-  PFNGLBUFFERSTORAGEPROC bs=(PFNGLBUFFERSTORAGEPROC)backend_gl_proc("glBufferStorage"); PFNGLMAPBUFFERRANGEPROC mbr=(PFNGLMAPBUFFERRANGEPROC)backend_gl_proc("glMapBufferRange");
   p_fs=(PFNGLFENCESYNCPROC)backend_gl_proc("glFenceSync"); p_cws=(PFNGLCLIENTWAITSYNCPROC)backend_gl_proc("glClientWaitSync"); p_ds=(PFNGLDELETESYNCPROC)backend_gl_proc("glDeleteSync");
-  if(!bs || !mbr || !p_fs || !p_cws || !p_ds) return;
+  if(getenv("SWR_NO_UBO_RING")) return;
   GLint al=256; glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT,&al); if(al<16) al=16; g_ur_align=(u32)al;
   g_ur_size=32u<<20;
+  g_ur_scratch=malloc(131072); if(!g_ur_scratch) return;
   GLuint b=0; glGenBuffers(1,&b); glBindBuffer(GL_UNIFORM_BUFFER,b);
-  GLbitfield fl=GL_MAP_WRITE_BIT|GL_MAP_PERSISTENT_BIT|GL_MAP_COHERENT_BIT;
-  bs(GL_UNIFORM_BUFFER,(GLsizeiptr)g_ur_size+65536,NULL,fl);
-  u8* ptr= glGetError()==GL_NO_ERROR? (u8*)mbr(GL_UNIFORM_BUFFER,0,(GLsizeiptr)g_ur_size+65536,fl) : NULL;
-  while(glGetError()!=GL_NO_ERROR){}
-  if(!ptr) return;
-  g_ur=b; g_ur_ptr=ptr; }
+  glBufferData(GL_UNIFORM_BUFFER,(GLsizeiptr)g_ur_size+65536,NULL,GL_STREAM_DRAW);
+  if(glGetError()!=GL_NO_ERROR){ glDeleteBuffers(1,&b); free(g_ur_scratch); g_ur_scratch=NULL; return; }
+  g_ur=b; }
 
 static u32 ur_alloc(u32 sz){
-  u32 need=(sz+g_ur_align-1)/g_ur_align*g_ur_align, seg=g_ur_size/UR_SEGS;
-  u32 off=g_ur_head; if(off+need>g_ur_size){ g_ur_abs+=g_ur_size-off; off=0; }
-  u32 cs=g_ur_head/seg; if(cs>=UR_SEGS) cs=UR_SEGS-1;
-  u32 es=(off+need-1)/seg; if(es>=UR_SEGS) es=UR_SEGS-1;
-  while(cs!=es){ if(g_ur_f[cs]) p_ds(g_ur_f[cs]); g_ur_f[cs]=p_fs(GL_SYNC_GPU_COMMANDS_COMPLETE,0);
-    cs=(cs+1)%UR_SEGS;
-    if(g_ur_f[cs]){ GLenum rr=p_cws(g_ur_f[cs],GL_SYNC_FLUSH_COMMANDS_BIT,0);
-      if(rr==GL_TIMEOUT_EXPIRED){ st_ur_wait++; p_cws(g_ur_f[cs],GL_SYNC_FLUSH_COMMANDS_BIT,2000000000ull); }
-      p_ds(g_ur_f[cs]); g_ur_f[cs]=0; } }
+  u32 need=(sz+g_ur_align-1)/g_ur_align*g_ur_align;
+  if(need>g_ur_size) return 0;
+  u32 off=g_ur_head;
+  if(off+need>g_ur_size){
+    g_ur_abs+=g_ur_size-off; off=0; g_ur_head=0; g_ur_store++; st_ur_wrap++;
+    glBindBuffer(GL_UNIFORM_BUFFER,g_ur);
+    glBufferData(GL_UNIFORM_BUFFER,(GLsizeiptr)g_ur_size+65536,NULL,GL_STREAM_DRAW);
+  }
   g_ur_head=off+need; g_ur_abs+=need; return off; }
 
-typedef struct { u64 a, gen, abs; u32 sz, valid, epoch, off; } UrC;
+typedef struct { u64 a, gen, abs, store; u32 sz, valid, epoch, off; } UrC;
 
 static UrC urc[4096];
 
@@ -1908,18 +1902,21 @@ static void upload_cbufs_ring(int stage, Sh* s){
     u32 tail= s->si.cbuf_max[i]>sz? s->si.cbuf_max[i]-sz : 0;
     UrC* e=&urc[(u32)((a>>4)^(a>>16)^(a>>28))&4095]; u32 off;
     /* same submit/address, not GPU-written, ring hasn't wrapped: reuse */
-    if(a && e->a==a && e->epoch==g_submit_epoch && e->valid==sz && e->sz>=sz+tail && g_ur_abs-e->abs<g_ur_size/2 && !gpu_mem_dirty_since(e->gen,a,sz)){ off=e->off; st_cb_skip++; }
-    else { st_cb_bytes+=sz; off=ur_alloc(sz+tail); u8* dst=g_ur_ptr+off; u8* src= a? gmem_ptr(a,sz) : NULL;
-      if(src) memcpy(dst,src,sz); else if(a) gmem_read(a,dst,sz); else memset(dst,0,sz);
-      if(tail) memset(dst+sz,0,tail);
-      if(a){ e->a=a; e->valid=sz; e->sz=sz+tail; e->epoch=g_submit_epoch; e->gen=g_gw_gen; e->off=off; e->abs=g_ur_abs; } }
+    if(a && e->a==a && e->epoch==g_submit_epoch && e->store==g_ur_store && e->valid==sz && e->sz>=sz+tail && g_ur_abs-e->abs<g_ur_size/2 && !gpu_mem_dirty_since(e->gen,a,sz)){ off=e->off; st_cb_skip++; }
+    else { st_cb_bytes+=sz; off=ur_alloc(sz+tail); u8* src= a? gmem_ptr(a,sz) : NULL;
+      glBindBuffer(GL_UNIFORM_BUFFER,g_ur);
+      if(src) glBufferSubData(GL_UNIFORM_BUFFER,off,sz,src);
+      else if(a && g_ur_scratch){ gmem_read(a,g_ur_scratch,sz); glBufferSubData(GL_UNIFORM_BUFFER,off,sz,g_ur_scratch); }
+      else if(g_ur_scratch){ memset(g_ur_scratch,0,sz); glBufferSubData(GL_UNIFORM_BUFFER,off,sz,g_ur_scratch); }
+      if(tail && g_ur_scratch){ memset(g_ur_scratch,0,tail); glBufferSubData(GL_UNIFORM_BUFFER,off+sz,tail,g_ur_scratch); }
+      if(a){ e->a=a; e->valid=sz; e->sz=sz+tail; e->epoch=g_submit_epoch; e->gen=g_gw_gen; e->off=off; e->abs=g_ur_abs; e->store=g_ur_store; } }
     if(s->si.cbuf_ssbo_mask&(1u<<i)){
       int bind=cb_ssbo_binding(stage,s,i);
       if(g_sb_bound[bind]!=off+1){ glBindBufferRange(GL_SHADER_STORAGE_BUFFER,bind,g_ur,off,65536); g_sb_bound[bind]=off+1; }
     } else if(g_ub_bound[bb+i]!=off+1){ glBindBufferRange(GL_UNIFORM_BUFFER,bb+i,g_ur,off,65536); g_ub_bound[bb+i]=off+1; } } }
 
 static void upload_cbufs(int stage, Sh* s){
-  if(g_ur_ptr){ upload_cbufs_ring(stage,s); return; }
+  if(g_ur){ upload_cbufs_ring(stage,s); return; }
   for(int i=0;i<18;i++){ if(!(s->si.cbuf_mask&(1u<<i))) continue;
     u64 a=g_cb.cb[stage][i]; u32 sz=g_cb.cbsize[stage][i]; if(sz>65536) sz=65536; if(!sz) sz=16;
     if(s->si.cbuf_max[i] && sz>s->si.cbuf_max[i]) sz=s->si.cbuf_max[i];   /* only the bytes the shader reads */
@@ -3448,7 +3445,7 @@ static void gpu_thread(void* arg){ t_gpu_thread=1;
   p_cis=(PFNGLCOPYIMAGESUBDATAPROC)backend_gl_proc("glCopyImageSubData");
   gl_selftest(); state_dirty(); mb_reset();
   LOG("gpu: native 0..1 depth %s, texture views %s\n",p_clip? "yes" : "no",p_tview? "yes" : "no");
-  LOG("gpu: texture multi-bind %s, persistent constant ring %s\n",p_bt? "yes" : "no",g_ur_ptr? "yes" : "no");
+  LOG("gpu: texture multi-bind %s, orphaned constant arena %s\n",p_bt? "yes" : "no",g_ur? "yes" : "no");
   warm_load();
   g_gl=1; g_gl_ready=1;
   splash_play(1.0);
@@ -3495,15 +3492,15 @@ static void gpu_thread(void* arg){ t_gpu_thread=1;
             l_now=now; l_pcpu=pc; l_gcpu=gc; l_cn=g_cmp_n; l_cns=g_cmp_ns; l_fr2=g_frame; l_skip=st_compiling; l_dr2=st_drawn; }
           { static u64 l_cbs, l_cbb, l_vbh, l_vbu, l_tex, l_dr; u64 fr=g_frame-last_frames_pf; if(!fr) fr=1;
             static u64 l_shf, l_sh, l_fbs, l_tbs, l_urw, l_tck, l_ss, l_dm, l_csg, l_css, l_csn, l_th, l_tm; extern u64 g_draws_merged;
-            LOG("per-frame profile: %llu draws | constants: %.1f KB copied, %llu reused | vertices/indices: %.1f KB checked, %.1f KB uploaded | textures: %.1f KB checked, %.1f KB uploaded | shaders via fast cache %llu/%llu | same fbo %llu, same textures %llu, same state %llu, ring waits %llu, merged instances %llu | compute: %llu GPU copies, %llu waits (%.1f ms) | texture lookups reused %.0f%%\n",
+            LOG("per-frame profile: %llu draws | constants: %.1f KB copied, %llu reused | vertices/indices: %.1f KB checked, %.1f KB uploaded | textures: %.1f KB checked, %.1f KB uploaded | shaders via fast cache %llu/%llu | same fbo %llu, same textures %llu, same state %llu, uniform arena orphans %llu, merged instances %llu | compute: %llu GPU copies, %llu waits (%.1f ms) | texture lookups reused %.0f%%\n",
               (unsigned long long)((st_drawn-l_dr)/fr),(double)(st_cb_bytes-l_cbb)/1024.0/fr,(unsigned long long)((st_cb_skip-l_cbs)/fr),(double)(st_vb_hashed-l_vbh)/1024.0/fr,(double)(st_vb_up-l_vbu)/1024.0/fr,
               (double)(st_tex_chk-l_tck)/1024.0/fr,(double)(st_tex_up-l_tex)/1024.0/fr,(unsigned long long)((st_sh_fast-l_shf)/fr),(unsigned long long)((st_shaders-l_sh)/fr),
-              (unsigned long long)((st_fb_skip-l_fbs)/fr),(unsigned long long)((st_tb_skip-l_tbs)/fr),(unsigned long long)((st_state_skip-l_ss)/fr),(unsigned long long)(st_ur_wait-l_urw),(unsigned long long)((g_draws_merged-l_dm)/fr),
+              (unsigned long long)((st_fb_skip-l_fbs)/fr),(unsigned long long)((st_tb_skip-l_tbs)/fr),(unsigned long long)((st_state_skip-l_ss)/fr),(unsigned long long)(st_ur_wrap-l_urw),(unsigned long long)((g_draws_merged-l_dm)/fr),
               (unsigned long long)((st_cs_gpucopy-l_csg)/fr),(unsigned long long)((st_cs_sync-l_css)/fr),(double)(st_cs_sync_ns-l_csn)/1e6/fr,
               (st_tdc_hit-l_th)+(st_tdc_miss-l_tm)? 100.0*(st_tdc_hit-l_th)/(double)((st_tdc_hit-l_th)+(st_tdc_miss-l_tm)) : 0.0);
             l_th=st_tdc_hit; l_tm=st_tdc_miss;
             l_csg=st_cs_gpucopy; l_css=st_cs_sync; l_csn=st_cs_sync_ns;
-            l_dm=g_draws_merged; l_shf=st_sh_fast; l_sh=st_shaders; l_fbs=st_fb_skip; l_tbs=st_tb_skip; l_urw=st_ur_wait; l_tck=st_tex_chk; l_ss=st_state_skip;
+            l_dm=g_draws_merged; l_shf=st_sh_fast; l_sh=st_shaders; l_fbs=st_fb_skip; l_tbs=st_tb_skip; l_urw=st_ur_wrap; l_tck=st_tex_chk; l_ss=st_state_skip;
             l_cbs=st_cb_skip; l_cbb=st_cb_bytes; l_vbh=st_vb_hashed; l_vbu=st_vb_up; l_tex=st_tex_up; l_dr=st_drawn; last_frames_pf=g_frame; } } }
     lsfg_pump();
     i64 to_=100000000; if(g_lfn){ u64 nw=plat_ns(); to_= g_lfq[0].t>nw? (i64)(g_lfq[0].t-nw) : 0; if(to_<200000) to_=200000; }
