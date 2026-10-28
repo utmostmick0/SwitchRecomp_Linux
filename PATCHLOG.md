@@ -305,6 +305,23 @@ The cumulative beta patch is `patches/milestone-022-main-to-beta.patch`.
 
 The cumulative beta patch is `patches/milestone-023-main-to-beta.patch`.
 
+## Milestone 024 — Stable preselected-user launch storage
+
+- Defined the `PreselectedUser` launch payload as an explicit 0x88-byte structure with the existing magic,
+  active marker, and shared `acc:u0` UID. A compile-time size assertion protects the guest ABI layout.
+- Tagged the returned storage and restore its magic, active marker, and UID before every accessor read, so
+  repeated offset-based reads see the same valid header. `GetSize` remains 0x88 and read offset/length bounds
+  remain honored.
+- Fixed the storage/accessor ownership path: accessors now retain the storage object and release that reference
+  when destroyed; storage destruction frees its byte buffer. `PopLaunchParameter` remains a one-time pop, and
+  its consumed state is set only after storage creation succeeds.
+- Added bounded lifecycle logs for creation, size queries, and reads. The available Balatro log does not show
+  a `PopLaunchParameter` or preselected-user accessor call, so a fresh run is required to verify whether this
+  path participates in the reported setup freeze.
+- Rebuilt `bin/runtime_linux_x11` successfully. `main` remains unchanged.
+
+The cumulative beta patch is `patches/milestone-024-main-to-beta.patch`.
+
 ## Recording the next milestone
 
 1. Make shared source changes on either work branch and carry them to the other branch; keep

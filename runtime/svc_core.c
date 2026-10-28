@@ -54,25 +54,48 @@ static u64 g_user_id[2]={0x0123456789ABCDEFull,0xFEDCBA9876543210ull};
 static void am_push_msg(u32 m){ pm_lock(&g_klock); if(g_nmsg<16) g_msgq[g_nmsg++]=m; pm_unlock(&g_klock); kevent_signal(g_msg_event); }
 
 /* IStorage / IStorageAccessor */
-typedef struct { u8* d; u64 size; } StorageData;
+enum { STORAGE_GENERIC, STORAGE_PRESELECTED_USER };
+typedef struct { u8* d; u64 size; u32 kind; } StorageData;
+typedef struct { SvcObj* storage; } StorageAccessorData;
+typedef struct { u32 magic, active; u64 uid[2]; u8 reserved[0x70]; } PreselectedUserPayload;
+_Static_assert(sizeof(PreselectedUserPayload)==0x88, "PreselectedUser storage payload size");
+
+static void storage_destroy(SvcObj* o){ StorageData* s=o->data; if(s) free(s->d); }
+static void storage_accessor_destroy(SvcObj* o){ StorageAccessorData* a=o->data; if(a && a->storage) svcobj_unref(a->storage); }
+
+static void preselected_user_refresh(StorageData* s){
+  if(!s || s->kind!=STORAGE_PRESELECTED_USER || !s->d || s->size!=sizeof(PreselectedUserPayload)) return;
+  static const u32 magic=0xC79497CA, active=1;
+  memcpy(s->d,&magic,sizeof magic); memcpy(s->d+4,&active,sizeof active); memcpy(s->d+8,g_user_id,sizeof g_user_id);
+}
 
 static int storage_acc_disp(SvcObj* o, IpcCtx* c){
-  StorageData* s=(StorageData*)(size_t)o->u[0];
+  StorageAccessorData* a=o->data; StorageData* s=a && a->storage? a->storage->data : NULL;
+  if(!s) return RC(128,2);
   switch(c->cmd){
-    case 0: out64(c,s->size); return 0;
+    case 0: { static int said; if(s->kind==STORAGE_PRESELECTED_USER && said++<4) LOG("applet: PreselectedUser IStorageAccessor GetSize=%llu\n",(unsigned long long)s->size);
+      out64(c,s->size); return 0; }
     /* compare against size-off, off+n can wrap around if off is huge */
     case 10: { u64 off=in64(c,0), a, n; buf_in(c,0,&a,&n); if(off>s->size || n>s->size-off) return RC(128,503); memcpy(s->d+off,GP(a),n); return 0; }
-    case 11: { u64 off=in64(c,0), a, n; buf_out(c,0,&a,&n); if(off>s->size) return RC(128,503); if(n>s->size-off) n=s->size-off; memcpy(GP(a),s->d+off,n); return 0; }
+    case 11: { u64 off=in64(c,0), dst, n; buf_out(c,0,&dst,&n); if(off>s->size) return RC(128,503); if(n>s->size-off) n=s->size-off;
+      preselected_user_refresh(s);
+      if(s->kind==STORAGE_PRESELECTED_USER){ static int said; if(said++<12) LOG("applet: PreselectedUser IStorageAccessor Read offset=%llu size=%llu\n",(unsigned long long)off,(unsigned long long)n); }
+      memcpy(GP(dst),s->d+off,n); return 0; }
   }
   return stub_ok(o,c); }
 
 static int storage_disp(SvcObj* o, IpcCtx* c){
-  if(c->cmd==0 || c->cmd==1){ SvcObj* a=svcobj_new("IStorageAccessor",storage_acc_disp,0); a->u[0]=(u64)(size_t)o->data; o->refs++; out_obj(c,a); return 0; }
+  if(c->cmd==0 || c->cmd==1){ SvcObj* a=svcobj_new("IStorageAccessor",storage_acc_disp,sizeof(StorageAccessorData));
+    if(!a) return RC(128,2); ((StorageAccessorData*)a->data)->storage=o; __atomic_add_fetch(&o->refs,1,__ATOMIC_SEQ_CST); a->destroy=storage_accessor_destroy; out_obj(c,a); return 0; }
   return stub_ok(o,c); }
 
-SvcObj* am_storage_new(u64 size, const void* init){
-  SvcObj* o=svcobj_new("IStorage",storage_disp,sizeof(StorageData)); StorageData* s=o->data; s->d=calloc(1,size?size:1); s->size=size;
-  if(init) memcpy(s->d,init,size); return o; }
+static SvcObj* am_storage_new_kind(u64 size, const void* init, u32 kind){
+  SvcObj* o=svcobj_new("IStorage",storage_disp,sizeof(StorageData)); if(!o || !o->data){ if(o) svcobj_unref(o); return NULL; }
+  StorageData* s=o->data; s->d=calloc(1,size?size:1); s->size=size; s->kind=kind; o->destroy=storage_destroy;
+  if(!s->d){ svcobj_unref(o); return NULL; }
+  if(init) memcpy(s->d,init,size); preselected_user_refresh(s); return o; }
+
+SvcObj* am_storage_new(u64 size, const void* init){ return am_storage_new_kind(size,init,STORAGE_GENERIC); }
 
 static int am_csg(SvcObj* o, IpcCtx* c){           /* ICommonStateGetter */
   switch(c->cmd){
@@ -123,9 +146,10 @@ static int am_appfn(SvcObj* o, IpcCtx* c){         /* IApplicationFunctions */
   switch(c->cmd){
     case 1: { u32 kind=in32(c,0);
       if(kind==2){ /* PreselectedUser */
-        static int given; if(given) return RC(128,2); given=1;
-        u8 buf[0x88]; memset(buf,0,sizeof buf); u32 magic=0xC79497CA; memcpy(buf,&magic,4); u32 one=1; memcpy(buf+4,&one,4); memcpy(buf+8,g_user_id,16);
-        out_obj(c,am_storage_new(sizeof buf,buf)); return 0; }
+        static int given; if(given) return RC(128,2);
+        PreselectedUserPayload payload; memset(&payload,0,sizeof payload); payload.magic=0xC79497CA; payload.active=1; memcpy(payload.uid,g_user_id,sizeof payload.uid);
+        SvcObj* st=am_storage_new_kind(sizeof payload,&payload,STORAGE_PRESELECTED_USER); if(!st) return RC(128,2);
+        given=1; LOG("applet: PopLaunchParameter PreselectedUser returned verified 0x88-byte storage\n"); out_obj(c,st); return 0; }
       return RC(128,2); }
     case 10: out_obj(c,am_storage_new(in64(c,0),NULL)); return 0;
     case 20: out64(c,0); return 0;                                     /* EnsureSaveData */
