@@ -330,3 +330,12 @@ The cumulative beta patch is `patches/milestone-024-main-to-beta.patch`.
 3. On `beta`, run `scripts/create-milestone-patch.sh NNN` with the next three-digit milestone number.
 4. Commit the generated patch and sync the patch and log updates to `flatpack`.
 5. Confirm shared source changes match across both branches and `main` has not moved.
+
+## Milestone 025 — Synchronous fallback for delayed shader links
+
+- Traced shader readiness in `runtime/gpu_gl.c`: both the worker-job and same-context parallel-link paths previously skipped draws indefinitely while compilation remained pending. There is no separate `src/gpu/` tree in this C runtime.
+- Added a 250 ms per-program wait threshold. After that interval, the render thread attempts one synchronous compile/link from the same guest shader sources. If a worker later finishes, its redundant program is deleted rather than replacing the synchronous result. The worker continues running because it may own other queued programs.
+- A transparent identity shader is not used as a fallback: it would replace the guest draw and hide link failures rather than present the missing content. Failed synchronous links retain the existing diagnostics and failed shader capture behavior.
+- Rebuilt beta's `bin/runtime_linux_x11` successfully. This has not yet been verified in a fresh FFRS run; the current logs need to show whether the delayed-link checkpoint triggers and whether frame output resumes.
+
+The cumulative beta patch is `patches/milestone-025-main-to-beta.patch`.

@@ -1299,7 +1299,7 @@ static void sep_init(void){
   gpp(1,&g_pipe); if(g_pipe) g_sep=1;
 out: LOG("shaders: %s\n",g_sep? "one program per shader (each shader is compiled only once)" : "one program per combination"); }
 
-typedef struct Prog { Sh* vs; Sh* fs; GLuint p; GLint vp_loc, at_loc; int pending; WJob* job; struct Prog* next; } Prog;
+typedef struct Prog { Sh* vs; Sh* fs; GLuint p; GLint vp_loc, at_loc; int pending; int sync_attempted; u64 wait_since; WJob* job; struct Prog* next; } Prog;
 
 static Prog* progs[512];
 
@@ -1314,18 +1314,36 @@ static Prog* program_get(Sh* vs, Sh* fs){
   if(!p->pending){ p->vp_loc= p->p? glGetUniformLocation(p->p,"swr_vp") : -1; p->at_loc= p->p? glGetUniformLocation(p->p,"swr_at") : -1; }
   p->next=progs[k]; progs[k]=p; return p; }
 
+/* Force a single foreground compile/link after async compilation has blocked a draw for 250 ms.
+   Keep the original job alive until it reports completion so its result can be safely discarded. */
+static void program_sync_fallback(Prog* p){
+  p->sync_attempted=1;
+  p->p=prog_build(p->vs,p->fs,NULL);
+  p->pending=0;
+  p->vp_loc=p->p? glGetUniformLocation(p->p,"swr_vp") : -1;
+  p->at_loc=p->p? glGetUniformLocation(p->p,"swr_at") : -1;
+  if(p->p) LOG("shaders: synchronously linked delayed program %016llx after 250 ms\n",(unsigned long long)prog_key(p->vs,p->fs));
+}
+
 /* 1 = ready, 0 = driver still compiling (skip the draw) */
 static int program_ready(Prog* p){
-  if(p->job){ int s=__atomic_load_n(&p->job->state,__ATOMIC_ACQUIRE); if(!s) return 0;
+  if(p->job){ int s=__atomic_load_n(&p->job->state,__ATOMIC_ACQUIRE); if(!s){
+      if(!p->wait_since) p->wait_since=plat_ns();
+      if(!p->sync_attempted && plat_ns()-p->wait_since>=250000000ull) program_sync_fallback(p);
+      return p->sync_attempted && p->p && !p->pending; }
     WJob* j=p->job; p->job=NULL;
-    if(s==1){ p->p=j->prog; pack_add(j->key,p->vs,p->fs); p->vp_loc=j->loc[0]; p->at_loc=j->loc[1]; }
-    else { p->p=0; WARN("GL link (thread): %s\n",j->log);
+    if(s==1){ if(p->sync_attempted){ if(j->prog) glDeleteProgram(j->prog); }
+      else { p->p=j->prog; pack_add(j->key,p->vs,p->fs); p->vp_loc=j->loc[0]; p->at_loc=j->loc[1]; } }
+    else { if(!p->sync_attempted) p->p=0; WARN("GL link (thread): %s\n",j->log);
       static int nd; if(nd<12){ nd++; plat_mkdir("captures"); plat_mkdir("captures/failed"); char fp[200];
         snprintf(fp,sizeof fp,"captures/failed/%016llx_vs.glsl",(unsigned long long)p->vs->hash); FILE* f=fopen(fp,"w"); if(f){ fputs(p->vs->src,f); fclose(f); }
         snprintf(fp,sizeof fp,"captures/failed/%016llx_fs.glsl",(unsigned long long)p->fs->hash); f=fopen(fp,"w"); if(f){ fputs(p->fs->src,f); fclose(f); } } }
-    free(j); return 1; }
+    free(j); return p->sync_attempted? (p->p && !p->pending) : 1; }
   if(!p->pending) return 1;
-  GLint done=0; glGetProgramiv(p->p,0x91B1 /* GL_COMPLETION_STATUS_KHR */,&done); if(!done) return 0;
+  GLint done=0; glGetProgramiv(p->p,0x91B1 /* GL_COMPLETION_STATUS_KHR */,&done); if(!done){
+    if(!p->wait_since) p->wait_since=plat_ns();
+    if(!p->sync_attempted && plat_ns()-p->wait_since>=250000000ull){ GLuint old=p->p; p->p=0; glDeleteProgram(old); program_sync_fallback(p); }
+    return p->sync_attempted && p->p && !p->pending; }
   p->pending=0; p->p=prog_finish(p->vs,p->fs,p->p);
   p->vp_loc= p->p? glGetUniformLocation(p->p,"swr_vp") : -1; p->at_loc= p->p? glGetUniformLocation(p->p,"swr_at") : -1; return 1; }
 
