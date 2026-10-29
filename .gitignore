@@ -1,0 +1,13 @@
+# Reproducible Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local game assets, generated recompilation output, saves, logs and rollbacks.
+# Keep these on disk; never add extracted game content to source control.
+/games/
+
+# Local launcher settings
+/SwitchRecomp.ini
+
+# Atomic runtime staging scratch files
+*.runtime-update

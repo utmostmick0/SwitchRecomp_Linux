@@ -1,0 +1,871 @@
+diff --git a/CHANGELOG_v190.txt b/CHANGELOG_v190.txt
+index 6e24a18..83e2364 100644
+--- a/CHANGELOG_v190.txt
++++ b/CHANGELOG_v190.txt
+@@ -12,7 +12,7 @@ tool/build_tool.bat and build_tool.sh rebuild SwitchRecomp.exe with GCC.
+ 
+ AUDIO
+ Games have sound now. audren mixes PCM and DSP-ADPCM voices, audout streams PCM16 (Celeste, Brawlhalla),
+-5.1 gets mixed down to stereo, and the output goes through waveOut on Windows and SDL2 on Linux.
++5.1 gets mixed down to stereo, and the output goes through waveOut on Windows and SDL3 on Linux.
+ F7 records the sound to a .wav next to the .mp4, on the same clock as the video.
+ Some effects, biquad filters and surround virtualization aren't done yet.
+ 
+diff --git a/PATCHLOG.md b/PATCHLOG.md
+new file mode 100644
+index 0000000..9e87a43
+--- /dev/null
++++ b/PATCHLOG.md
+@@ -0,0 +1,54 @@
++# Linux patch milestones
++
++`main` is the pristine Linux v190 AppImage prerelease base. Do not commit development changes to `main`.
++`beta` remains the AppImage line; `flatpack` contains Flatpak-specific packaging. Shared runtime and
++game-code changes are synchronized between those branches, while packaging-specific changes stay on
++their respective branches. Each milestone records the shared changes here and stores a unified patch
++from `main` to `beta` in `patches/`.
++
++## Milestone 001 — Flatpak foundation and memory lookup
++
++- Shared across `flatpack` and `beta`: optimized guest memory block lookup using the existing sorted
++  block list.
++- `flatpack` only: changed Linux defaults to XDG data/config paths, added writable directory creation,
++  and added an initial Flatpak manifest, launcher, desktop entry, AppStream metadata, and Steam Deck notes.
++- `beta` keeps the original AppImage packaging behavior from `main`.
++- Flatpak remains a draft: it still needs the SDL3 stack, Python, a compiler, and a
++  Flatpak-compatible file chooser before it can package the complete workflow.
++
++The beta patch is `patches/milestone-001-main-to-beta.patch`. It contains the shared memory optimization
++and milestone documentation, not the Flatpak-only package changes.
++
++## Milestone 002 — SDL3 migration
++
++- Replaced SDL2 in the Linux launcher with SDL3, SDL3_ttf, and SDL3_image APIs for rendering, text, image
++  handling, menu gamepad input, and music playback.
++- Replaced the runtime's optional SDL2 gamepad and queued-audio backends with SDL3 gamepad and audio-stream
++  APIs. Both still load SDL3 at runtime so games retain keyboard/playback fallback when SDL3 is unavailable.
++- The launcher now enumerates already-connected gamepads on startup and polls confirm/cancel/menu buttons
++  in addition to event handling.
++- Updated Linux build and dependency instructions. The Windows tool continues to use SDL2 libraries.
++- The Linux launcher build uses GNU C17 so GCC 15's C23 default does not make the older-glibc compatibility
++  wrappers recurse into themselves at SDL3 startup. The build script writes the launcher beside `bin/` and
++  `tool/`, matching the paths expected by the app.
++- The Linux runtime build also uses GNU C17. Without it, GCC 15 emits C23 `strtol` calls that resolve to the
++  compatibility wrapper and recurse while reading a game's INI file; SMO then consumed a full CPU core
++  before creating its window. Rebuilds through `switchrecomp.py --build-runtime` now include the same flag.
++- `SDL_GetBasePath()` returns an SDL-owned cached path in SDL3, so the launcher keeps it as a `const char *`
++  and does not free it. This avoids a shutdown double free.
++- SDL3 gamepad button events and polling now trigger A, B, and menu actions only on press edges. Previously,
++  holding A while a game tile was selected could launch a new game process every frame.
++- Verified the Linux launcher and X11 runtime compile with GCC against SDL3 3.4.18, SDL3_ttf 3.2.2, and
++  SDL3_image 3.2.4. The Steam Controller is recognized by SDL3; gamepad behavior in a running game still
++  needs a successful SMO launch to verify.
++
++The cumulative beta patch is `patches/milestone-002-main-to-beta.patch`.
++
++## Recording the next milestone
++
++1. Make shared source changes on either work branch and carry them to the other branch; keep
++   Flatpak-specific packaging changes on `flatpack` and AppImage-specific packaging on `beta`.
++2. Update this log and keep `main` unchanged.
++3. On `beta`, run `scripts/create-milestone-patch.sh NNN` with the next three-digit milestone number.
++4. Commit the generated patch and sync the patch and log updates to `flatpack`.
++5. Confirm shared source changes match across both branches and `main` has not moved.
+diff --git a/README_LINUX.txt b/README_LINUX.txt
+index 48431d1..d6f79e3 100644
+--- a/README_LINUX.txt
++++ b/README_LINUX.txt
+@@ -6,14 +6,14 @@ QUE NECESITAS
+   - Una distro con glibc 2.34 o mas nueva (Ubuntu 22.04+, Debian 12+, Fedora 35+, Arch, Mint 21+...).
+   - Una GPU con OpenGL 4.5 (Mesa reciente, NVIDIA o AMD).
+   - Para recompilar juegos: python3 y gcc.
+-  - Para la interfaz: SDL2, SDL2_ttf y SDL2_image. Para elegir carpetas: zenity o kdialog.
++  - Para la interfaz: SDL3, SDL3_ttf y SDL3_image. Para elegir carpetas: zenity o kdialog.
+ 
+   Ubuntu / Debian / Mint:
+-    sudo apt install python3 gcc libsdl2-2.0-0 libsdl2-ttf-2.0-0 libsdl2-image-2.0-0 zenity
++    sudo apt install python3 gcc libsdl3-0 libsdl3-ttf0 libsdl3-image0 zenity
+   Fedora:
+-    sudo dnf install python3 gcc SDL2 SDL2_ttf SDL2_image zenity
++    sudo dnf install python3 gcc SDL3-devel SDL3_ttf-devel SDL3_image-devel zenity
+   Arch:
+-    sudo pacman -S python gcc sdl2 sdl2_ttf sdl2_image zenity
++    sudo pacman -S python gcc sdl3 sdl3_ttf sdl3_image zenity
+ 
+ COMO SE USA
+   1. Descomprime:  tar xzf SwitchRecomp_v190_linux.tar.gz
+@@ -31,7 +31,7 @@ CON EL APPIMAGE (un solo archivo)
+   porque la interfaz guarda los juegos, opciones y caches junto a si misma. Los juegos quedan en
+   ~/.local/share/SwitchRecomp/games. Un AppImage nuevo se descomprime encima: cambia el programa, tus juegos y
+   partidas se quedan. Para usar otra carpeta: SWITCHRECOMP_HOME=/otra/carpeta ./SwitchRecomp-v190-x86_64.AppImage
+-  No necesita FUSE. Las dependencias de arriba (python3, gcc, SDL2...) siguen haciendo falta.
++  No necesita FUSE. Las dependencias de arriba (python3, gcc, SDL3...) siguen haciendo falta.
+ 
+ LO MISMO QUE EN WINDOWS
+   Cada juego tiene su <nombre>.ini (resolucion, modo dock, idioma, controles...).
+@@ -44,8 +44,8 @@ LO QUE NO HAY EN LINUX (todavia)
+   - Generacion de frames LSFG si no tienes Lossless.dll.
+ 
+ SI LA INTERFAZ NO ABRE
+-  Falta SDL2_ttf o SDL2_image: instala los paquetes de arriba. Para recompilarla desde el codigo:
+-    sudo apt install libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev && sh SwitchRecomp/tool/src/build_tool_linux.sh
++  Falta SDL3_ttf o SDL3_image: instala los paquetes de arriba. Para recompilarla desde el codigo:
++    sudo apt install libsdl3-dev libsdl3-ttf-dev libsdl3-image-dev && sh SwitchRecomp/tool/src/build_tool_linux.sh
+   El runtime tambien se puede recompilar (necesita libx11-dev y libgl-dev):
+     python3 SwitchRecomp/switchrecomp.py --build-runtime --target linux --backend x11 --cc gcc
+ 
+diff --git a/runtime/audio.c b/runtime/audio.c
+index 16552da..e415506 100644
+--- a/runtime/audio.c
++++ b/runtime/audio.c
+@@ -8,6 +8,7 @@
+ #include "audio_queue.h"
+ #include <math.h>
+ #include <limits.h>
++#include <stdbool.h>
+ #if defined(_WIN32)
+ #include <mmsystem.h>
+ #else
+@@ -58,18 +59,19 @@ static int host_open(void){ WAVEFORMATEX f; memset(&f,0,sizeof f); f.wFormatTag=
+   LOG("audio: Windows waveOut, 48000 Hz stereo PCM16 enabled\n"); return 1;
+ }
+ #else
+-/* SDL2 is optional and loaded at run time, same as the linux controller backend */
+-typedef struct { int freq; u16 format; u8 channels,silence; u16 samples,padding; u32 size; void(*callback)(void*,u8*,int); void* userdata; } AudioSpec;
+-static void* sdl_lib; static u32 device;
+-static struct { int(*init)(u32); u32(*open)(const char*,int,const AudioSpec*,AudioSpec*,int); void(*pause)(u32,int); int(*queue)(u32,const void*,u32); u32(*queued)(u32); void(*close)(u32); const char*(*error)(void); } sdl;
+-static void device_close(void){ if(device) sdl.close(device); device=0; }
+-static int host_open(void){ sdl_lib=dlopen("libSDL2-2.0.so.0",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib) sdl_lib=dlopen("libSDL2.so",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib){ WARN("audio: SDL2 not available\n"); return 0; }
++/* SDL3 is optional and loaded at run time, same as the Linux gamepad backend. */
++typedef struct { int format; int channels; int freq; } AudioSpec;
++typedef void SDL_AudioStream;
++static void* sdl_lib; static SDL_AudioStream* device;
++static struct { bool(*init)(u32); SDL_AudioStream*(*open)(u32,const AudioSpec*,void*,void*); bool(*resume)(SDL_AudioStream*); bool(*queue)(SDL_AudioStream*,const void*,int); int(*queued)(SDL_AudioStream*); void(*close)(SDL_AudioStream*); const char*(*error)(void); } sdl;
++static void device_close(void){ if(device) sdl.close(device); device=NULL; }
++static int host_open(void){ sdl_lib=dlopen("libSDL3.so.0",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib) sdl_lib=dlopen("libSDL3.so",RTLD_NOW|RTLD_LOCAL); if(!sdl_lib){ WARN("audio: SDL3 not available\n"); return 0; }
+ #define SYM(field,name) do{*(void**)(&sdl.field)=dlsym(sdl_lib,name);if(!sdl.field)return 0;}while(0)
+-  SYM(init,"SDL_InitSubSystem"); SYM(open,"SDL_OpenAudioDevice"); SYM(pause,"SDL_PauseAudioDevice"); SYM(queue,"SDL_QueueAudio"); SYM(queued,"SDL_GetQueuedAudioSize"); SYM(close,"SDL_CloseAudioDevice"); SYM(error,"SDL_GetError");
++  SYM(init,"SDL_InitSubSystem"); SYM(open,"SDL_OpenAudioDeviceStream"); SYM(resume,"SDL_ResumeAudioStreamDevice"); SYM(queue,"SDL_PutAudioStreamData"); SYM(queued,"SDL_GetAudioStreamQueued"); SYM(close,"SDL_DestroyAudioStream"); SYM(error,"SDL_GetError");
+ #undef SYM
+-  AudioSpec want={0}; want.freq=48000; want.format=0x8010; want.channels=2; want.samples=1024;
+-  if(sdl.init(0x10) || (device=sdl.open(NULL,0,&want,NULL,0))==0){ WARN("audio: SDL2 output failed: %s\n",sdl.error()); return 0; }
+-  sdl.pause(device,0); LOG("audio: SDL2, 48000 Hz stereo PCM16 enabled\n"); return 1;
++  AudioSpec want={0}; want.freq=48000; want.format=0x8010; want.channels=2;
++  if(!sdl.init(0x10) || !(device=sdl.open(0xFFFFFFFFu,&want,NULL,NULL)) || !sdl.resume(device)){ WARN("audio: SDL3 output failed: %s\n",sdl.error()); return 0; }
++  LOG("audio: SDL3, 48000 Hz stereo PCM16 enabled\n"); return 1;
+ }
+ #endif
+ static void host_write(const float* samples,unsigned frames){
+@@ -97,7 +99,7 @@ static void host_write(const float* samples,unsigned frames){
+   }
+   if(!r) host_next=(k+1)%HOST_N;
+ #else
+-  while(sdl.queue(device,dst,frames*4)!=0 && !audio_stopping()) plat_sleep_ns(5000000);
++  while(!sdl.queue(device,dst,frames*4) && !audio_stopping()) plat_sleep_ns(5000000);
+ #endif
+   pm_unlock(&host_lock);
+ }
+diff --git a/runtime/backend_x11.c b/runtime/backend_x11.c
+index cce0122..7c271cb 100644
+--- a/runtime/backend_x11.c
++++ b/runtime/backend_x11.c
+@@ -2,7 +2,7 @@
+    Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
+    Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
+ /* X11 + GLX 4.3 backend, the linux version of backend_win32.c (wayland desktops run it through XWayland).
+-   controllers come from SDL2, loaded at run time like XInput on windows. F1 help F3 screenshot F4 fps limit F5
++   controllers come from SDL3, loaded at run time like XInput on windows. F1 help F3 screenshot F4 fps limit F5
+    trace F8 full res screenshot F11/Alt+Enter fullscreen Esc quit. the Xvfb tests run on this too (screenshots,
+    scripted input) */
+ #include "rt.h"
+@@ -13,6 +13,7 @@
+ #include <X11/keysym.h>
+ #include <GL/glx.h>
+ #include <dlfcn.h>
++#include <stdbool.h>
+ #include <time.h>
+ 
+ static Display* dpy; static Window win; static Atom wm_delete, a_state, a_fs; static Cursor g_blank;
+@@ -35,43 +36,46 @@ void backend_ini(const char* k, const char* v){
+ 
+ int video_has_gl(void){ return 1; }
+ 
+-/* ---------------------------------------------------------------- SDL2 game controllers, loaded dynamically */
+-typedef void SDLGC;
++/* ---------------------------------------------------------------- SDL3 gamepads, loaded dynamically */
++typedef void SDLGamepad;
++typedef u32 SDLGamepadID;
+ static struct {
+-  int (*Init)(u32); int (*SetHint)(const char*, const char*); int (*NumJoysticks)(void); int (*IsGameController)(int);
+-  SDLGC* (*Open)(int); int (*Attached)(SDLGC*); void (*Close)(SDLGC*); void (*Update)(void);
+-  u8 (*Button)(SDLGC*, int); i16 (*Axis)(SDLGC*, int); const char* (*Name)(SDLGC*);
++  bool (*InitSubSystem)(u32); bool (*SetHint)(const char*, const char*); SDLGamepadID* (*GetGamepads)(int*);
++  bool (*IsGamepad)(SDLGamepadID); SDLGamepad* (*Open)(SDLGamepadID); bool (*Connected)(SDLGamepad*);
++  void (*Close)(SDLGamepad*); void (*Update)(void); bool (*Button)(SDLGamepad*, int);
++  i16 (*Axis)(SDLGamepad*, int); const char* (*Name)(SDLGamepad*); void (*Free)(void*);
+ } sdl;
+ 
+-static SDLGC* g_pad_gc; static u64 g_pad_scan;
++static SDLGamepad* g_pad_gc; static u64 g_pad_scan;
+ 
+ static void sdl_load(void){
+-  void* h=dlopen("libSDL2-2.0.so.0",RTLD_NOW|RTLD_LOCAL); if(!h) h=dlopen("libSDL2.so",RTLD_NOW|RTLD_LOCAL);
+-  if(!h){ LOG("controllers: SDL2 not found (install libsdl2), keyboard only\n"); return; }
+-  void** f[]={(void**)&sdl.Init,(void**)&sdl.SetHint,(void**)&sdl.NumJoysticks,(void**)&sdl.IsGameController,(void**)&sdl.Open,(void**)&sdl.Attached,
+-              (void**)&sdl.Close,(void**)&sdl.Update,(void**)&sdl.Button,(void**)&sdl.Axis,(void**)&sdl.Name};
+-  const char* n[]={"SDL_Init","SDL_SetHint","SDL_NumJoysticks","SDL_IsGameController","SDL_GameControllerOpen","SDL_GameControllerGetAttached",
+-                   "SDL_GameControllerClose","SDL_GameControllerUpdate","SDL_GameControllerGetButton","SDL_GameControllerGetAxis","SDL_GameControllerName"};
+-  for(int i=0;i<11;i++){ *f[i]=dlsym(h,n[i]); if(!*f[i]){ memset(&sdl,0,sizeof sdl); return; } }
+-  /* buttons by position like on windows, also for nintendo controllers that SDL would map by label */
+-  sdl.SetHint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS","0");
++  void* h=dlopen("libSDL3.so.0",RTLD_NOW|RTLD_LOCAL); if(!h) h=dlopen("libSDL3.so",RTLD_NOW|RTLD_LOCAL);
++  if(!h){ LOG("controllers: SDL3 not found (install SDL3), keyboard only\n"); return; }
++  void** f[]={(void**)&sdl.InitSubSystem,(void**)&sdl.SetHint,(void**)&sdl.GetGamepads,(void**)&sdl.IsGamepad,(void**)&sdl.Open,(void**)&sdl.Connected,
++              (void**)&sdl.Close,(void**)&sdl.Update,(void**)&sdl.Button,(void**)&sdl.Axis,(void**)&sdl.Name,(void**)&sdl.Free};
++  const char* n[]={"SDL_InitSubSystem","SDL_SetHint","SDL_GetGamepads","SDL_IsGamepad","SDL_OpenGamepad","SDL_GamepadConnected",
++                   "SDL_CloseGamepad","SDL_UpdateGamepads","SDL_GetGamepadButton","SDL_GetGamepadAxis","SDL_GetGamepadName","SDL_free"};
++  for(int i=0;i<12;i++){ *f[i]=dlsym(h,n[i]); if(!*f[i]){ memset(&sdl,0,sizeof sdl); return; } }
++  /* SDL3 gamepad face buttons are positional, matching Switch controls by location. */
+   sdl.SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS","1");
+-  if(sdl.Init(0x2000 /* SDL_INIT_GAMECONTROLLER */)){ memset(&sdl,0,sizeof sdl); return; }
++  if(!sdl.InitSubSystem(0x2000 /* SDL_INIT_GAMEPAD */)){ memset(&sdl,0,sizeof sdl); return; }
+ }
+ 
+ static i32 dz(i32 v){ return (v>-7000 && v<7000)? 0 : v; }
+ 
+ static void pad_poll(u64* b, i32* lx, i32* ly, i32* rx, i32* ry){
+-  if(!sdl.Init) return;
++  if(!sdl.InitSubSystem) return;
+   sdl.Update();
+-  if(g_pad_gc && !sdl.Attached(g_pad_gc)){ sdl.Close(g_pad_gc); g_pad_gc=NULL; LOG("controllers: disconnected\n"); }
++  if(g_pad_gc && !sdl.Connected(g_pad_gc)){ sdl.Close(g_pad_gc); g_pad_gc=NULL; LOG("controllers: disconnected\n"); }
+   if(!g_pad_gc){ u64 now=plat_ns(); if(now-g_pad_scan<1000000000ull) return; g_pad_scan=now;
+-    for(int i=0;i<sdl.NumJoysticks() && !g_pad_gc;i++) if(sdl.IsGameController(i)) g_pad_gc=sdl.Open(i);
++    int count=0; SDLGamepadID* ids=sdl.GetGamepads(&count);
++    for(int i=0;ids && i<count && !g_pad_gc;i++) if(sdl.IsGamepad(ids[i])) g_pad_gc=sdl.Open(ids[i]);
++    if(ids) sdl.Free(ids);
+     if(!g_pad_gc) return;
+     LOG("controllers: %s\n",sdl.Name(g_pad_gc)? sdl.Name(g_pad_gc) : "connected"); }
+-  SDLGC* g=g_pad_gc;
+-  /* SDL names buttons by Xbox position: A bottom, B right, X left, Y top */
+-  static const struct { int sdl, bit; } m[]={{1,0},{0,1},{3,2},{2,3},{7,4},{8,5},{9,6},{10,7},{6,10},{4,11},{13,12},{11,13},{14,14},{12,15}};
++  SDLGamepad* g=g_pad_gc;
++  /* SDL3 names face buttons by position: south bottom, east right, west left, north top. */
++  static const struct { int sdl, bit; } m[]={{0,0},{1,1},{2,2},{3,3},{7,4},{8,5},{9,6},{10,7},{6,10},{4,11},{13,12},{11,13},{14,14},{12,15}};
+   for(unsigned i=0;i<sizeof m/sizeof m[0];i++) if(sdl.Button(g,m[i].sdl)) *b|=1ull<<m[i].bit;
+   if(sdl.Axis(g,4)>7700) *b|=1ull<<8; if(sdl.Axis(g,5)>7700) *b|=1ull<<9;
+   /* SDL's Y axes point down, the Switch's up */
+diff --git a/runtime/mem.c b/runtime/mem.c
+index c066d90..17082a3 100644
+--- a/runtime/mem.c
++++ b/runtime/mem.c
+@@ -40,7 +40,11 @@ static void merge(void){
+ 
+ int mem_is_free(u64 a, u64 s){
+   if(a<AS_BASE || a+s>AS_SIZE || a+s<a) return 0;
+-  for(int i=0;i<nblk;i++){ MemBlock* b=&blk[i]; if(b->addr<a+s && a<b->addr+b->size) return 0; }
++  /* Blocks are sorted and non-overlapping. Skip everything ending at or before a,
++     then only the first remaining block can overlap [a, a+s). */
++  int first=0,last=nblk;
++  while(first<last){ int mid=first+(last-first)/2; if(blk[mid].addr+blk[mid].size<=a) first=mid+1; else last=mid; }
++  if(first<nblk && blk[first].addr<a+s) return 0;
+   return 1; }
+ 
+ int mem_map(u64 a, u64 s, u32 state, u32 perm){
+@@ -92,11 +96,19 @@ u64 mem_find_free(u64 lo, u64 hi, u64 size, u64 align){
+   if(!align) align=0x1000;
+   pm_lock(&g_memlock);
+   u64 a=(lo+align-1)&~(align-1);
+-  for(;;){
+-    if(a+size>hi || a+size<a){ pm_unlock(&g_memlock); return 0; }
+-    int clash=0;
+-    for(int i=0;i<nblk;i++){ MemBlock* b=&blk[i]; if(b->addr<a+size && a<b->addr+b->size){ a=(b->addr+b->size+align-1)&~(align-1); clash=1; break; } }
+-    if(!clash){ pm_unlock(&g_memlock); return a; } } }
++  if(a<lo || a+size<a || a+size>hi){ pm_unlock(&g_memlock); return 0; }
++  /* Walk the sorted ranges once. The previous loop restarted at block zero
++     after every collision, making dense address spaces quadratic to scan. */
++  for(int i=0;i<nblk;i++){
++    MemBlock* b=&blk[i];
++    if(b->addr+b->size<=a) continue;
++    if(b->addr>=a+size) break;
++    u64 end=b->addr+b->size;
++    if(end>UINT64_MAX-(align-1)){ pm_unlock(&g_memlock); return 0; }
++    a=(end+align-1)&~(align-1);
++    if(a<end || a+size<a || a+size>hi){ pm_unlock(&g_memlock); return 0; }
++  }
++  pm_unlock(&g_memlock); return a; }
+ 
+ u64 kmem_alloc(u64 size, u32 state, u32 perm){
+   size=(size+0xFFF)&~0xFFFull;
+diff --git a/scripts/create-milestone-patch.sh b/scripts/create-milestone-patch.sh
+new file mode 100755
+index 0000000..19902d2
+--- /dev/null
++++ b/scripts/create-milestone-patch.sh
+@@ -0,0 +1,21 @@
++#!/bin/sh
++set -eu
++
++if [ "$#" -ne 1 ] || ! printf '%s' "$1" | grep -Eq '^[0-9]{3}$'; then
++    echo "Usage: $0 NNN (three-digit milestone number)" >&2
++    exit 2
++fi
++
++root=$(git rev-parse --show-toplevel)
++branch=$(git -C "$root" branch --show-current)
++if [ "$branch" != beta ]; then
++    echo "Run this script on the beta branch; current branch is $branch" >&2
++    exit 1
++fi
++
++git -C "$root" rev-parse --verify main >/dev/null
++git -C "$root" rev-parse --verify beta >/dev/null
++mkdir -p "$root/patches"
++out="$root/patches/milestone-$1-main-to-beta.patch"
++git -C "$root" diff --binary main..beta -- . ':(exclude)patches/*.patch' > "$out"
++echo "Wrote $out"
+diff --git a/switchrecomp.py b/switchrecomp.py
+index 2ecd41f..5edff54 100644
+--- a/switchrecomp.py
++++ b/switchrecomp.py
+@@ -283,7 +283,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
+     # hwopus: libopus (BSD), same rule as OpenH264
+     op = os.path.join(RT, 'opus', 'win' if target_win else 'lin')
+     opus = os.path.isfile(os.path.join(op, 'libopus.a')) and backend in ('win32', 'x11', 'headless')
+-    cmd = [cc, '-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S', '-I', RT, '-I', os.path.join(RT, 'bcn'), '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'opus', 'include')] + srcs + ['-o', out]
++    cmd = [cc] + ([] if target_win else ['-std=gnu17']) + ['-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S', '-I', RT, '-I', os.path.join(RT, 'bcn'), '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'opus', 'include')] + srcs + ['-o', out]
+     if target_win and backend == 'win32': cmd += ['-DSWR_RECORD_AUDIO']
+     if not h264: cmd += ['-DSWR_NO_H264']
+     if not opus: cmd += ['-DSWR_NO_OPUS']
+diff --git a/tool/src/build_tool_linux.sh b/tool/src/build_tool_linux.sh
+index 19dcb1a..7af5e84 100755
+--- a/tool/src/build_tool_linux.sh
++++ b/tool/src/build_tool_linux.sh
+@@ -1,4 +1,4 @@
+ #!/bin/sh
+-# SwitchRecomp (the tool) for Linux: needs the SDL2, SDL2_ttf and SDL2_image development packages
++# SwitchRecomp (the tool) for Linux: needs SDL3, SDL3_ttf and SDL3_image development packages
+ cd "$(dirname "$0")"
+-cc -O2 -Wall -Wno-missing-braces main.c gfx.c music.c glibc_compat.c -o ${1:-../SwitchRecomp} $(pkg-config --cflags --libs sdl2 SDL2_ttf SDL2_image) -lm
++cc -std=gnu17 -O2 -Wall -Wno-missing-braces main.c gfx.c music.c glibc_compat.c -o "${1:-../../SwitchRecomp}" $(pkg-config --cflags --libs sdl3 sdl3-ttf sdl3-image) -lm
+diff --git a/tool/src/gfx.c b/tool/src/gfx.c
+index e775e4c..360e894 100644
+--- a/tool/src/gfx.c
++++ b/tool/src/gfx.c
+@@ -4,7 +4,7 @@
+ #include <math.h>
+ #include <stdio.h>
+ #include <string.h>
+-#include <SDL_ttf.h>
++#include <SDL3_ttf/SDL_ttf.h>
+ #include "gfx.h"
+ 
+ static SDL_Renderer *g_r;
+@@ -49,7 +49,7 @@ static Shape *shape_slot(void)
+ /* coverage from a signed distance in pixels, 4x4 samples per pixel so thin strokes stay smooth */
+ static SDL_Texture *rasterize(int w, int h, SdfFn fn, const float *p)
+ {
+-    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ABGR8888);
++    SDL_Surface *s = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_ABGR8888);
+     if (!s)
+         return NULL;
+     Uint32 *px = s->pixels;
+@@ -66,7 +66,7 @@ static SDL_Texture *rasterize(int w, int h, SdfFn fn, const float *p)
+             px[y * (s->pitch / 4) + x] = (a << 24) | 0xFFFFFF;
+         }
+     SDL_Texture *t = SDL_CreateTextureFromSurface(g_r, s);
+-    SDL_FreeSurface(s);
++    SDL_DestroySurface(s);
+     if (t)
+         SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+     return t;
+@@ -93,7 +93,9 @@ static void draw_tinted(SDL_Texture *t, const SDL_Rect *src, float x, float y, f
+     SDL_SetTextureColorMod(t, c.r, c.g, c.b);
+     SDL_SetTextureAlphaMod(t, c.a);
+     SDL_FRect dst = { x, y, w, h };
+-    SDL_RenderCopyF(g_r, t, src, &dst);
++    SDL_FRect srcf;
++    if (src) { srcf = (SDL_FRect){ (float)src->x, (float)src->y, (float)src->w, (float)src->h }; }
++    SDL_RenderTexture(g_r, t, src ? &srcf : NULL, &dst);
+ }
+ 
+ /* ---- signed distance functions, in pixels ---- */
+@@ -155,7 +157,7 @@ static SDL_Texture *shadow_tex(int w, int h, float radius, float spread)
+     }
+     int pad = (int)ceilf(spread * 2);
+     int tw = w + pad * 2, th = h + pad * 2;
+-    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, tw, th, 32, SDL_PIXELFORMAT_ABGR8888);
++    SDL_Surface *s = SDL_CreateSurface(tw, th, SDL_PIXELFORMAT_ABGR8888);
+     if (!s)
+         return NULL;
+     Uint32 *px = s->pixels;
+@@ -166,7 +168,7 @@ static SDL_Texture *shadow_tex(int w, int h, float radius, float spread)
+             px[y * (s->pitch / 4) + x] = ((Uint32)(a * 255) << 24) | 0xFFFFFF;
+         }
+     SDL_Texture *t = SDL_CreateTextureFromSurface(g_r, s);
+-    SDL_FreeSurface(s);
++    SDL_DestroySurface(s);
+     SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+     *shape_slot() = (Shape){ 100, { p[0], p[1], p[2], p[3] }, tw, th, t, ++g_shape_clock };
+     return t;
+@@ -330,13 +332,13 @@ static TextEntry *text_get(FontId f, const char *s)
+     memset(slot, 0, sizeof(*slot));
+     if (!g_fonts[f] || !s[0])
+         return NULL;
+-    SDL_Surface *surf = TTF_RenderUTF8_Blended(g_fonts[f], s, (SDL_Color){ 255, 255, 255, 255 });
++    SDL_Surface *surf = TTF_RenderText_Blended(g_fonts[f], s, 0, (SDL_Color){ 255, 255, 255, 255 });
+     if (!surf)
+         return NULL;
+     slot->tex = SDL_CreateTextureFromSurface(g_r, surf);
+     slot->w = surf->w;
+     slot->h = surf->h;
+-    SDL_FreeSurface(surf);
++    SDL_DestroySurface(surf);
+     if (!slot->tex)
+         return NULL;
+     SDL_SetTextureBlendMode(slot->tex, SDL_BLENDMODE_BLEND);
+@@ -362,7 +364,7 @@ static const struct { const char *file; int size; } g_font_specs[FONT_COUNT] = {
+ bool gfx_init(SDL_Renderer *r, const char *font_dir)
+ {
+     g_r = r;
+-    if (TTF_Init() < 0)
++    if (!TTF_Init())
+         return false;
+     for (int i = 0; i < FONT_COUNT; i++) {
+         char path[1024];
+@@ -406,7 +408,7 @@ void gfx_rect(float x, float y, float w, float h, Color c)
+     SDL_SetRenderDrawBlendMode(g_r, SDL_BLENDMODE_BLEND);
+     SDL_SetRenderDrawColor(g_r, c.r, c.g, c.b, c.a);
+     SDL_FRect rc = { x, y, w, h };
+-    SDL_RenderFillRectF(g_r, &rc);
++    SDL_RenderFillRect(g_r, &rc);
+ }
+ 
+ /* nine-slice: corners from a texture of size 2r, edges and middle as plain rects */
+@@ -500,14 +502,16 @@ void gfx_texture(SDL_Texture *t, float x, float y, float w, float h, float alpha
+     SDL_SetTextureColorMod(t, 255, 255, 255);
+     SDL_SetTextureAlphaMod(t, (Uint8)(255 * clampf(alpha, 0, 1)));
+     SDL_FRect dst = { x, y, w, h };
+-    SDL_RenderCopyF(g_r, t, NULL, &dst);
++    SDL_RenderTexture(g_r, t, NULL, &dst);
+ }
+ 
+ float gfx_text_width(FontId f, const char *s)
+ {
+     int w = 0;
+-    if (g_fonts[f] && s[0])
+-        TTF_SizeUTF8(g_fonts[f], s, &w, NULL);
++    if (g_fonts[f] && s[0]) {
++        int h;
++        TTF_GetStringSize(g_fonts[f], s, 0, &w, &h);
++    }
+     return (float)w;
+ }
+ 
+@@ -517,7 +521,7 @@ float gfx_text(FontId f, const char *s, float x, float y, Align align, Color c)
+     if (!e)
+         return 0;
+     float left = align == ALIGN_CENTER ? x - e->w / 2.0f : align == ALIGN_RIGHT ? x - e->w : x;
+-    draw_tinted(e->tex, NULL, roundf(left), roundf(y - TTF_FontAscent(g_fonts[f])), e->w, e->h, c);
++    draw_tinted(e->tex, NULL, roundf(left), roundf(y - TTF_GetFontAscent(g_fonts[f])), e->w, e->h, c);
+     return (float)e->w;
+ }
+ 
+diff --git a/tool/src/gfx.h b/tool/src/gfx.h
+index d2f151c..bba0ab4 100644
+--- a/tool/src/gfx.h
++++ b/tool/src/gfx.h
+@@ -4,7 +4,7 @@
+ /* drawing helpers on top of SDL_Renderer. anti aliased shapes and icons get rasterized once into textures, text
+    goes through a small cache */
+ #pragma once
+-#include <SDL.h>
++#include <SDL3/SDL.h>
+ #include <stdbool.h>
+ 
+ typedef struct { Uint8 r, g, b, a; } Color;
+diff --git a/tool/src/main.c b/tool/src/main.c
+index 76d7002..c70c67e 100644
+--- a/tool/src/main.c
++++ b/tool/src/main.c
+@@ -27,8 +27,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+-#include <SDL.h>
+-#include <SDL_image.h>
++#include <SDL3/SDL.h>
++#include <SDL3_image/SDL_image.h>
+ #ifndef _WIN32
+ #define IMG_Load(p) IMG_Load(px(p))
+ #define IMG_SavePNG(s, p) IMG_SavePNG(s, px(p))
+@@ -323,7 +323,7 @@ static void load_game(Game *g, SDL_Renderer *r)
+         SDL_Surface *s = IMG_Load(p);
+         if (s) {
+             g->icon = SDL_CreateTextureFromSurface(r, s);
+-            SDL_FreeSurface(s);
++            SDL_DestroySurface(s);
+         }
+     }
+     game_file(p, sizeof p, g, EXE_SUFFIX);
+@@ -473,15 +473,16 @@ static int set_custom_icon(Game *g, const char *file)
+ {
+     SDL_Surface *s = IMG_Load(file);
+     if (!s) return 0;
+-    SDL_Surface *c = SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ABGR8888, 0);
+-    SDL_FreeSurface(s);
++    SDL_Surface *c = SDL_ConvertSurface(s, SDL_PIXELFORMAT_ABGR8888);
++    SDL_DestroySurface(s);
+     if (!c) return 0;
+     int side = c->w < c->h ? c->w : c->h;
+     SDL_Rect src = { (c->w - side) / 2, (c->h - side) / 2, side, side };
+-    SDL_Surface *d = SDL_CreateRGBSurfaceWithFormat(0, 256, 256, 32, SDL_PIXELFORMAT_ABGR8888);
++    SDL_Rect dst = { 0, 0, 256, 256 };
++    SDL_Surface *d = SDL_CreateSurface(256, 256, SDL_PIXELFORMAT_ABGR8888);
+     SDL_SetSurfaceBlendMode(c, SDL_BLENDMODE_NONE);
+-    SDL_BlitScaled(c, &src, d, NULL);
+-    SDL_FreeSurface(c);
++    SDL_BlitSurfaceScaled(c, &src, d, &dst, SDL_SCALEMODE_LINEAR);
++    SDL_DestroySurface(c);
+     char dir[MAX_PATH], p[MAX_PATH], o[MAX_PATH];
+     game_file(dir, sizeof dir, g, "_data");
+     CreateDirectoryA(dir, NULL);
+@@ -493,8 +494,8 @@ static int set_custom_icon(Game *g, const char *file)
+         else if (file_exists(p)) DeleteFileA(p);
+     }
+     snprintf(p, sizeof p, "%s\\icon.png", dir);
+-    int ok = IMG_SavePNG(d, p) == 0;
+-    SDL_FreeSurface(d);
++    int ok = IMG_SavePNG(d, p);
++    SDL_DestroySurface(d);
+     snprintf(o, sizeof o, "%s\\icon_custom", dir);
+     FILE *f = fopen(o, "w");
+     if (f) fclose(f);
+@@ -545,7 +546,7 @@ static struct {
+     int fd;
+ #endif
+     SDL_Thread *reader;
+-    SDL_mutex *lock;
++    SDL_Mutex *lock;
+     char pending[8192];
+     int npending;
+     int running, finished, ok, cancelled;
+@@ -1609,7 +1610,7 @@ static void list_draw(const Input *in)
+     gfx_rect(30, 88, 1220, 1, with_alpha(th->line, alpha));
+ 
+     SDL_Rect clip = { 0, LIST_Y - 8, SCREEN_W, 640 - LIST_Y };
+-    SDL_RenderSetClipRect(gfx_renderer(), &clip);
++    SDL_SetRenderClipRect(gfx_renderer(), &clip);
+     float off = L.top_y * ROW_H;
+     for (int i = 0; i < L.nrows; i++) {
+         const Row *r = &L.rows[i];
+@@ -1624,7 +1625,7 @@ static void list_draw(const Input *in)
+     float s = L.pop > 0.5f ? 0 : 3 * expf(-L.pop * 12) * cosf(L.pop * 24);
+     float y = L.sel_y + slide - off;
+     gfx_round_frame(LIST_X - 4 - s, y - 2 - s, LIST_W + 8 + 2 * s, ROW_H + 4 + 2 * s, 4, 5, with_alpha(pulse_color(), alpha));
+-    SDL_RenderSetClipRect(gfx_renderer(), NULL);
++    SDL_SetRenderClipRect(gfx_renderer(), NULL);
+ 
+     /* more rows below / above */
+     if (L.top + LIST_ROWS < L.nrows) gfx_text(FONT_HINT, "...", SCREEN_W / 2.0f, 636, ALIGN_CENTER, with_alpha(th->text_dim, alpha));
+@@ -1703,10 +1704,11 @@ static void progress_draw(const Input *in)
+ 
+ /* ------------------------------------------------------------------ input */
+ 
+-static void read_input(Input *in, float dt, SDL_GameController **pad)
++static void read_input(Input *in, float dt, SDL_Gamepad **pad)
+ {
+     static float hold[4];
+     static int held[4];
++    static int pad_a_held, pad_b_held, pad_start_held, pad_back_held, pad_opts_held;
+     int down[4] = { 0 };
+     float mx = in->mx, my = in->my;
+     memset(in, 0, sizeof *in);
+@@ -1715,18 +1717,18 @@ static void read_input(Input *in, float dt, SDL_GameController **pad)
+     SDL_Event e;
+     while (SDL_PollEvent(&e)) {
+         switch (e.type) {
+-        case SDL_QUIT: app.quit = 1; break;
+-        case SDL_MOUSEMOTION: in->mx = (float)e.motion.x; in->my = (float)e.motion.y; in->moved = 1; break;
+-        case SDL_MOUSEBUTTONDOWN:
++        case SDL_EVENT_QUIT: app.quit = 1; break;
++        case SDL_EVENT_MOUSE_MOTION: in->mx = e.motion.x; in->my = e.motion.y; in->moved = 1; break;
++        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+             in->mx = (float)e.button.x;
+             in->my = (float)e.button.y;
+             if (e.button.button == SDL_BUTTON_LEFT) in->click = 1;
+             if (e.button.button == SDL_BUTTON_RIGHT) in->rclick = 1;
+             if (e.button.button == SDL_BUTTON_X1) in->back = 1;
+             break;
+-        case SDL_MOUSEWHEEL: in->wheel += e.wheel.y; break;
+-        case SDL_KEYDOWN: {
+-            SDL_Keycode k = e.key.keysym.sym;
++        case SDL_EVENT_MOUSE_WHEEL: in->wheel += (int)e.wheel.y; break;
++        case SDL_EVENT_KEY_DOWN: {
++            SDL_Keycode k = e.key.key;
+             int dir = k == SDLK_LEFT ? 0 : k == SDLK_RIGHT ? 1 : k == SDLK_UP ? 2 : k == SDLK_DOWN ? 3 : -1;
+             if (dir >= 0) { if (!e.key.repeat) down[dir] = 1; }
+             else if (!e.key.repeat) {
+@@ -1736,33 +1738,57 @@ static void read_input(Input *in, float dt, SDL_GameController **pad)
+             }
+             break;
+         }
+-        case SDL_CONTROLLERDEVICEADDED:
+-            if (!*pad) *pad = SDL_GameControllerOpen(e.cdevice.which);
++        case SDL_EVENT_GAMEPAD_ADDED:
++            if (!*pad) *pad = SDL_OpenGamepad(e.gdevice.which);
+             break;
+-        case SDL_CONTROLLERBUTTONDOWN: {
+-            int b = e.cbutton.button;
+-            if (b == SDL_CONTROLLER_BUTTON_A) in->a = 1;
+-            if (b == SDL_CONTROLLER_BUTTON_B) in->b = 1;
+-            if (b == SDL_CONTROLLER_BUTTON_START || b == SDL_CONTROLLER_BUTTON_BACK) in->opts = 1;
+-            if (b == SDL_CONTROLLER_BUTTON_DPAD_LEFT) down[0] = 1;
+-            if (b == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) down[1] = 1;
+-            if (b == SDL_CONTROLLER_BUTTON_DPAD_UP) down[2] = 1;
+-            if (b == SDL_CONTROLLER_BUTTON_DPAD_DOWN) down[3] = 1;
++        case SDL_EVENT_GAMEPAD_REMOVED:
++            if (*pad && SDL_GetGamepadID(*pad) == e.gdevice.which) { SDL_CloseGamepad(*pad); *pad = NULL; }
++            break;
++        case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
++            int b = e.gbutton.button;
++            if (b == SDL_GAMEPAD_BUTTON_SOUTH) { if (!pad_a_held) in->a = 1; pad_a_held = 1; }
++            if (b == SDL_GAMEPAD_BUTTON_EAST) { if (!pad_b_held) in->b = 1; pad_b_held = 1; }
++            if (b == SDL_GAMEPAD_BUTTON_START) { if (!pad_opts_held) in->opts = 1; pad_start_held = pad_opts_held = 1; }
++            if (b == SDL_GAMEPAD_BUTTON_BACK) { if (!pad_opts_held) in->opts = 1; pad_back_held = pad_opts_held = 1; }
++            if (b == SDL_GAMEPAD_BUTTON_DPAD_LEFT) down[0] = 1;
++            if (b == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) down[1] = 1;
++            if (b == SDL_GAMEPAD_BUTTON_DPAD_UP) down[2] = 1;
++            if (b == SDL_GAMEPAD_BUTTON_DPAD_DOWN) down[3] = 1;
+             break;
+         }
++        case SDL_EVENT_GAMEPAD_BUTTON_UP:
++            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) pad_a_held = 0;
++            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) pad_b_held = 0;
++            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_START) pad_start_held = 0;
++            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) pad_back_held = 0;
++            pad_opts_held = pad_start_held || pad_back_held;
++            break;
+         }
+     }
+     /* held directions repeat like the HOME menu */
+-    const Uint8 *ks = SDL_GetKeyboardState(NULL);
++    const bool *ks = SDL_GetKeyboardState(NULL);
+     int now[4] = { ks[SDL_SCANCODE_LEFT], ks[SDL_SCANCODE_RIGHT], ks[SDL_SCANCODE_UP], ks[SDL_SCANCODE_DOWN] };
+     if (*pad) {
+-        const int bt[4] = { SDL_CONTROLLER_BUTTON_DPAD_LEFT, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, SDL_CONTROLLER_BUTTON_DPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_DOWN };
+-        int ax = SDL_GameControllerGetAxis(*pad, SDL_CONTROLLER_AXIS_LEFTX), ay = SDL_GameControllerGetAxis(*pad, SDL_CONTROLLER_AXIS_LEFTY);
++        int a = SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_SOUTH);
++        int b = SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_EAST);
++        int opts = SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_START) || SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_BACK);
++        if (a && !pad_a_held) in->a = 1;
++        if (b && !pad_b_held) in->b = 1;
++        if (opts && !pad_opts_held) in->opts = 1;
++        pad_a_held = a;
++        pad_b_held = b;
++        pad_start_held = SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_START);
++        pad_back_held = SDL_GetGamepadButton(*pad, SDL_GAMEPAD_BUTTON_BACK);
++        pad_opts_held = opts;
++        const int bt[4] = { SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN };
++        int ax = SDL_GetGamepadAxis(*pad, SDL_GAMEPAD_AXIS_LEFTX), ay = SDL_GetGamepadAxis(*pad, SDL_GAMEPAD_AXIS_LEFTY);
+         int st[4] = { ax < -20000, ax > 20000, ay < -20000, ay > 20000 };
+         for (int i = 0; i < 4; i++) {
+-            now[i] |= SDL_GameControllerGetButton(*pad, bt[i]) | st[i];
++            now[i] |= SDL_GetGamepadButton(*pad, (SDL_GamepadButton)bt[i]) | st[i];
+             if (st[i] && !held[i]) down[i] = 1;
+         }
++    } else {
++        pad_a_held = pad_b_held = pad_start_held = pad_back_held = pad_opts_held = 0;
+     }
+     int *out[4] = { &in->left, &in->right, &in->up, &in->down };
+     for (int i = 0; i < 4; i++) {
+@@ -1790,13 +1816,13 @@ static void splash_show(SDL_Renderer *ren, double secs)
+         for (int i = 0; i < SPLASH_W * SPLASH_H; i++) px[i] = 0x00FFFFFFu | ((Uint32)cov[i] << 24);
+         SDL_UpdateTexture(t, NULL, px, SPLASH_W * 4);
+         SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+-        SDL_SetTextureScaleMode(t, SDL_ScaleModeLinear);
++        SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
+         Uint64 t0 = SDL_GetPerformanceCounter();
+         double freq = (double)SDL_GetPerformanceFrequency(), fin = 0.25, vstart = secs * 0.7;
+         for (;;) {
+             SDL_Event ev;
+             int quit = 0;
+-            while (SDL_PollEvent(&ev)) if (ev.type == SDL_QUIT) { SDL_PushEvent(&ev); quit = 1; break; }
++            while (SDL_PollEvent(&ev)) if (ev.type == SDL_EVENT_QUIT) { SDL_PushEvent(&ev); quit = 1; break; }
+             double tt = (double)(SDL_GetPerformanceCounter() - t0) / freq;
+             if (quit || tt >= secs) break;
+             double al = 1.0, e = 0.0;
+@@ -1807,7 +1833,8 @@ static void splash_show(SDL_Renderer *ren, double secs)
+             int w = (int)(SCREEN_W * (1.0 + 0.06 * e)), h = (int)(SCREEN_H * (1.0 + 0.06 * e));
+             SDL_Rect d = { (SCREEN_W - w) / 2, (SCREEN_H - h) / 2, w, h };
+             SDL_SetTextureAlphaMod(t, (Uint8)(al * 255.0));
+-            SDL_RenderCopy(ren, t, NULL, &d);
++            SDL_FRect dst = { (float)d.x, (float)d.y, (float)d.w, (float)d.h };
++            SDL_RenderTexture(ren, t, NULL, &dst);
+             SDL_RenderPresent(ren);
+             SDL_Delay(5);
+         }
+@@ -1830,9 +1857,8 @@ int main(int argc, char **argv)
+         if (!strncmp(argv[i], "--screen=", 9)) shot_screen = atoi(argv[i] + 9);
+         if (!strncmp(argv[i], "--test-icon=", 12)) test_icon = argv[i] + 12;   /* checks: picture for game 0 */
+     }
+-    char *base = SDL_GetBasePath();
++    const char *base = SDL_GetBasePath();
+     snprintf(app.here, sizeof app.here, "%s", base ? base : ".\\");
+-    SDL_free(base);
+ #ifdef _WIN32
+     SetCurrentDirectoryA(app.here);
+     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+@@ -1842,8 +1868,7 @@ int main(int argc, char **argv)
+     signal(SIGPIPE, SIG_IGN);
+ #endif
+ 
+-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_AUDIO) < 0) {
++    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
+ #ifdef _WIN32
+         MessageBoxA(NULL, SDL_GetError(), "SwitchRecomp", MB_ICONERROR);
+ #else
+@@ -1851,9 +1876,10 @@ int main(int argc, char **argv)
+ #endif
+         return 1;
+     }
+-    SDL_Window *win = SDL_CreateWindow("SwitchRecomp v190", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, SCREEN_W, SCREEN_H, SDL_WINDOW_RESIZABLE);
+-    SDL_Renderer *ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC) : NULL;
+-    if (!ren && win) ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
++    SDL_Window *win = SDL_CreateWindow("SwitchRecomp v190", SCREEN_W, SCREEN_H, SDL_WINDOW_RESIZABLE);
++    SDL_Renderer *ren = win ? SDL_CreateRenderer(win, NULL) : NULL;
++    if (ren) SDL_SetRenderVSync(ren, 1);
++    if (!ren && win) ren = SDL_CreateRenderer(win, SDL_SOFTWARE_RENDERER);
+     char fonts[MAX_PATH];
+     path_join(fonts, sizeof fonts, app.here, "tool\\fonts\\");
+ #ifndef _WIN32
+@@ -1867,10 +1893,9 @@ int main(int argc, char **argv)
+ #endif
+         return 1;
+     }
+-    SDL_RenderSetLogicalSize(ren, SCREEN_W, SCREEN_H);
++    SDL_SetRenderLogicalPresentation(ren, SCREEN_W, SCREEN_H, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+     splash_show(ren, 2.0);
+-    IMG_Init(IMG_INIT_JPG | IMG_INIT_PNG);
+     J.lock = SDL_CreateMutex();
+ 
+     load_settings();
+@@ -1884,7 +1909,12 @@ int main(int argc, char **argv)
+     }
+     home_enter();
+ 
+-    SDL_GameController *pad = NULL;
++    SDL_Gamepad *pad = NULL;
++    int pad_count = 0;
++    SDL_JoystickID *pad_ids = SDL_GetGamepads(&pad_count);
++    for (int i = 0; pad_ids && i < pad_count && !pad; i++)
++        if (SDL_IsGamepad(pad_ids[i])) pad = SDL_OpenGamepad(pad_ids[i]);
++    SDL_free(pad_ids);
+     Input in;
+     memset(&in, 0, sizeof in);
+     in.mx = in.my = -1;
+@@ -1933,12 +1963,8 @@ int main(int argc, char **argv)
+         else { progress_update(&in, dt); progress_draw(&in); }
+         if (D.open) dialog_draw();
+         if (shot && ++frames == 90) {
+-            int w, h;
+-            SDL_GetRendererOutputSize(ren, &w, &h);
+-            SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+-            SDL_RenderReadPixels(ren, NULL, SDL_PIXELFORMAT_ARGB8888, s->pixels, s->pitch);
+-            SDL_SaveBMP(s, shot);
+-            SDL_FreeSurface(s);
++            SDL_Surface *s = SDL_RenderReadPixels(ren, NULL);
++            if (s) { SDL_SaveBMP(s, shot); SDL_DestroySurface(s); }
+             break;
+         }
+         SDL_RenderPresent(ren);
+@@ -1946,7 +1972,6 @@ int main(int argc, char **argv)
+     if (J.running) job_cancel();
+     unload_games();
+     music_close();
+-    IMG_Quit();
+     gfx_exit();
+     SDL_DestroyRenderer(ren);
+     SDL_DestroyWindow(win);
+diff --git a/tool/src/music.c b/tool/src/music.c
+index 616c31d..6d4e2f1 100644
+--- a/tool/src/music.c
++++ b/tool/src/music.c
+@@ -1,5 +1,5 @@
+ /* SwitchRecomp by MZ Labs, Copyright 2026 MZ Labs. AGPL-3.0, see LICENSE.txt and NOTICE.txt. the decoders in audio_decode/ keep their own licenses */
+-#include <SDL.h>
++#include <SDL3/SDL.h>
+ #include <math.h>
+ #include <string.h>
+ #include <stdlib.h>
+@@ -9,16 +9,27 @@
+ #define DR_MP3_IMPLEMENTATION
+ #include "audio_decode/dr_mp3.h"
+ #include "audio_decode/stb_vorbis.c"
+-static SDL_AudioDeviceID device;
++static SDL_AudioStream* device;
+ static float* samples;
+ static size_t count,cursor;
+ static float gain=.25f;
+ static int playing;
+ static char loaded[4096],music_err[256];
+-static void callback(void* user,Uint8* stream,int len){
+-    (void)user; float* dst=(float*)stream; int n=len/(int)sizeof(float);
+-    if(!playing || !count){ memset(stream,0,len); return; }
+-    for(int i=0;i<n;i++){ float x=samples[cursor++]*gain; if(cursor==count) cursor=0; dst[i]=isfinite(x)?fmaxf(-1,fminf(1,x)):0; }
++static void callback(void* user, SDL_AudioStream* stream, int amount, int total){
++    (void)user; (void)total;
++    float buffer[2048];
++    while(amount > 0){
++        int bytes=amount>(int)sizeof buffer?(int)sizeof buffer:amount;
++        int n=bytes/(int)sizeof(float);
++        for(int i=0;i<n;i++){
++            float x=0;
++            if(playing && count){ x=samples[cursor++]*gain; if(cursor==count) cursor=0; }
++            buffer[i]=isfinite(x)?fmaxf(-1,fminf(1,x)):0;
++        }
++        if(!SDL_PutAudioStreamData(stream,buffer,n*(int)sizeof(float))) break;
++        amount-=n*(int)sizeof(float);
++        if(n==0) break;
++    }
+ }
+ const char* music_error(void){ return music_err; }
+ int music_load(const char* path){
+@@ -34,21 +45,23 @@ int music_load(const char* path){
+         free(pcm);
+     }
+     if(!decoded || !frames || !channels || channels>8 || !rate || frames*channels>0x1fffffff){ free(decoded); SDL_strlcpy(music_err,"Invalid or unsupported WAV, OGG or MP3.",sizeof music_err); return 0; }
+-    SDL_AudioStream* convert=SDL_NewAudioStream(AUDIO_F32SYS,(Uint8)channels,(int)rate,AUDIO_F32SYS,2,48000);
++    SDL_AudioSpec src={ .format=SDL_AUDIO_F32, .channels=(int)channels, .freq=(int)rate };
++    SDL_AudioSpec dst={ .format=SDL_AUDIO_F32, .channels=2, .freq=48000 };
++    SDL_AudioStream* convert=SDL_CreateAudioStream(&src,&dst);
+     int bytes=(int)(frames*channels*sizeof(float));
+-    if(!convert || SDL_AudioStreamPut(convert,decoded,bytes)<0 || SDL_AudioStreamFlush(convert)<0){ free(decoded); if(convert) SDL_FreeAudioStream(convert); SDL_strlcpy(music_err,SDL_GetError(),sizeof music_err); return 0; }
+-    free(decoded); int size=SDL_AudioStreamAvailable(convert); float* pcm=size>0?malloc((size_t)size):NULL;
+-    if(!pcm || SDL_AudioStreamGet(convert,pcm,size)!=size){ free(pcm); SDL_FreeAudioStream(convert); SDL_strlcpy(music_err,"Could not convert the music file.",sizeof music_err); return 0; }
+-    SDL_FreeAudioStream(convert);
+-    if(!device){ SDL_AudioSpec want={0}; want.freq=48000; want.format=AUDIO_F32SYS; want.channels=2; want.samples=1024; want.callback=callback;
+-        device=SDL_OpenAudioDevice(NULL,0,&want,NULL,0); if(!device){ free(pcm); SDL_strlcpy(music_err,SDL_GetError(),sizeof music_err); return 0; }}
+-    SDL_LockAudioDevice(device); free(samples); samples=pcm; count=(size_t)size/sizeof(float); cursor=0; SDL_strlcpy(loaded,path,sizeof loaded); SDL_UnlockAudioDevice(device);
+-    SDL_PauseAudioDevice(device,0); music_err[0]=0; return 1;
++    if(!convert || !SDL_PutAudioStreamData(convert,decoded,bytes) || !SDL_FlushAudioStream(convert)){ free(decoded); if(convert) SDL_DestroyAudioStream(convert); SDL_strlcpy(music_err,SDL_GetError(),sizeof music_err); return 0; }
++    free(decoded); int size=SDL_GetAudioStreamAvailable(convert); float* pcm=size>0?malloc((size_t)size):NULL;
++    if(!pcm || SDL_GetAudioStreamData(convert,pcm,size)!=size){ free(pcm); SDL_DestroyAudioStream(convert); SDL_strlcpy(music_err,"Could not convert the music file.",sizeof music_err); return 0; }
++    SDL_DestroyAudioStream(convert);
++    if(!device){ SDL_AudioSpec want={ .freq=48000, .format=SDL_AUDIO_F32, .channels=2 };
++        device=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&want,callback,NULL); if(!device){ free(pcm); SDL_strlcpy(music_err,SDL_GetError(),sizeof music_err); return 0; }}
++    SDL_LockAudioStream(device); free(samples); samples=pcm; count=(size_t)size/sizeof(float); cursor=0; SDL_strlcpy(loaded,path,sizeof loaded); SDL_UnlockAudioStream(device);
++    SDL_ResumeAudioStreamDevice(device); music_err[0]=0; return 1;
+ }
+ void music_config(const char* path,int enabled,float volume){
+     if(enabled && path && path[0] && !music_load(path)) enabled=0;
+-    if(device) SDL_LockAudioDevice(device);
++    if(device) SDL_LockAudioStream(device);
+     playing=enabled; gain=isfinite(volume)?fmaxf(0,fminf(1,volume)):0;
+-    if(device) SDL_UnlockAudioDevice(device);
++    if(device) SDL_UnlockAudioStream(device);
+ }
+-void music_close(void){ if(device) SDL_CloseAudioDevice(device); device=0; free(samples); samples=NULL; count=cursor=0; loaded[0]=0; }
++void music_close(void){ if(device) SDL_DestroyAudioStream(device); device=NULL; free(samples); samples=NULL; count=cursor=0; loaded[0]=0; }

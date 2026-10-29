@@ -1,0 +1,47 @@
+SwitchRecomp v190 - MZ Labs
+
+INSTALL
+Unzip over your SwitchRecomp folder, open SwitchRecomp.exe and hit Update all games.
+GCC is still a separate download. TCC and Python come in the package.
+
+INTERFACE
+The alternate console theme is gone.
+Settings has background music now: pick a WAV, OGG or MP3 file, turn it on or off and set the volume.
+The music is decoded on your PC and loops. No music files come with the package.
+tool/build_tool.bat and build_tool.sh rebuild SwitchRecomp.exe with GCC.
+
+AUDIO
+Games have sound now. audren mixes PCM and DSP-ADPCM voices, audout streams PCM16 (Celeste, Brawlhalla),
+5.1 gets mixed down to stereo, and the output goes through waveOut on Windows and SDL3 on Linux.
+F7 records the sound to a .wav next to the .mp4, on the same clock as the video.
+Some effects, biquad filters and surround virtualization aren't done yet.
+
+GRAPHICS
+1 pixel high/wide render targets stay at native size (the Odyssey table artifacts), scale is per render target.
+Clear rect, scissor and viewport clip flags are separate like on hardware.
+Render enable modes and render override, conditional clears included.
+
+CRASHES
+Xenoblade titles get extra game memory automatically. Game memory can also be set in each game's options.
+
+LATER V190 BUILDS
+Intel on Windows: shaders compile in a second copy of the runtime (a helper process). When the Intel driver crashes
+on one of Odyssey's vertex shaders only the helper closes, a new one starts and tries a simpler version of that
+shader (no precise/invariant). The game keeps running instead of freezing and closing with "The video driver crashed".
+shader_process=1 in the game's ini turns it on for other GPUs, shader_process=0 turns it off.
+Odyssey: the bloom levels are read from their own render targets also when those are wider than the level (they're
+rounded up to 16 pixels). That path used to copy the levels, which came out as garbage on some GPUs: blue screen on
+some, a black screen with only the HUD on others.
+shadows=0 clears the skipped shadow maps to the right "far" value for games with reversed depth (Sonic Frontiers was
+almost black with shadows=0).
+F5 traces: the first line says the GPU, driver and render scale, and the values of small textures (exposure, LUTs)
+are read correctly now (they all read 0 before).
+Linux: SwitchRecomp-v190-x86_64.AppImage. It unpacks itself into ~/.local/share/SwitchRecomp the first time.
+
+LICENSE AND STARTUP SCREEN
+SwitchRecomp is now under the GNU AGPL v3 (LICENSE.txt) with additional terms in NOTICE.txt.
+The recompiler shows the SwitchRECOMP startup screen for 2 seconds and every recompiled game for 1 second (it
+vanishes at the end): white logo on black with the copyright notice in the corner. Under NOTICE.txt, copies and
+forks have to keep it.
+The Launcher is gone, the recompiler already does everything it did.
+Android (APK builds, touch controls, the GLES renderer) is gone from the code.
