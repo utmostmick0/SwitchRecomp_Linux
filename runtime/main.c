@@ -7,7 +7,7 @@
 /* the runtime version goes in every log, so you can tell a crash report from an old or third party build by the
    first line */
 #ifndef SWR_RUNTIME_VERSION
-#define SWR_RUNTIME_VERSION "v190-sonic-cbuf"
+#define SWR_RUNTIME_VERSION "v200-romfs-scan-index"
 #endif
 const char* g_runtime_version=SWR_RUNTIME_VERSION;
 #include "rt.h"
@@ -234,7 +234,7 @@ static const IniOpt INI_GRAPHICS[]={
 
 static const IniOpt INI_PERF[]={
   {"fps_target","60","Experimental: 30 or 20 = draw only every 2nd / 3rd frame, the game keeps its normal speed (less GPU work,\n;   effects updated on skipped frames can flicker). 120 = frame generation x2 (needs Lossless.dll, see lsfg). 60 = normal"},
-  {"fps_limit","1","1 = 60 FPS, 30 = cap displayed frames at 30 while the game keeps its 60 Hz update rate, 0 = unlimited. F4 toggles between 60 and unlimited"},
+  {"fps_limit","1","1 = 60 FPS, 30 = cap displayed frames at 30 while the game keeps its 60 Hz update rate, 0 = unlimited. F4 cycles 60 / 30 / unlimited"},
   {"forced_vsync","0","1 = always wait for vsync (can lower FPS a lot on slow PCs)"},
   {"null_trap","0","1 = a write through a NULL pointer stops the game with a precise log (diagnostics; 0 = normal)"},
   {"memory_gb","0","Memory the game sees: 0 = automatic (3.2 GB like the console, more for games that need it,\n;   e.g. Tears of the Kingdom), 4 = console (3.2 GB), 6 or 8 = extended (like yuzu's extended memory layout)"},
@@ -510,6 +510,17 @@ int audren_update(SvcObj* o, IpcCtx* c){
       LOG("audren: input strides voice %#x effect %#x, sinks %u (input %u bytes)\n",vstride,estride,nsinks,ih[7]); } }
   u8* p=in+0x40+behav;
   u8* pools_in=p; p+=mp; u8* resources_in=p; p+=vr; u8* voices_in=p; p+=vo; u8* eff_in=p;
+  u8* mixes_in=eff_in+ef; u8* sinks_in=mixes_in+ih[6];
+  u32 splitter_size=0; const u8* splitter_in=NULL;
+  if((u64)(mixes_in-in)+4<=is){
+    u32 magic; memcpy(&magic,mixes_in,4);
+    if(magic==0x48444e53){
+      u64 total=ih[15]?ih[15]:is,tail=(u64)ih[6]+ih[7]+ih[8]+ih[10];
+      if(total>is || total<(u64)(mixes_in-in) || tail>total-(u64)(mixes_in-in)) return RC(153,4);
+      splitter_in=mixes_in; mixes_in=in+total-tail;
+      splitter_size=(u32)(mixes_in-splitter_in); sinks_in=mixes_in+ih[6];
+    }
+  }
   if(nvoices>4096 || npools>4096 || neff>4096 || nsinks>64) return RC(153,4);
   int eff_v2 = revn>=9;
   u32 o_mp=npools*0x10, o_vo=nvoices*0x10, o_ef=neff*(eff_v2? 0x90 : 0x10), o_sk=nsinks*0x20, o_pf=0x10, o_bh=0xB0, o_ri= revn>=5? 0x10 : 0;
@@ -520,6 +531,9 @@ int audren_update(SvcObj* o, IpcCtx* c){
     LOG("audren: REV%d header in: %x %x %x %x %x %x %x %x %x %x %x  counts: pools %u voices %u effects %u sinks %u\n",revn,ih[0],ih[1],ih[2],ih[3],ih[4],ih[5],ih[6],ih[7],ih[8],ih[9],ih[10],npools,nvoices,neff,nsinks);
     if(o->data){ const u32* pp=(const u32*)o->data; LOG("audren: params %x %x %x %x %x %x %x %x %x %x %x %x %x\n",pp[0],pp[1],pp[2],pp[3],pp[4],pp[5],pp[6],pp[7],pp[8],pp[9],pp[10],pp[11],pp[12]); }
     return RC(153,4); }
+  u32 splitter_count=0,destination_count=0;
+  if(o->data){ memcpy(&splitter_count,(u8*)o->data+0x24,4); memcpy(&destination_count,(u8*)o->data+0x28,4); }
+  if(!swr_audio_configure_splitters(o,splitter_in,splitter_size,splitter_count,destination_count)) return RC(153,4);
   static int said; if(!said){ said=1; LOG("audren: REV%d, %u pools, %u voices, %u effects, %u sinks\n",revn,npools,nvoices,neff,nsinks); }
   memset(out,0,oh[15]); memcpy(out,oh,64);
   u8* q=out+0x40;
@@ -568,17 +582,22 @@ int audren_update(SvcObj* o, IpcCtx* c){
   float pcm[SWR_AUDIO_FRAMES*2];
   for(unsigned block=0;block<blocks;block++){
     int active=swr_audio_mix(o,block && continuation?continuation:voices_in,nvoices,vstride,resources_in,vr,
-        eff_in+ef,ih[6],eff_in+ef+ih[6],ih[7],q,pcm);
+        mixes_in,ih[6],sinks_in,ih[7],q,pcm);
     o->u[7]=(u64)active;
     if(o->u[3]==0){ swr_audio_submit_at(pcm,SWR_AUDIO_FRAMES,block_end); o->u[6]+=5000000ull; block_end+=5000000ull; }
   }
   free(continuation);
-  {extern void audren_signal_ready(int); audren_signal_ready(o->u[3]==0 && o->u[6]<=guest_ns()); }
   q+=o_vo;
   /* effects: Enabled(3) / Disabled(4) */
   for(u32 i=0;i<neff;i++){ u8 en=eff_in[i*estride+2]; q[i*(eff_v2?0x90:0x10)]= en? 3 : 4; }
   q+=o_ef; q+=o_sk; q+=o_pf; q+=o_bh;
-  if(o_ri){ u64 frames=o->u[5]++; memcpy(q,&frames,8); }
+  if(o->u[3]==0) o->u[5]+=blocks;
+  if(o_ri){ u64 frames=o->u[5]; memcpy(q,&frames,8); }
+  /* Publish status/timeline bytes before notifying the guest's completion waiter. */
+  { extern void audren_signal_ready(int); extern void audren_notify_update(SvcObj*);
+    audren_signal_ready(o->u[3]==0 && o->u[6]<=guest_ns());
+    audren_notify_update(o);
+  }
   return 0;
 }
 
@@ -594,6 +613,8 @@ static u8* read_file_all(const char* path, u64* size){
 
 static u32 bswap32_(u32 v){ return (v>>24)|((v>>8)&0xFF00)|((v<<8)&0xFF0000)|(v<<24); }
 
+#include "font_buttons.h"
+
 static u8* font_fallback(u64* size){
   const char* cands[8]; int n=0; char w1[512], w2[512], w3[512];
 #if defined(_WIN32)
@@ -604,7 +625,9 @@ static u8* font_fallback(u64* size){
   (void)w1; (void)w2; (void)w3;
   cands[n++]="/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"; cands[n++]="/usr/share/fonts/TTF/DejaVuSans.ttf"; cands[n++]="/usr/share/fonts/truetype/freefont/FreeSans.ttf";
 #endif
-  for(int i=0;i<n;i++){ u8* d=read_file_all(cands[i],size); if(d){ LOG("pl: system font -> %s\n",cands[i]); return d; } }
+  for(int i=0;i<n;i++){ u8* d=read_file_all(cands[i],size); if(d){ size_t patched_size=0; u8* patched=font_button_aliases(d,(size_t)*size,&patched_size);
+      if(patched){ free(d); d=patched; *size=patched_size; }
+      LOG("pl: system font -> %s (%s button aliases)\n",cands[i],patched?"with":"without"); return d; } }
   return NULL; }
 
 static void fonts_fill(u8* shm, u64 cap){

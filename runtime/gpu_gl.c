@@ -882,6 +882,7 @@ static ShA sha[4096]; static u64 st_sh_fast;
 static int g_sh_bind; static u32* g_last_r3d; static u32 g_gs_input_vertices;
 static int sh_cb_read(u32 idx, u32 off, u32* out);
 static void sh_dump_cbs(u64 h);
+static u32 g_fs_t3d, g_fs_tar;
 static u32 g_fs_rtk, g_fs_rtm, g_fs_rts;   /* FS integer output key */
 static void aw_write(const char* path, const void* d, size_t n, int append);
 static GLenum shader_gl_type(int stage){
@@ -921,8 +922,10 @@ static char* sh_post(char* src, int stage){
 static Sh* shader_get(u64 gva_code, int stage, u32 attr_int, u32 attr_sint){
   st_shaders++; g_sh_bind= stage==ST_VS? 0 : stage==ST_GS? 3 : 4; g_shader_cb_read=sh_cb_read; /* BRX table is only used to mark targets, length doesn't change */
   u32 key2= stage==ST_VS? (attr_int^(attr_sint*31)^((g_last_r3d && (g_last_r3d[0x840]&1))? 0xA341316Cu : 0)) : stage==ST_GS? (g_gs_input_vertices*0x85EBCA6Bu) : (attr_int*0x9E3779B1u ^ attr_sint*0x85EBCA6Bu ^ g_fs_rtk);
+  u32 tex3d=stage==ST_FS?g_fs_t3d:0; key2^=tex3d*0xD168AAADu;
+  u32 texarr=stage==ST_FS?g_fs_tar:0; key2^=texarr*0xA24BAED5u;
   ShA* ca=&sha[(u32)((gva_code>>6)^(gva_code>>18)^((u64)key2*0x9E3779B1u)^((u32)stage<<11))&4095];
-  if(ca->s && ca->gva==gva_code && ca->stage==stage && ca->key2==key2){
+  if(ca->s && ca->gva==gva_code && ca->stage==stage && ca->key2==key2 && ca->s->si.tex_3d_mask==tex3d && ca->s->si.tex_array_mask==texarr){
     if(ca->epoch==g_submit_epoch){ st_sh_fast++; return ca->s; }
     Sh* s=ca->s;
     /* write tracking says nothing touched the code since the last check, so no need to hash it again (hashing
@@ -935,12 +938,12 @@ static Sh* shader_get(u64 gva_code, int stage, u32 attr_int, u32 attr_sint){
   u8* code=gmem_ptr(gva_code,0x10000); u8* tmp=NULL;
   if(!code){ tmp=malloc(0x10000); gmem_read(gva_code,tmp,0x10000); code=tmp; }
   u32 len; u64 h=shader_hash(code,0x10000,&len);
-  for(Sh* s=shh[h&1023];s;s=s->next) if(s->hash==h && s->stage==stage && s->key2==key2){
+  for(Sh* s=shh[h&1023];s;s=s->next) if(s->hash==h && s->stage==stage && s->key2==key2 && s->si.tex_3d_mask==tex3d && s->si.tex_array_mask==texarr){
     ca->gva=gva_code; ca->key2=key2; ca->stage=stage; ca->epoch=g_submit_epoch; ca->chk=g_submit_epoch; ca->cpu=gmmu_translate(gva_code); ca->s=s; free(tmp); return s; }
   Sh* s=calloc(1,sizeof *s); s->hash=h; s->stage=stage; s->key2=key2; st_sh_new++;
   s->clen=len; s->qh=fast_hash(code,len,0);
   ca->gva=gva_code; ca->key2=key2; ca->stage=stage; ca->epoch=g_submit_epoch; ca->chk=g_submit_epoch; ca->cpu=gmmu_translate(gva_code); ca->s=s;
-  if(stage==ST_FS){ s->si.tex_int_mask=attr_int; s->si.tex_sint_mask=attr_sint; s->si.rt_int_mask=g_fs_rtm; s->si.rt_sint_mask=g_fs_rts; }
+  if(stage==ST_FS){ s->si.tex_array_mask=texarr; s->si.tex_3d_mask=tex3d; s->si.tex_int_mask=attr_int; s->si.tex_sint_mask=attr_sint; s->si.rt_int_mask=g_fs_rtm; s->si.rt_sint_mask=g_fs_rts; }
   else { s->si.attr_int_mask=attr_int; s->si.attr_sint_mask=attr_sint; }
   if(stage==ST_GS) s->si.gs_input_vertices=g_gs_input_vertices;
   char* src=shader_to_glsl(code,0x10000,stage,&s->si);
@@ -2075,21 +2078,25 @@ static Sh* fs_get_keyed(GpuChannel* ch, u64 addr){
     valid_fb=1;
     GlFmt f=rt_format(rt[4]); if(f.is_int){ rm|=1u<<i; if(ifmt_signed(f.ifmt)) rs|=1u<<i; } }
   if(r[0x54E]){ u64 za=((u64)r[0x3F8]<<32)|r[0x3F9]; if(rt_descriptor_active(za,r[0x48A],r[0x48B])) valid_fb=1; }
-  g_fs_rtk=0; g_fs_rtm=0; g_fs_rts=0;
+  g_fs_t3d=0; g_fs_tar=0; g_fs_rtk=0; g_fs_rtm=0; g_fs_rts=0;
   Sh* s0=shader_get(addr,ST_FS,0,0); if(!s0) return s0;
   /* Don't resolve sampler TICs against an intermediate draw packet with no
      committed, addressable framebuffer descriptor. The draw flush path runs
      after MME register emission, so complete descriptors are visible here. */
   if(!valid_fb) return s0;
-  u32 tm=0, ts=0; int nt=s0->si.ntex; if(nt>32) nt=32;
+  u32 tm=0, ts=0, t3d=0, tar=0; int nt=s0->si.ntex; if(nt>32) nt=32;
   if(nt){ u32 tcb=r[0x982]; u64 tic_base=((u64)r[0x55D]<<32)|r[0x55E]; u64 cba=g_cb.cb[4][tcb&31]; g_tic_base=tic_base; g_tic_lim=r[0x55F];
     for(int i=0;i<nt;i++){ ShTex* st=&s0->si.tex[i]; if(st->shadow) continue; u32 handle=sh_tex_handle(4,tcb,st); (void)cba;
       u32 tic[8]; gmem_read(tic_base+(handle&0xFFFFF)*32ull,tic,32); u32 ty=(tic[0]>>7)&7;
       u64 tt0=plat_ns(); Tex* t=tex_from_tic(tic); g_fsk_tex_ns+=plat_ns()-tt0;   /* texture loads: counted as textures, not shaders */
+      if(st->can_3d && t && t->target==GL_TEXTURE_3D && ((tic[4]>>23)&0xF)==2) t3d|=1u<<i;
+      /* TIC 5 is 2D array. A non-array instruction has no layer operand:
+         specialize only a single-layer descriptor, preserving its x/y tuple. */
+      if(st->can_3d && t && t->d==1 && t->target==GL_TEXTURE_2D_ARRAY && ((tic[4]>>23)&0xF)==5) tar|=1u<<i;
       if(t? t->f.is_int : (ty==3 || ty==4)){ tm|=1u<<i; if((t && ifmt_signed(t->f.ifmt)) || (!t && ty==3)) ts|=1u<<i; } } }
-  rm&=s0->si.sph[18]? 0xFF : 0; if(!tm && !rm) return s0;
-  g_fs_rtm=rm; g_fs_rts=rs; g_fs_rtk=rm*0x27D4EB2Fu ^ rs*0x165667B1u ^ 0x5A5A0000u;
-  Sh* s=shader_get(addr,ST_FS,tm,ts); g_fs_rtk=0; g_fs_rtm=0; g_fs_rts=0; return s; }
+  rm&=s0->si.sph[18]? 0xFF : 0; if(!tm && !rm && !t3d && !tar) return s0;
+  g_fs_tar=tar; g_fs_t3d=t3d; g_fs_rtm=rm; g_fs_rts=rs; g_fs_rtk=rm*0x27D4EB2Fu ^ rs*0x165667B1u ^ 0x5A5A0000u;
+  Sh* s=shader_get(addr,ST_FS,tm,ts); g_fs_t3d=0; g_fs_tar=0; g_fs_rtk=0; g_fs_rtm=0; g_fs_rts=0; return s; }
 
 /* transparent 0,0,0,0 for bad TICs, an empty GL unit gives opaque black */
 static GLuint null_tex(GLenum tg){
@@ -2272,12 +2279,12 @@ static u64 sample_hash(u64 gva, u64 len){
 
 static int g_nosample=-1;
 static void vbc_delta_free(VbC* e){ if(e->mirror){ free(e->mirror); e->mirror=NULL; if(g_vbc_mirror_bytes>=e->len) g_vbc_mirror_bytes-=e->len; else g_vbc_mirror_bytes=0; } }
-/* Compare in 64 KiB blocks, aligned to a vertex's stride when available. Dense
-   changes switch to one full transfer after half the range is dirty; sparse
-   blocks are refined to stride-sized runs before sub-range upload. */
+/* Skip unchanged blocks, then compare actual vertex rows. A changed byte in
+   each coarse block must not turn a sparse interleaved update into a full
+   upload. Consecutive changed rows share one transfer; cache identity stays. */
 static int vbc_delta_upload(GLenum target, VbC* e, const u8* src, u32 stride){
   const u64 base_block=(64u<<10);
-  u64 gran=stride && stride<=4096? stride : base_block;
+  u64 gran=stride && stride<=4096? stride : 1;
   u64 block=base_block-(base_block%gran); if(!block) block=gran;
   if(e->len>SIZE_MAX) return 0;
   if(!e->mirror){
@@ -2292,20 +2299,18 @@ static int vbc_delta_upload(GLenum target, VbC* e, const u8* src, u32 stride){
     e->hash=~0ull; st_vb_hashed+=e->len; st_vb_up+=e->len; e->stable=0; return 1;
   }
   st_vb_hashed+=e->len;
-  u64 changed=0;
-  for(u64 off=0;off<e->len;off+=block){ u64 n=e->len-off; if(n>block) n=block;
-    if(memcmp(e->mirror+off,src+off,(size_t)n)){ changed+=n;
-      if(changed>=e->len/2){ glBufferSubData(target,0,(GLsizeiptr)e->len,src); memcpy(e->mirror,src,(size_t)e->len); st_vb_up+=e->len; e->hash=~0ull; e->stable=0; return 1; } } }
-  if(!changed){ if(e->stable<100000) e->stable++; return 1; }
+  int changed=0;
   u64 run=~0ull, end=0;
   for(u64 bo=0;bo<e->len;bo+=block){ u64 bn=e->len-bo; if(bn>block) bn=block;
     if(!memcmp(e->mirror+bo,src+bo,(size_t)bn)){ if(run!=~0ull){ glBufferSubData(target,(GLintptr)run,(GLsizeiptr)(end-run),src+run); memcpy(e->mirror+run,src+run,(size_t)(end-run)); st_vb_up+=end-run; run=~0ull; } continue; }
     for(u64 off=bo;off<bo+bn;off+=gran){ u64 n=bo+bn-off; if(n>gran) n=gran;
       if(!memcmp(e->mirror+off,src+off,(size_t)n)){ if(run!=~0ull){ glBufferSubData(target,(GLintptr)run,(GLsizeiptr)(end-run),src+run); memcpy(e->mirror+run,src+run,(size_t)(end-run)); st_vb_up+=end-run; run=~0ull; } }
-      else { if(run==~0ull) run=off; end=off+n; } }
+      else { changed=1; if(run==~0ull) run=off; end=off+n; } }
   }
   if(run!=~0ull){ glBufferSubData(target,(GLintptr)run,(GLsizeiptr)(end-run),src+run); memcpy(e->mirror+run,src+run,(size_t)(end-run)); st_vb_up+=end-run; }
-  e->hash=~0ull; e->stable=0; return 1;
+  if(changed){ e->hash=~0ull; e->stable=0; }
+  else if(e->stable<100000) e->stable++;
+  return 1;
 }
 /* range fully inside a compute result that didn't land in guest memory yet: copy gpu to gpu instead of waiting,
    reading back and uploading again (SMO particles hit this every frame) */
@@ -3194,19 +3199,21 @@ static void gpu_evict_step(void){
   if(vany) g_va_inval=1; }
 
 static int present_addr(u64 cpu_addr, int w, int h){
+  /* The presentation shader samples sampler2D; array/cube targets cannot be bound as 2D. */
   /* find the RT whose gva maps this memory */
   Tex* best=NULL; int best_exact=0;
-  for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && gmmu_translate(t->gva)==cpu_addr){
+  for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && t->id && t->target==GL_TEXTURE_2D && !t->f.depth && !t->f.is_int && gmmu_translate(t->gva)==cpu_addr){
     int exact=t->w==(u32)w && t->h==(u32)h;
     if(!best || (exact && !best_exact) || (exact==best_exact && t->last_used>best->last_used)){ best=t; best_exact=exact; } }
   int dimension_fallback=0;
-  if(!best && w>0 && h>0){
+  if(!best_exact && w>0 && h>0){
     /* Presentation descriptors can use an address alias that differs from the
        render-target cache key. Reuse the most recently used exact-layout RT. */
-    for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && t->w==(u32)w && t->h==(u32)h){
-      if(!best || t->last_used>best->last_used) best=t;
+    Tex* layout=NULL;
+    for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && t->id && t->target==GL_TEXTURE_2D && !t->f.depth && !t->f.is_int && t->w==(u32)w && t->h==(u32)h){
+      if(!layout || t->last_used>layout->last_used) layout=t;
     }
-    dimension_fallback=best!=NULL;
+    if(layout){ best=layout; dimension_fallback=1; }
   }
   trace_note("PRESENT %llx %dx%d -> %s %llx tex=%u %ux%u exact=%d dimension_fallback=%d\n",(unsigned long long)cpu_addr,w,h,best?"rt":"(none, CPU)",(unsigned long long)(best?best->gva:0),best?best->id:0,best?best->w:0,best?best->h:0,best_exact,dimension_fallback);
   if(dimension_fallback){ static int said; if(said<4){ said++; LOG("gpu: presentation address %llx did not match a render target; remapping to latest %ux%u target gva=%llx tex=%u\n",(unsigned long long)cpu_addr,(u32)w,(u32)h,(unsigned long long)best->gva,best->id); } }
@@ -3683,8 +3690,11 @@ static void cs_release_held(void){
   extern void syncpt_incr(u32 id); extern void gpu_sem_reduce(u64,u32,u32,int);
   for(int i=0;i<g_cs_nincs;i++){ CsHeld* h=&g_cs_incs[i];
     if(h->kind==0) for(u32 k=0;k<h->n;k++) syncpt_incr(h->id);
-    else if(h->kind==1) gmem_write(h->addr,h->data,h->len);
-    else gpu_sem_reduce(h->addr,h->id,h->n,h->len); }
+    else {
+      if(h->kind==1) gmem_write(h->addr,h->data,h->len);
+      else gpu_sem_reduce(h->addr,h->id,h->n,h->len);
+      if(h->addr==0x500000000ull) plat_yield();
+    } }
   g_cs_nincs=0; }
 
 /* next free slot while something is in flight. still full after a timeout: let go of what's held instead of writing

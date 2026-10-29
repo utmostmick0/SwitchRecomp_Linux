@@ -404,3 +404,11 @@ The cumulative beta patch is `patches/milestone-032-main-to-beta.patch`.
 - Mirrored the kernel change and note to flatpack. Rebuilt beta's `bin/runtime_linux_x11`; a new SMW run is needed to assess the stall.
 
 The cumulative beta patch is `patches/milestone-033-main-to-beta.patch`.
+
+## Milestone 034 — Shader dimensions and audio completion
+
+- Compatible TIC type 2 fragment texture bindings now select separately cached sampler3D variants with matching vec3/ivec3 coordinates. Ordinary and packed TEX/TLD forms have focused GLSL-generation tests.
+- RequestUpdate publishes status/timeline output before signaling successful running-update completion. Renderer-info counters advance by rendered quanta, not IPC calls, and hold while stopped. SMO progressed from zero draws to 508 frames in the isolated startup test; XC2 reached 259 frames with no texture-type mismatch.
+- Linux Vulkan output retains OpenGL rendering plus staged Xlib presentation, explicit readback-state handling, and shared extent validation for creation/recreation.
+- Runtime v195-audio-completion is staged for seven games. Current verification, known service-test mismatch, unresolved issues and rollback details are in [SESSION_HANDOFF.md](SESSION_HANDOFF.md).
+- This milestone documents the current workspace only. No sibling mirror, cumulative patch export, commit, push, or remote synchronization is implied.

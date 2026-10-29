@@ -131,7 +131,7 @@ static const char* const cw_keys[][2]={
   {"D-Pad","Arrows"}, {"Left stick","W A S D"}, {"Right stick","I J K L (or the mouse)"}, {"A  B  X  Y","X/Space  Z  C  V"},
   {"L  R  ZL  ZR","Q  E  1  3"}, {"+  -","Enter  Backspace"}, {"Controller","Xbox (XInput) pad"}};
 static const char* const cw_fkeys[][2]={
-  {"F1","This page"}, {"F3","Screenshot"}, {"F4","FPS limit on/off"}, {"F5","Diagnostic trace"},
+  {"F1","This page"}, {"F3","Screenshot"}, {"F4","FPS limit 60 / 30 / unlimited"}, {"F5","Diagnostic trace"},
   {"F7","Record video"}, {"F8","Full resolution capture"}, {"F11","Fullscreen"}, {"Esc","Quit the game"}};
 static int cw_sel;
 static HFONT cw_font(int px, int weight){ return CreateFontA(-px,0,0,0,weight,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,"Segoe UI"); }
@@ -256,7 +256,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
       CreateDirectoryA("captures",NULL); FILE* f=fopen("captures/threads.txt","w");   /* written next to the trace */
       if(f){ g_log_redirect=f; kernel_dump_threads(); g_log_redirect=NULL; fclose(f); }
       kernel_dump_threads(); gpu_gl_dump_rts(); return 0; }
-    if(w==VK_F4){ g_opt_fps= g_opt_fps==0? 1 : 0; char t[64]; snprintf(t,sizeof t,"FPS limit: %s",g_opt_fps==0? "unlimited" : "60"); SetWindowTextA(h,t); { extern void ini_set(const char*, const char*); char v[8]; snprintf(v,sizeof v,"%d",g_opt_fps); ini_set("fps_limit",v); } return 0; }
+    if(w==VK_F4){ g_opt_fps= g_opt_fps==0? 60 : g_opt_fps==30? 0 : 30; char t[64]; snprintf(t,sizeof t,"FPS limit: %s",g_opt_fps==0? "unlimited" : g_opt_fps==30? "30" : "60"); SetWindowTextA(h,t); { extern void ini_set(const char*, const char*); char v[8]; snprintf(v,sizeof v,"%d",g_opt_fps); ini_set("fps_limit",v); } return 0; }
     keys_held|=keymap(w); return 0;
   case WM_SYSKEYUP: case WM_KEYUP: keys_held&=~keymap(w); return 0;
   case WM_KILLFOCUS: keys_held=0; ClipCursor(NULL); InterlockedExchange(&g_mouse_dx,0); InterlockedExchange(&g_mouse_dy,0); return 0;

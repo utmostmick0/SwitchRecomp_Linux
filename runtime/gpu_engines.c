@@ -109,17 +109,25 @@ u64 gpu_ticks(void){
 
 int gpu_gl_hold_write(u64 addr, const void* data, u32 len); int gpu_gl_hold_reduce(u64 addr, u32 op, u32 payload, int is_signed); void gpu_gl_before_syncwait(void);
 
+/* Yield only once the report value is visible; deferred writes yield at release. */
+static void report_write(u64 addr,const void* data,u32 len){
+  if(gpu_gl_hold_write(addr,data,len)) return;
+  if(len==4){ u32 value; memcpy(&value,data,4); gmem_w32(addr,value); }
+  else gmem_write(addr,data,len);
+  if(addr==0x500000000ull) plat_yield();
+}
+
 static void query_get(GpuChannel* ch, u32* r, int base, u32 v){
   u64 addr=((u64)(r[base]&0xFF)<<32)|r[base+1]; u32 seq=r[base+2];
   u32 op=v&3;
   { static int nl; if(nl<24){ nl++; LOG("gpu: report semaphore op %u at %llx payload %x (word %x, now %x)\n",op,(unsigned long long)addr,seq,v,gmem_r32(addr)); } }
   if(op==0 && ((v>>3)&1)){ /* release with REDUCTION_ENABLE: atomic op on the word. 3D encoding: ADD MIN MAX INC DEC AND OR XOR */
     static const u8 map[8]={5,0,1,6,7,3,4,2}; extern void gpu_sem_reduce(u64,u32,u32,int);
-    if(!gpu_gl_hold_reduce(addr,map[(v>>9)&7],seq,(v>>17)&1)) gpu_sem_reduce(addr,map[(v>>9)&7],seq,(v>>17)&1);
+    if(!gpu_gl_hold_reduce(addr,map[(v>>9)&7],seq,(v>>17)&1)){ gpu_sem_reduce(addr,map[(v>>9)&7],seq,(v>>17)&1); if(addr==0x500000000ull) plat_yield(); }
     return; }
   if(op==0){ /* release, after any compute results still on their way (gpu_gl_hold_write) */
-    if(((v>>4)&1) || ((v>>28)&1)){ if(!gpu_gl_hold_write(addr,&seq,4)) gmem_w32(addr,seq); }
-    else { u64 q[2]={seq,gpu_ticks()}; if(!gpu_gl_hold_write(addr,q,16)) gmem_write(addr,q,16); }
+    if(((v>>4)&1) || ((v>>28)&1)){ report_write(addr,&seq,4); }
+    else { u64 q[2]={seq,gpu_ticks()}; report_write(addr,q,16); }
   } else if(op==1){ /* acquire */
     gpu_gl_before_syncwait();
     u64 end=plat_ns()+1000000000ull;
@@ -127,8 +135,8 @@ static void query_get(GpuChannel* ch, u32* r, int base, u32 v){
   } else if(op==2){ /* counter */
     u32 sel=(v>>23)&31; u64 val= sel==0? 0 : (sel==1? g_draws*3 : 1000);
     if(sel==2 || sel==21 || sel==23){ static int said; if(!said){ said=1; LOG("gpu: the game reads occlusion queries (counter %u)\n",sel); } }
-    if((v>>28)&1){ u32 w=(u32)val; if(!gpu_gl_hold_write(addr,&w,4)) gmem_w32(addr,w); }
-    else { u64 q[2]={val,gpu_ticks()}; if(!gpu_gl_hold_write(addr,q,16)) gmem_write(addr,q,16); }
+    if((v>>28)&1){ u32 w=(u32)val; report_write(addr,&w,4); }
+    else { u64 q[2]={val,gpu_ticks()}; report_write(addr,q,16); }
   }
 }
 

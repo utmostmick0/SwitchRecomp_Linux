@@ -3,6 +3,9 @@
    Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
 #define HS_HidSharedMemory 0x40000
 #define HO_HidSharedMemory_npad 0x9a00
+#define HO_HidSharedMemory_npad_condition 0x3e200
+#define HO_HidNpadCondition_joy_hold_type 0x8
+#define HO_HidNpadCondition_initialized 0xc
 #define HO_HidSharedMemory_touchscreen 0x400
 #define HO_HidSharedMemory_debug_pad 0x0
 #define HO_HidSharedMemory_keyboard 0x3800

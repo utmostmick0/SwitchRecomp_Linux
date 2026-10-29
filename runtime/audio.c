@@ -1,11 +1,13 @@
 /* SwitchRecomp by MZ Labs, Copyright 2026 MZ Labs. AGPL-3.0, see LICENSE.txt and NOTICE.txt.
    Initial audren software mixer. Wire layouts verified against switchbrew/libnx
    audren.h. PCM 8/16/24/32/float and Nintendo DSP ADPCM; simple mix graphs.
-   Voice/submix biquads, auxiliary rings and buffer mix effects are supported. Reverb,
-   effects, splitters and surround virtualization remain incomplete. */
+   Voice/submix biquads, auxiliary rings, buffer mix effects, delay and reverb
+   are supported, together with splitter routing, voice gain ramps and depop tails.
+   The existing stereo output/downmix backend remains in use. */
 #include "audio.h"
 #include "audio_limit.h"
 #include "audio_queue.h"
+#include "audio_effects.h"
 #include <math.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -161,16 +163,96 @@ void swr_audio_submit_at(const float* samples,unsigned frames,u64 sample_end){
 typedef struct { u64 addr,size,context,context_size; i32 start,end; u8 loop,slot; } Wave;
 typedef struct { i64 frame; i16 h0,h1,seed0,pcm[14],previous[14]; } Adpcm;
 typedef struct { float x1,x2,y1,y2; } BiquadState;
+typedef struct { u32* destinations; u32 count; } AudioSplitter;
+typedef struct { u32 mix; u8 used; float volume[NC],previous[NC]; } AudioDestination;
 typedef struct { Wave q[4]; u32 nq,consumed; u64 played; double pos,fraction;
   i16 carry0,carry1; u8 carry_valid; unsigned defer_blocks;
-  u8 busy[4],seen[4],sent[4],was_playing,was_logged,signal_logged; u64 signature[4],accepted_update[4]; Adpcm ad; BiquadState filter[2][6]; } Voice;
-typedef struct { u8 config[0xc0]; BiquadState filter[6]; int aux_logged; } Effect;
+  u8 busy[4],seen[4],sent[4],was_playing,was_logged,signal_logged; u64 signature[4],accepted_update[4]; Adpcm ad; BiquadState filter[2][6];
+  float previous_volume,previous_route[6][NC],last[4][NC]; u32 last_mix[4],last_count,previous_mix; int ramp_valid;
+} Voice;
+typedef struct { u8 config[0xc0]; BiquadState filter[6]; int aux_logged; SwrDspEffect* dsp; } Effect;
 typedef struct { Voice v[NV]; float* mix; u32 mix_cap; u64 updates,last_diag,ipc_serial; int logged;
-  Effect* effects; Effect** effect_order; u32 neffects,update_blocks; int effect_log; } AudioState;
+  Effect* effects; Effect** effect_order; u32 neffects,update_blocks; int effect_log;
+  AudioSplitter* splitters; AudioDestination* destinations; u32 nsplitters,ndestinations;
+  u8 mix_config[NM][0x930],mix_known[NM]; float depop[NM][NC];
+} AudioState;
 static AudioState* audio_state(SvcObj* o){
   AudioState* a=(AudioState*)(uintptr_t)o->u[4]; if(!a){ a=calloc(1,sizeof *a); o->u[4]=(u64)(uintptr_t)a; }return a;
 }
 void swr_audio_begin_update(SvcObj* o,unsigned blocks){ AudioState* a=audio_state(o); if(a){ a->update_blocks=blocks; a->ipc_serial++; } }
+
+/* SNDH/SNDI/SNDD wire layout adapted from PrimeRecomp's update_splitters.
+   Validate the complete packet before changing a renderer's incremental routes. */
+int swr_audio_configure_splitters(SvcObj* o,const u8* data,u32 size,u32 count,u32 destinations){
+  if(count>4096 || destinations>65536 || (size && (!data || size<0x20))) return 0;
+  u32 infos=0,updates=0; size_t offset=0;
+  if(size){
+    if(rd32(data)!=0x48444e53) return 0;
+    infos=rd32(data+4); updates=rd32(data+8); offset=0x20;
+    if(infos>count || updates>destinations) return 0;
+    for(u32 i=0;i<infos;i++){
+      if(size-offset<0x1c || rd32(data+offset)!=0x49444e53) return 0;
+      u32 n=rd32(data+offset+12);
+      if(rd32(data+offset+4)>=count || n>destinations || n>(size-offset-0x1c)/4) return 0;
+      for(u32 k=0;k<n;k++) if(rd32(data+offset+16+k*4)>=destinations) return 0;
+      offset+=0x1c+(size_t)n*4;
+    }
+    if(updates>(size-offset)/0x70) return 0;
+    for(u32 i=0;i<updates;i++){
+      if(rd32(data+offset)!=0x44444e53 || rd32(data+offset+4)>=destinations) return 0;
+      offset+=0x70;
+    }
+  }
+  AudioState* a=audio_state(o); if(!a) return 0;
+  if(a->nsplitters!=count || a->ndestinations!=destinations){
+    AudioSplitter* s=count?calloc(count,sizeof *s):NULL;
+    AudioDestination* d=destinations?calloc(destinations,sizeof *d):NULL;
+    if((count && !s) || (destinations && !d)){ free(s); free(d); return 0; }
+    for(u32 i=0;i<a->nsplitters;i++) free(a->splitters[i].destinations);
+    free(a->splitters); free(a->destinations);
+    a->splitters=s; a->destinations=d; a->nsplitters=count; a->ndestinations=destinations;
+  }
+  offset=0x20;
+  for(u32 i=0;i<infos;i++){
+    const u8* p=data+offset; u32 id=rd32(p+4),n=rd32(p+12);
+    u32* ids=n?malloc((size_t)n*4):NULL; if(n && !ids) return 0;
+    for(u32 k=0;k<n;k++) ids[k]=rd32(p+16+k*4);
+    free(a->splitters[id].destinations); a->splitters[id].destinations=ids; a->splitters[id].count=n;
+    offset+=0x1c+(size_t)n*4;
+  }
+  for(u32 i=0;i<updates;i++){
+    const u8* p=data+offset; AudioDestination* d=&a->destinations[rd32(p+4)];
+    int fresh=!d->used || d->mix!=rd32(p+0x68); d->mix=rd32(p+0x68);
+    for(unsigned k=0;k<NC;k++) d->volume[k]=rdf(p+8+k*4);
+    if(fresh) memcpy(d->previous,d->volume,sizeof d->previous);
+    d->used=p[0x6c]!=0; offset+=0x70;
+  }
+  return 1;
+}
+
+static AudioDestination* splitter_destination(AudioState* a,u32 id,u32 index){
+  if(id>=a->nsplitters || index>=a->splitters[id].count) return NULL;
+  u32 dest=a->splitters[id].destinations[index]; if(dest>=a->ndestinations) return NULL;
+  AudioDestination* d=&a->destinations[dest]; return d->used && d->mix<NM?d:NULL;
+}
+
+static void voice_depop(AudioState* a,Voice* v){
+  for(u32 i=0;i<v->last_count;i++) if(v->last_mix[i]<NM)
+    for(unsigned k=0;k<NC;k++) a->depop[v->last_mix[i]][k]+=v->last[i][k];
+  v->last_count=0; v->ramp_valid=0;
+}
+
+static void route_voice(AudioState* a,Voice* v,unsigned mix,unsigned buffers,const float* src,
+                        unsigned produced,float previous_volume,float volume,const float* previous,const float* current){
+  u32 slot=0; while(slot<v->last_count && v->last_mix[slot]!=mix) slot++;
+  if(slot==v->last_count && slot<4){ v->last_mix[slot]=mix; memset(v->last[slot],0,sizeof v->last[slot]); v->last_count++; }
+  for(unsigned k=0;k<buffers;k++){
+    float g0=previous_volume*previous[k],g1=volume*current[k],delta=(g1-g0)/NF;
+    float* dst=a->mix+(mix*NC+k)*NF;
+    for(unsigned f=0;f<produced;f++) dst[f]+=src[f]*(g0+delta*f);
+    if(slot<4 && produced) v->last[slot][k]+=src[produced-1]*(g0+delta*(produced-1));
+  }
+}
 static int effect_compare(const void* x,const void* y){
   const Effect* a=*(Effect* const*)x; const Effect* b=*(Effect* const*)y;
   u32 ao=rd32(a->config+0x18),bo=rd32(b->config+0x18); return ao<bo?-1:ao>bo?1:(a>b)-(a<b);
@@ -181,11 +263,13 @@ void swr_audio_configure_effects(SvcObj* o,const u8* data,u32 count,u32 stride){
   if(a->neffects!=count){
     Effect* effects=count?calloc(count,sizeof *effects):NULL; Effect** order=count?calloc(count,sizeof *order):NULL;
     if(count && (!effects || !order)){ free(effects); free(order); return; }
+    for(u32 i=0;i<a->neffects;i++) swr_dsp_free(a->effects[i].dsp);
     free(a->effects); free(a->effect_order); a->effects=effects; a->effect_order=order; a->neffects=count;
   }
   for(u32 i=0;i<count;i++){
     Effect* e=&a->effects[i]; const u8* p=data+i*stride;
     if(p[1] || p[0]!=e->config[0] || p[2]!=e->config[2]) memset(e->filter,0,sizeof e->filter);
+    e->dsp=swr_dsp_configure(e->dsp,p);
     memcpy(e->config,p,0xc0); a->effect_order[i]=e;
   }
   if(count) qsort(a->effect_order,count,sizeof *a->effect_order,effect_compare);
@@ -247,6 +331,8 @@ static void mix_effects(AudioState* a,unsigned index,unsigned id,unsigned buffer
       }
     } else if(p[0]==2){
       aux_effect(e,mix,buffers);
+    } else if(p[0]>=3 && p[0]<=5){
+      swr_dsp_process(e->dsp,mix,buffers,NF);
     } else if(p[0]==6){
       unsigned count=v[0x16]; if(!count || count>6) continue;
       float coeff[5]; for(int k=0;k<5;k++) coeff[k]=rd16(v+12+k*2)/16384.f;
@@ -257,7 +343,11 @@ static void mix_effects(AudioState* a,unsigned index,unsigned id,unsigned buffer
     }
   }
 }
-void swr_audio_destroy(SvcObj* o){ AudioState* a=(AudioState*)(uintptr_t)o->u[4]; if(a){ free(a->mix); free(a->effects); free(a->effect_order); free(a); }o->u[4]=0; }
+void swr_audio_destroy(SvcObj* o){ AudioState* a=(AudioState*)(uintptr_t)o->u[4]; if(a){
+  for(u32 i=0;i<a->neffects;i++) swr_dsp_free(a->effects[i].dsp);
+  for(u32 i=0;i<a->nsplitters;i++) free(a->splitters[i].destinations);
+  free(a->splitters); free(a->destinations); free(a->mix); free(a->effects); free(a->effect_order); free(a);
+}o->u[4]=0; }
 static void ad_reset(Voice* v,int restart){
   v->ad.frame=v->nq?(i64)v->q[0].start/14-1:-1;
   v->ad.h0=(!restart && v->carry_valid)?v->carry0:0;
@@ -321,30 +411,42 @@ static void queue_waves(Voice* v,const u8* vi,unsigned channels,unsigned format,
     v->seen[k]=1; v->sent[k]=sent; v->signature[k]=sig;
   }
 }
-/* routing only knows the legacy 0x930 byte mixes. other layouts get a straight stereo mix so you still hear the
-   first sounds, and it says so in the log */
+/* Legacy mix records and the newer sparse update wrapper share the same cached
+   0x930-byte bus layout. Source DSP/routing behavior is adapted through native state. */
 int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* resources,u32 resources_size,
  const u8* mixes,u32 mixes_size,const u8* sinks,u32 sinks_size,u8* status,float* stereo){
   memset(stereo,0,NF*2*sizeof(float)); if(count>NV || stride<0x170) return 0;
   AudioState* a=audio_state(o); if(!a) return 0;
-  unsigned nm=mixes_size/0x930; if(nm>NM || mixes_size%0x930) nm=0;
+  const u8* records=mixes; unsigned records_count=mixes_size/0x930;
+  if(mixes_size>=0x20 && rd32(mixes)==0xcafebabe){
+    records_count=rd32(mixes+4); records=mixes+0x20;
+    if(records_count>NM || records_count>(mixes_size-0x20)/0x930) return 0;
+  } else if(records_count>NM || mixes_size%0x930) return 0;
+  for(unsigned i=0;i<records_count;i++){
+    const u8* p=records+i*0x930; u32 id=rd32(p+0x10);
+    if(id<NM){ memcpy(a->mix_config[id],p,0x930); a->mix_known[id]=1; }
+  }
+  unsigned nm=0;
   int map[NM]; const u8* mi[NM]; unsigned nbuf[NM]; memset(mi,0,sizeof mi); memset(nbuf,0,sizeof nbuf); for(int i=0;i<NM;i++) map[i]=-1;
-  for(unsigned i=0;i<nm;i++){ const u8* p=mixes+i*0x930; u32 id=rd32(p+0x10),nb=rd32(p+8); if(p[0xc] && id<NM && nb>0 && nb<=NC){ map[id]=(int)i; mi[i]=p; nbuf[i]=nb; } }
+  for(unsigned i=0;i<NM;i++){ const u8* p=a->mix_config[i]; u32 nb=rd32(p+8);
+    if(a->mix_known[i] && p[0xc] && nb>0 && nb<=NC){ map[i]=(int)i; mi[i]=p; nbuf[i]=nb; nm=i+1; }
+  }
   if(nm){ u32 cap=nm*NC*NF; if(a->mix_cap<cap){ float* t=realloc(a->mix,(size_t)cap*4); if(!t) return 0; a->mix=t; a->mix_cap=cap; }memset(a->mix,0,(size_t)cap*4); }
   int active=0;
   for(u32 i=0;i<count;i++){ const u8* vi=voices+i*stride; u32 id=rd32(vi); if(id>=NV) continue; Voice* v=&a->v[id];
-    if(vi[8]) memset(v,0,sizeof *v);
+    if(vi[8]){ voice_depop(a,v); memset(v,0,sizeof *v); }
     unsigned channels=rd32(vi+0x18),format=vi[0xb]; if(!channels || channels>6) channels=1;
     if(vi[9]){
       int was_empty=!v->nq,was_stopped=!v->was_playing;
       queue_waves(v,vi,channels,format,a->ipc_serial);
+      if(vi[0xa]!=0 || !v->nq) voice_depop(a,v);
       /* catch up quanta are time from before this IPC, a new sound can't get played during that time even if other
          voices are playing */
       if(v->nq && vi[0xa]==0 && (vi[8] || was_empty || was_stopped)) v->defer_blocks=a->update_blocks>1?a->update_blocks-1:0;
       /* 0x158..0x16f is just padding in the legacy voice layout (REV1, puyo uses it). reading 0x159 as a drop
          command threw away clips depending on whatever junk the SDK left there */
-      if(vi[0xa]==1 && v->was_playing){ while(v->nq) pop_wave(v); v->pos=0; v->played=0; v->fraction=0; v->carry_valid=0; ad_reset(v,1); memset(v->filter,0,sizeof v->filter); }
-      v->was_playing=vi[0xa]!=1;
+      if(vi[0xa]!=0 && v->was_playing){ while(v->nq) pop_wave(v); v->pos=0; v->played=0; v->fraction=0; v->carry_valid=0; ad_reset(v,1); memset(v->filter,0,sizeof v->filter); }
+      v->was_playing=vi[0xa]==0;
       int deferred=0;
       if(vi[0xa]==0 && v->nq && o->u[3]==0 && v->defer_blocks){ v->defer_blocks--; deferred=1; active++; }
       if(vi[0xa]==0 && v->nq && o->u[3]==0 && !deferred){
@@ -353,6 +455,7 @@ int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* reso
         u64 extra=rd64(vi+0x48),esz=rd64(vi+0x50); if(format==6 && esz>=32 && readable(extra,32)) memcpy(co,GP(extra),32);
         if(format<1 || format>6 || (format==6 && channels!=1)){ static int warned; if(warned++<8) WARN("audio: unsupported voice format %u, channels %u (timing preserved)\n",format,channels); vol=0; }
         int dest=rd32(vi+0x58)<NM?map[rd32(vi+0x58)]:-1; float routing[6][NC]; memset(routing,0,sizeof routing);
+        if(v->ramp_valid && v->previous_mix!=rd32(vi+0x58)) voice_depop(a,v);
         for(unsigned ch=0;ch<channels;ch++){ u32 cid=rd32(vi+0x140+ch*4);
           if(dest>=0 && cid<resources_size/0x70 && resources[cid*0x70+0x64]) for(unsigned k=0;k<nbuf[dest];k++) routing[ch][k]=rdf(resources+cid*0x70+4+k*4);
           else if(dest>=0){ routing[ch][ch<nbuf[dest]?ch:0]=channels==1?0.70710678f:1; if(channels==1 && nbuf[dest]>1) routing[ch][1]=0.70710678f; }
@@ -380,38 +483,78 @@ int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* reso
               x=biquad(&v->filter[stage][ch],coeff[stage],x);
             }
             if(track && fabsf(x)>filter_peak) filter_peak=fabsf(x);
-            decoded[ch][f]=x*vol;
+            decoded[ch][f]=x;
           }
           produced++;
           v->pos+=step; v->fraction+=step; u64 advance=(u64)(v->fraction+1e-9); v->played+=advance; v->fraction-=advance;
         }normalize(v,format,co);
+        v->last_count=0;
         for(unsigned ch=0;ch<channels;ch++){
           if(dest>=0){
-            for(unsigned k=0;k<nbuf[dest];k++){ float g=routing[ch][k]; if(g==0) continue;
-              float* dst=a->mix+(dest*NC+k)*NF;
-              for(unsigned f=0;f<produced;f++) dst[f]+=decoded[ch][f]*g;
+            route_voice(a,v,(unsigned)dest,nbuf[dest],decoded[ch],produced,v->ramp_valid?v->previous_volume:vol,
+              vol,v->ramp_valid?v->previous_route[ch]:routing[ch],routing[ch]);
+          } else if(rd32(vi+0x5c)<a->nsplitters){
+            u32 splitter=rd32(vi+0x5c);
+            for(u32 k=ch;k<a->splitters[splitter].count;k+=channels){
+              AudioDestination* d=splitter_destination(a,splitter,k);
+              if(d && map[d->mix]>=0) route_voice(a,v,d->mix,nbuf[d->mix],decoded[ch],produced,
+                v->ramp_valid?v->previous_volume:vol,vol,d->previous,d->volume);
             }
           } else if(channels==1){
-            for(unsigned f=0;f<produced;f++){ float x=decoded[ch][f]*.70710678f; stereo[f*2]+=x; stereo[f*2+1]+=x; }
-          } else { unsigned side=ch==1 || ch==5?1:0; for(unsigned f=0;f<produced;f++) stereo[f*2+side]+=decoded[ch][f]; }
+            for(unsigned f=0;f<produced;f++){ float x=decoded[ch][f]*vol*.70710678f; stereo[f*2]+=x; stereo[f*2+1]+=x; }
+          } else { unsigned side=ch==1 || ch==5?1:0; for(unsigned f=0;f<produced;f++) stereo[f*2+side]+=decoded[ch][f]*vol; }
         }
+        memcpy(v->previous_route,routing,sizeof routing); v->previous_volume=vol;
+        v->previous_mix=rd32(vi+0x58); v->ramp_valid=1;
         if(track && source_peak>.00001f){
           float route=dest<0?1:0; for(unsigned ch=0;ch<channels;ch++) if(dest>=0) for(unsigned k=0;k<nbuf[dest];k++) if(fabsf(routing[ch][k])>route) route=fabsf(routing[ch][k]);
           LOG("audio: voice %u signal source=%.5f filtered=%.5f volume=%.4f route_peak=%.4f played=%llu mix=%d\n",id,(double)source_peak,(double)filter_peak,(double)vol,(double)route,(unsigned long long)v->played,dest);
           v->signal_logged=1; signal_traces++;
         }
       }
-    } else { v->nq=0; v->pos=0; v->carry_valid=0; memset(v->filter,0,sizeof v->filter); memset(v->busy,0,sizeof v->busy); }
+    } else { voice_depop(a,v); v->nq=0; v->pos=0; v->carry_valid=0; memset(v->filter,0,sizeof v->filter); memset(v->busy,0,sizeof v->busy); }
     memcpy(status+i*16,&v->played,8); memcpy(status+i*16+8,&v->consumed,4);
   }
   int diagnostic=active && (!a->logged || a->updates-a->last_diag>=400);
   /* mixes that feed others go first, whatever order they come in */
-  int incoming[NM]={0},done[NM]={0}; for(unsigned i=0;i<nm;i++) if(mi[i]){ u32 id=rd32(mi[i]+0x924); if(id<NM && map[id]>=0 && map[id]!=(int)i) incoming[map[id]]++; }
+  int incoming[NM]={0},done[NM]={0}; u8 edge[NM][NM]={{0}};
+  for(unsigned i=0;i<nm;i++) if(mi[i]){
+    u32 id=rd32(mi[i]+0x924),splitter=rd32(mi[i]+0x928);
+    if(id<NM && map[id]>=0){ if(id!=i) edge[i][id]=1; }
+    else if(splitter<a->nsplitters) for(u32 k=0;k<a->splitters[splitter].count;k++){
+      AudioDestination* d=splitter_destination(a,splitter,k);
+      if(d && d->mix!=i && map[d->mix]>=0) edge[i][d->mix]=1;
+    }
+    for(unsigned j=0;j<nm;j++) incoming[j]+=edge[i][j];
+  }
   for(unsigned pass=0;pass<nm;pass++) for(unsigned i=0;i<nm;i++) if(mi[i] && !done[i] && !incoming[i]){
-    done[i]=1; if(o->u[3]==0) mix_effects(a,i,rd32(mi[i]+0x10),nbuf[i]); u32 id=rd32(mi[i]+0x924); int dst=id<NM?map[id]:-1;
+    done[i]=1;
+    if(o->u[3]==0){
+      for(unsigned k=0;k<nbuf[i];k++){
+        float tail=a->depop[i][k];
+        for(unsigned f=0;f<NF && tail!=0;f++){
+          tail*=.962189f; if(fabsf(tail)<1e-7f) tail=0;
+          a->mix[(i*NC+k)*NF+f]+=tail;
+        }
+        a->depop[i][k]=tail;
+      }
+      mix_effects(a,i,rd32(mi[i]+0x10),nbuf[i]);
+    }
+    u32 id=rd32(mi[i]+0x924); int dst=id<NM?map[id]:-1;
     if(dst>=0 && dst!=(int)i){ float volume=gain(mi[i]); for(unsigned sc=0;sc<nbuf[i];sc++) for(unsigned dc=0;dc<nbuf[dst];dc++){
         float g=rdf(mi[i]+0x24+(sc*NC+dc)*4)*volume; if(g==0) continue; for(unsigned f=0;f<NF;f++) a->mix[(dst*NC+dc)*NF+f]+=a->mix[(i*NC+sc)*NF+f]*g; }
-      incoming[dst]--; }
+    } else if(dst<0){
+      u32 splitter=rd32(mi[i]+0x928);
+      if(splitter<a->nsplitters) for(u32 k=0;k<a->splitters[splitter].count;k++){
+        AudioDestination* d=splitter_destination(a,splitter,k); if(!d || d->mix==i || map[d->mix]<0) continue;
+        for(unsigned dc=0;dc<nbuf[d->mix];dc++){
+          float g=gain(mi[i])*d->volume[dc];
+          const float* src=a->mix+(i*NC+k%nbuf[i])*NF; float* target=a->mix+(d->mix*NC+dc)*NF;
+          for(unsigned f=0;f<NF;f++) target[f]+=src[f]*g;
+        }
+      }
+    }
+    for(unsigned j=0;j<nm;j++) if(edge[i][j]) incoming[j]--;
   }
   int final=map[0]; if(final>=0){
     float downmix[4]={1.f,.70710678f,.5f,.70710678f};
@@ -445,9 +588,10 @@ int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* reso
   if(active && !a->effect_log){
     a->effect_log=1;
     for(unsigned i=0;i<nm;i++) if(mi[i]) LOG("audio: mix id=%u buffers=%u volume=%.4f destination=%u\n",rd32(mi[i]+0x10),nbuf[i],(double)gain(mi[i]),rd32(mi[i]+0x924));
-    for(u32 i=0;i<a->neffects;i++){ const u8* e=a->effects[i].config; if(e[0]) LOG("audio: effect %u type=%u enabled=%u mix=%u order=%u%s\n",i,e[0],e[2],rd32(e+4),rd32(e+0x18),(e[0]==1 || e[0]==2 || e[0]==6)?"":" (DSP not implemented)"); }
+    for(u32 i=0;i<a->neffects;i++){ const u8* e=a->effects[i].config; if(e[0]) LOG("audio: effect %u type=%u enabled=%u mix=%u order=%u%s\n",i,e[0],e[2],rd32(e+4),rd32(e+0x18),(e[0]>=1 && e[0]<=6)?"":" (DSP not implemented)"); }
   }
   if(active && !a->logged){ a->logged=1; LOG("audio: audren mixer active (%d voices, %u mixes), PCM/DSP-ADPCM, %s\n",active,nm,nm?"mix routing":"direct stereo fallback"); }
   if(a->update_blocks) a->update_blocks--;
+  for(u32 i=0;i<a->ndestinations;i++) memcpy(a->destinations[i].previous,a->destinations[i].volume,sizeof a->destinations[i].previous);
   a->updates++; return active;
 }

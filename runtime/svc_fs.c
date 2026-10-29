@@ -5,12 +5,13 @@
    to normal folders */
 #include "rt.h"
 #include <ctype.h>
+#include <errno.h>
 
 #define FS_NOTFOUND RC(2,1)
 #define FS_EXISTS   RC(2,2)
 
 /* ============================================================ RomFS virtual */
-typedef struct { char* path; u64 off, size; int logged; } RFile;
+typedef struct { char* path; u64 off, size; int logged; FILE* stream; } RFile;
 
 static size_t g_romdir_len;
 static RFile* rfiles; static int nrfiles;
@@ -37,27 +38,34 @@ static int add_dir(const char* name, int parent){ if(ndn==capdn){ capdn=capdn?ca
 static int add_file(const char* name, int parent, u64 size, const char* host){ if(nfn==capfn){ capfn=capfn?capfn*2:1024; fn=realloc(fn,sizeof(FNode)*capfn); }
   FNode* f=&fn[nfn]; f->name=strdup(name); f->parent=parent; f->next_sib=-1; f->size=size; f->host=strdup(host); return nfn++; }
 
-static int cmpname(const void* a, const void* b){ return strcmp(*(char* const*)a,*(char* const*)b); }
+/* Keep metadata attached to its name while sorting. The old sorted-name
+   permutation was joined back to the unsorted list with an O(n^2) search. */
+typedef struct { char* name; u64 size; int isdir; } ScanEntry;
+static int scan_entry_cmp(const void* a,const void* b){
+  const ScanEntry* x=a; const ScanEntry* y=b;
+  if(x->isdir!=y->isdir) return x->isdir?-1:1;
+  return strcmp(x->name,y->name);
+}
 
 static void scan(const char* host, int di){
   PDir d; if(plat_dir_open(&d,host)) return;
-  char** names=NULL; int* isdir=NULL; u64* sizes=NULL; int n=0, cap=0;
-  while(plat_dir_next(&d)){ if(n==cap){ cap=cap?cap*2:64; names=realloc(names,sizeof(char*)*cap); isdir=realloc(isdir,sizeof(int)*cap); sizes=realloc(sizes,8*cap); }
-    names[n]=strdup(d.name); isdir[n]=d.is_dir; sizes[n]=d.size; n++; }
-  plat_dir_close(&d);
-  /* dirs first, then alphabetical, so the layout is stable */
-  for(int pass=0;pass<2;pass++){
-    int lastd=-1, lastf=-1;
-    char** idx=malloc(sizeof(char*)*(n?n:1)); int m=0;
-    for(int i=0;i<n;i++) if(isdir[i]==(pass==0)) idx[m++]=names[i];
-    qsort(idx,m,sizeof(char*),cmpname);
-    for(int k=0;k<m;k++){ int i=0; while(names[i]!=idx[k]) i++;
-      char p[2048]; snprintf(p,sizeof p,"%s/%s",host,names[i]);
-      if(pass==0){ int c=add_dir(names[i],di); if(lastd<0) dn[di].first_child=c; else dn[lastd].next_sib=c; lastd=c; scan(p,c); }
-      else { int f=add_file(names[i],di,sizes[i],p); if(lastf<0) dn[di].first_file=f; else fn[lastf].next_sib=f; lastf=f; } }
-    free(idx);
+  ScanEntry* entries=NULL; int n=0,cap=0;
+  while(plat_dir_next(&d)){
+    if(n==cap){ cap=cap?cap*2:64; entries=realloc(entries,sizeof *entries*cap); }
+    entries[n].name=strdup(d.name); entries[n].isdir=d.is_dir; entries[n].size=d.size; n++;
   }
-  for(int i=0;i<n;i++) free(names[i]); free(names); free(isdir); free(sizes);
+  plat_dir_close(&d);
+  /* Preserve directories first and lexical sibling order, including recursive
+     node allocation order, so the serialized RomFS stays byte-identical. */
+  if(n>1) qsort(entries,n,sizeof *entries,scan_entry_cmp);
+  int lastd=-1,lastf=-1;
+  for(int k=0;k<n;k++){
+    ScanEntry* e=&entries[k]; char p[2048]; snprintf(p,sizeof p,"%s/%s",host,e->name);
+    if(e->isdir){ int c=add_dir(e->name,di); if(lastd<0) dn[di].first_child=c; else dn[lastd].next_sib=c; lastd=c; scan(p,c); }
+    else { int f=add_file(e->name,di,e->size,p); if(lastf<0) dn[di].first_file=f; else fn[lastf].next_sib=f; lastf=f; }
+    free(e->name);
+  }
+  free(entries);
 }
 
 static u32 rhash(u32 parent, const char* s){ u32 h=parent^123456789u; for(;*s;s++){ h=(h>>5)|(h<<27); h^=(u8)*s; } return h; }
@@ -67,8 +75,10 @@ static u32 hcount(u32 n){ if(n<3) return 3; if(n<19) return n|1; u32 c=n; while(
 static int rf_cmp(const void* a, const void* b){ const RFile* x=a,*y=b; return x->off<y->off? -1 : x->off>y->off; }
 
 static void romfs_build(const char* dir){
+  u64 started=plat_ns();
   add_dir("",0); dn[0].parent=0; g_romdir_len=strlen(dir);
   scan(dir,0);
+  u64 scanned=plat_ns();
   /* table offsets */
   u32 doff=0; for(int i=0;i<ndn;i++){ dn[i].off=doff; doff+=0x18+((strlen(dn[i].name)+3)&~3u); }
   u32 foff=0; for(int i=0;i<nfn;i++){ fn[i].off=foff; foff+=0x20+((strlen(fn[i].name)+3)&~3u); }
@@ -98,6 +108,7 @@ static void romfs_build(const char* dir){
   rtotal=rdata_off+data;
   qsort(rfiles,nrfiles,sizeof(RFile),rf_cmp);
   LOG("RomFS: %d folders, %d files, %.1f MB\n",ndn,nfn,(double)rtotal/1048576.0);
+  LOG("RomFS: index %.3f s (scan %.3f s, tables %.3f s)\n",(double)(plat_ns()-started)/1e9,(double)(scanned-started)/1e9,(double)(plat_ns()-scanned)/1e9);
 }
 
 void romfs_init(void){
@@ -129,41 +140,87 @@ u64 romfs_size(void){ return rtotal; }
 static struct { const char* path; FILE* f; u64 last; u32 refs; } openf[NOPEN]; static u64 openclk;
 
 static FILE* rf_acquire(const char* path, int* cached_slot){
-  int lru=-1;
+  *cached_slot=-1;
   pm_lock(&g_romlock);
+  for(int i=0;i<NOPEN;i++) if(openf[i].f && openf[i].path==path){
+    openf[i].last=++openclk; openf[i].refs++; *cached_slot=i;
+    FILE* f=openf[i].f; pm_unlock(&g_romlock); return f;
+  }
+  pm_unlock(&g_romlock);
+  FILE* fresh=fopen(path,"rb"); if(!fresh) return NULL;
+  FILE* retired=NULL; int lru=-1;
+  pm_lock(&g_romlock);
+  /* A concurrent miss may have installed the same archive while open was in flight. */
   for(int i=0;i<NOPEN;i++){
-    if(openf[i].f && openf[i].path==path){ openf[i].last=++openclk; openf[i].refs++; *cached_slot=i; FILE* f=openf[i].f; pm_unlock(&g_romlock); return f; }
+    if(openf[i].f && openf[i].path==path){
+      openf[i].last=++openclk; openf[i].refs++; *cached_slot=i;
+      FILE* f=openf[i].f; pm_unlock(&g_romlock); fclose(fresh); return f;
+    }
     if(!openf[i].refs && (lru<0 || openf[i].last<openf[lru].last)) lru=i;
   }
   if(lru>=0){
-    if(openf[lru].f) fclose(openf[lru].f);
-    openf[lru].f=fopen(path,"rb"); openf[lru].path=path; openf[lru].last=++openclk; openf[lru].refs=openf[lru].f? 1 : 0;
-    FILE* f=openf[lru].f; if(f) *cached_slot=lru; pm_unlock(&g_romlock); return f;
+    retired=openf[lru].f; openf[lru].f=fresh; openf[lru].path=path;
+    openf[lru].last=++openclk; openf[lru].refs=1; *cached_slot=lru;
   }
-  /* All cached descriptors are in use. An uncached descriptor avoids waiting
-     behind unrelated archive reads and is closed by rf_read after its pread. */
-  pm_unlock(&g_romlock); *cached_slot=-1; return fopen(path,"rb");
+  pm_unlock(&g_romlock);
+  if(retired) fclose(retired);
+  return fresh;
+}
+
+/* A bounded positional loop handles short host reads without integer truncation. */
+static int fs_read_exact(FILE* f,void* dst,u64 size,u64 off){
+  if(!f || (size && !dst)) return -1;
+  if(off>0x7fffffffffffffffull || size>0x7fffffffffffffffull-off) return -1;
+  u64 done=0;
+  while(done<size){
+    u64 chunk=size-done; if(chunk>0x100000) chunk=0x100000;
+    int got=plat_pread(f,(u8*)dst+done,chunk,off+done);
+    if(got<=0) return -1;
+    done+=(u64)got;
+  }
+  return 0;
 }
 
 static int rf_read(const char* path, void* dst, u64 size, u64 off){
   int slot=-1; FILE* f=rf_acquire(path,&slot); if(!f) return -1;
-  int n=plat_pread(f,dst,size,off);
+  int result=fs_read_exact(f,dst,size,off);
   if(slot>=0){ pm_lock(&g_romlock); if(openf[slot].refs) openf[slot].refs--; pm_unlock(&g_romlock); }
   else fclose(f);
-  return n;
+  return result;
 }
 
-static int rf_log_once(RFile* f){
-  pm_lock(&g_romlock); int log=!f->logged; if(log) f->logged=1; pm_unlock(&g_romlock); return log;
+/* Large immutable archives retain at most eight process-lifetime descriptors.
+   Published streams cannot be evicted, so warm reads need no cache lock/refcount. */
+static u32 rf_pinned_streams;
+static FILE* rf_archive_stream(RFile* file){
+  FILE* stream=__atomic_load_n(&file->stream,__ATOMIC_ACQUIRE);
+  if(stream || file->size<(256ull<<20)) return stream;
+  if(__atomic_fetch_add(&rf_pinned_streams,1,__ATOMIC_ACQ_REL)>=8){
+    __atomic_fetch_sub(&rf_pinned_streams,1,__ATOMIC_RELEASE); return NULL;
+  }
+  FILE* fresh=fopen(file->path,"rb");
+  if(!fresh){ __atomic_fetch_sub(&rf_pinned_streams,1,__ATOMIC_RELEASE); return NULL; }
+  FILE* expected=NULL;
+  if(!__atomic_compare_exchange_n(&file->stream,&expected,fresh,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+    fclose(fresh); __atomic_fetch_sub(&rf_pinned_streams,1,__ATOMIC_RELEASE); return expected;
+  }
+  return fresh;
 }
+
+static int rf_log_once(RFile* f){ return !__atomic_exchange_n(&f->logged,1,__ATOMIC_RELAXED); }
 
 int romfs_read(u64 off, void* dst, u64 size){
   u8* d=dst;
-  if(rraw){ int r=plat_pread(rraw,d,size,off); return r<0? -1 : 0; }
+  if(rraw) return fs_read_exact(rraw,d,size,off);
   if(off<rmeta_size){ u64 n=rmeta_size-off; if(n>size) n=size; memcpy(d,rmeta+off,n); d+=n; off+=n; size-=n; }
   while(size){
-    int lo=0, hi=nrfiles-1, k=-1;
-    while(lo<=hi){ int m=(lo+hi)/2; if(rfiles[m].off<=off){ k=m; lo=m+1; } else hi=m-1; }
+    static __thread int last_file=-1;
+    int k=last_file;
+    if(k<0 || k>=nrfiles || off<rfiles[k].off || off-rfiles[k].off>=rfiles[k].size){
+      int lo=0,hi=nrfiles-1; k=-1;
+      while(lo<=hi){ int m=(lo+hi)/2; if(rfiles[m].off<=off){ k=m; lo=m+1; } else hi=m-1; }
+    }
+    last_file=k;
     if(k<0){ memset(d,0,size); break; }
     RFile* f=&rfiles[k];
     if(off>=f->off+f->size){ /* inter-file padding */
@@ -173,7 +230,8 @@ int romfs_read(u64 off, void* dst, u64 size){
     { extern void vp9_note_file(const char* path); vp9_note_file(f->path); }
 #endif
     if(rf_log_once(f)) LOG("romfs: %s (%.1f KB)\n",f->path+g_romdir_len,(double)f->size/1024.0);
-    if(rf_read(f->path,d,n,off-f->off)<(int)n){ memset(d,0,n); }
+    FILE* stream=rf_archive_stream(f);
+    if((stream?fs_read_exact(stream,d,n,off-f->off):rf_read(f->path,d,n,off-f->off))<0) return -1;
     d+=n; off+=n; size-=n;
   }
   return 0;
@@ -183,8 +241,9 @@ int romfs_read(u64 off, void* dst, u64 size){
 static int romstorage(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 0: { u64 off=in64(c,0), sz=in64(c,8), a, bs; buf_out(c,0,&a,&bs); if(sz>bs) sz=bs;
-      if(off>rtotal) return RC(2,6001); if(off+sz>rtotal) sz=rtotal-off;
-      romfs_read(off,GP(a),sz); return 0; }
+      if(off>rtotal) return RC(2,6001); if(sz>rtotal-off) sz=rtotal-off;
+      if(sz && (!a || a>=AS_SIZE || sz>AS_SIZE-a)) return RC(2,6001);
+      return romfs_read(off,GP(a),sz)<0? FS_NOTFOUND : 0; }
     case 4: out64(c,rtotal); return 0;
     case 1: case 2: case 3: return RC(2,6300);
     case 5: { u8 z[0x40]; memset(z,0,sizeof z); outbytes(c,z,0x40); return 0; }
@@ -200,7 +259,7 @@ typedef struct { PDir d; int ok; u32 filter; char path[1100]; int done; } DirDat
 
 static void read_path(IpcCtx* c, int idx, char* out, u32 max){
   u64 a,s; if(!buf_xs(c,idx,&a,&s) || !a){ buf_in(c,idx,&a,&s); }
-  u32 n=0; if(a){ const char* p=(const char*)GP(a); while(n<max-1 && n<0x300 && p[n]){ out[n]=p[n]; n++; } } out[n]=0; }
+  u32 n=0; if(a){ const char* p=(const char*)GP(a); while(n<max-1 && n<0x300 && n<s && p[n]){ out[n]=p[n]; n++; } } out[n]=0; }
 
 static void host_path(FsData* fs, const char* p, char* out, size_t max){
   while(*p=='/') p++;
@@ -224,7 +283,7 @@ static void copy_tree(const char* src, const char* dst){
   while(plat_dir_next(&d)){ char s[1600], t[1600]; snprintf(s,sizeof s,"%s/%s",src,d.name); snprintf(t,sizeof t,"%s/%s",dst,d.name);
     if(d.is_dir){ copy_tree(s,t); continue; }
     FILE* fi=fopen(s,"rb"); if(!fi) continue; FILE* fo=fopen(t,"wb"); if(!fo){ fclose(fi); continue; }
-    static char buf[1<<16]; size_t n; while((n=fread(buf,1,sizeof buf,fi))>0) fwrite(buf,1,n,fo);
+    char buf[1<<16]; size_t n; while((n=fread(buf,1,sizeof buf,fi))>0) fwrite(buf,1,n,fo);
     fclose(fi); fclose(fo); }
   plat_dir_close(&d); }
 
@@ -232,9 +291,20 @@ static int file_disp(SvcObj* o, IpcCtx* c){
   FileData* f=o->data;
   switch(c->cmd){
     case 0: { u64 off=in64(c,8), sz=in64(c,16), a, bs; buf_out(c,0,&a,&bs); if(sz>bs) sz=bs;
-      fseek(f->f,(long)off,SEEK_SET); u64 n=fread(GP(a),1,sz,f->f); out64(c,n); return 0; }
+      /* Explicit offsets let readers share a file without racing its stream cursor. */
+      if(off>0x7fffffffffffffffull || sz>0x7fffffffffffffffull-off || (sz && (!a || a>=AS_SIZE || sz>AS_SIZE-a))) return RC(2,6001);
+      u64 n=0;
+      while(n<sz){
+        u64 chunk=sz-n; if(chunk>0x100000) chunk=0x100000;
+        int got=plat_pread(f->f,GP(a+n),chunk,off+n);
+        if(got<0) return RC(2,1);
+        if(!got) break;
+        n+=(u64)got;
+      }
+      out64(c,n); return 0; }
     case 1: { u64 off=in64(c,8), sz=in64(c,16), a, bs; buf_in(c,0,&a,&bs); if(sz>bs) sz=bs;
-      fseek(f->f,(long)off,SEEK_SET); fwrite(GP(a),1,sz,f->f); if(in32(c,0)&1) fflush(f->f); return 0; }
+      fseek(f->f,(long)off,SEEK_SET); fwrite(GP(a),1,sz,f->f); /* Position-relative reads bypass stdio buffering. */
+      fflush(f->f); return 0; }
     case 2: fflush(f->f); return 0;
     case 3: { u64 n=in64(c,0); fflush(f->f); fseek(f->f,0,SEEK_END); u64 cur=(u64)ftell(f->f);
       if(n>cur){ u64 k=n-cur; static const u8 z[4096]; while(k){ u64 m=k>4096?4096:k; fwrite(z,1,m,f->f); k-=m; } fflush(f->f); }
@@ -265,10 +335,27 @@ static void dir_destroy(SvcObj* o){ DirData* d=o->data; if(d->ok) plat_dir_close
 /* save data lookups that fail: a game that waits on a file we don't have shows up here */
 static void fs_miss(const char* what, const char* p){ static int n; if(n<40){ n++; LOG("fs: %s %s -> not found\n",what,p); } }
 
+/* Thread-local negative entries avoid a new filesystem-wide read lock. Mutations
+   invalidate all entries; host-side changes become visible within 250 ms. */
+static u64 fs_path_epoch;
+typedef struct { char path[1100]; u64 epoch,expires; } FsNegative;
+static __thread FsNegative fs_negative[16];
+static __thread unsigned fs_negative_next;
+static int fs_negative_hit(const char* path,u64 now){
+  u64 epoch=__atomic_load_n(&fs_path_epoch,__ATOMIC_ACQUIRE);
+  for(unsigned i=0;i<16;i++) if(fs_negative[i].expires>now && fs_negative[i].epoch==epoch && !strcmp(fs_negative[i].path,path)) return 1;
+  return 0;
+}
+static void fs_negative_add(const char* path,u64 epoch,u64 now){
+  FsNegative* entry=&fs_negative[fs_negative_next++%16];
+  snprintf(entry->path,sizeof entry->path,"%s",path); entry->epoch=epoch; entry->expires=now+250000000ull;
+}
+
 static int fs_disp(SvcObj* o, IpcCtx* c){
   FsData* fs=o->data; char p[0x301], hp[1100], p2[0x301], hp2[1100];
   if(c->cmd<=15 && c->cmd!=10){ read_path(c,0,p,sizeof p); if(path_escapes(p)) return FS_NOTFOUND; }
   if(c->cmd==5 || c->cmd==6){ read_path(c,1,p2,sizeof p2); if(path_escapes(p2)) return FS_NOTFOUND; }
+  if(c->cmd<=6 || c->cmd==13) __atomic_add_fetch(&fs_path_epoch,1,__ATOMIC_RELEASE);
   switch(c->cmd){
     case 0: { read_path(c,0,p,sizeof p); host_path(fs,p,hp,sizeof hp); u64 sz=in64(c,8);
       FILE* t=fopen(hp,"rb"); if(t){ fclose(t); return FS_EXISTS; }
@@ -280,8 +367,10 @@ static int fs_disp(SvcObj* o, IpcCtx* c){
       extern void rm_rf(const char*, int keep); rm_rf(hp,c->cmd==13); return 0; }
     case 5: case 6: read_path(c,0,p,sizeof p); read_path(c,1,p2,sizeof p2); host_path(fs,p,hp,sizeof hp); host_path(fs,p2,hp2,sizeof hp2); return rename(hp,hp2)? FS_NOTFOUND : 0;
     case 7: { read_path(c,0,p,sizeof p); host_path(fs,p,hp,sizeof hp);
+      u64 now=plat_ns(), epoch=__atomic_load_n(&fs_path_epoch,__ATOMIC_ACQUIRE);
+      if(fs_negative_hit(hp,now)) return FS_NOTFOUND;
       if(plat_is_dir(hp) || !strcmp(p,"/") || !p[0]){ out32(c,0); return 0; }
-      FILE* t=fopen(hp,"rb"); if(!t){ fs_miss("GetEntryType",p); return FS_NOTFOUND; } fclose(t); out32(c,1); return 0; }
+      FILE* t=fopen(hp,"rb"); if(!t){ if(errno==ENOENT || errno==ENOTDIR) fs_negative_add(hp,epoch,now); fs_miss("GetEntryType",p); return FS_NOTFOUND; } fclose(t); out32(c,1); return 0; }
     case 8: { read_path(c,0,p,sizeof p); host_path(fs,p,hp,sizeof hp); u32 mode=in32(c,0);
       FILE* t=fopen(hp,(mode&2)? "rb+" : "rb"); if(!t){ fs_miss("OpenFile",p); return FS_NOTFOUND; }
       SvcObj* f=svcobj_new("IFile",file_disp,sizeof(FileData)); FileData* fd=f->data; fd->f=t; fd->mode=mode; strcpy(fd->path,hp); f->destroy=file_destroy;
@@ -419,7 +508,8 @@ static int fsp_disp(SvcObj* o, IpcCtx* c){
     case 203: return RC(2,1001);
     case 400: out_obj(c,svc_generic("IDeviceOperator")); return 0;
     case 500: out_obj(c,svc_generic("IEventNotifier")); return 0;
-    case 1003: case 1004: case 1006: case 1007: case 1008: case 1011: case 1012: case 1013: return 0;
+    case 1011: { u8 info[0x10]={0}; outbytes(c,info,sizeof info); return 0; }
+    case 1003: case 1004: case 1006: case 1007: case 1008: case 1012: case 1013: return 0;
     case 1005: out32(c,0); return 0;
     case 1009: out_obj(c,svc_generic("IFileSystemProxyAccessLog")); return 0;
     case 620: case 630: case 631: case 632: case 800: return 0;

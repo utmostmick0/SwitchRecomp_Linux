@@ -98,6 +98,11 @@ u64 plat_process_cpu_ns(void){ FILETIME c,e,k,u; if(!GetProcessTimes(GetCurrentP
 u64 plat_ns(void){ static LARGE_INTEGER f; LARGE_INTEGER t; if(!f.QuadPart) QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
   return (u64)((double)t.QuadPart*1e9/(double)f.QuadPart); }
 
+int plat_realtime(u64* ns){ FILETIME ft; GetSystemTimeAsFileTime(&ft);
+  u64 ticks=((u64)ft.dwHighDateTime<<32)|ft.dwLowDateTime;
+  if(ticks<116444736000000000ull) return 0;
+  *ns=(ticks-116444736000000000ull)*100; return 1; }
+
 i64 plat_unix_time(void){ return (i64)time(NULL); }
 
 /* UTC offset in seconds, DST included */
@@ -443,6 +448,21 @@ u64 plat_process_cpu_ns(void){ struct timespec ts; clock_gettime(CLOCK_PROCESS_C
 
 u64 plat_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (u64)ts.tv_sec*1000000000ull+ts.tv_nsec; }
 
+/* Bounded retries for transient host clock failures. Never publish an uninitialized timespec. */
+int plat_realtime(u64* ns){
+  struct timespec ts={0};
+  for(int attempt=0;attempt<8;attempt++){
+    if(!clock_gettime(CLOCK_REALTIME,&ts)){
+      if(ts.tv_sec<0 || ts.tv_nsec<0 || ts.tv_nsec>=1000000000) return 0;
+      *ns=(u64)ts.tv_sec*1000000000ull+(u64)ts.tv_nsec; return 1;
+    }
+    if(errno!=EAGAIN && errno!=EINTR) return 0;
+  }
+  /* The wall-clock seconds API is an independent fallback after transient retries. */
+  time_t seconds=time(NULL); if(seconds==(time_t)-1 || seconds<0) return 0;
+  *ns=(u64)seconds*1000000000ull; return 1;
+}
+
 i64 plat_unix_time(void){ return (i64)time(NULL); }
 
 i64 plat_tz_offset(void){ time_t t=time(NULL); struct tm lt; localtime_r(&t,&lt); return (i64)lt.tm_gmtoff; }
@@ -479,7 +499,11 @@ void plat_dir_close(PDir* d){ PD_* p=d->h; closedir(p->d); free(p); }
 
 u64 plat_file_size(const char* p){ struct stat s; if(stat(p,&s)) return 0; return (u64)s.st_size; }
 
-int plat_pread(FILE* f, void* buf, u64 size, u64 off){ return (int)pread(fileno(f),buf,size,(off_t)off); }
+int plat_pread(FILE* f, void* buf, u64 size, u64 off){
+  if(off>0x7fffffffffffffffull || size>0x7fffffffull) return -1;
+  ssize_t got; do { got=pread(fileno(f),buf,(size_t)size,(off_t)off); } while(got<0 && errno==EINTR);
+  return (int)got;
+}
 
 int plat_ncpu(void){ long n=sysconf(_SC_NPROCESSORS_ONLN); return n>0? (int)n : 1; }
 

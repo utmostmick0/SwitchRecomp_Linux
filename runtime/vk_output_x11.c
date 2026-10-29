@@ -3,6 +3,7 @@
    This is a compatibility path; cross-API zero-copy sharing can replace the
    readback once the Linux driver combinations are validated. */
 #include <X11/Xlib.h>
+#define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
 #include <dlfcn.h>
 #define VK_USE_PLATFORM_XLIB_KHR
@@ -288,6 +289,21 @@ static void destroy_swapchain(void){
   if(s_vk.swapchain) vkDestroySwapchainKHR(s_vk.device,s_vk.swapchain,NULL);
   s_vk.swapchain=VK_NULL_HANDLE; free(s_vk.images); free(s_vk.layouts); s_vk.images=NULL; s_vk.layouts=NULL; s_vk.image_count=0;
 }
+/* Keep creation and resize comparison identical. Guest dimensions are scaled by
+   screen_quad; Xlib surface limits define the actual presentation image extent. */
+static VkExtent2D presentation_extent(const VkSurfaceCapabilitiesKHR* caps,int width,int height){
+  VkExtent2D extent=caps->currentExtent;
+  if(extent.width==UINT32_MAX){
+    extent.width=width>0?(u32)width:caps->minImageExtent.width;
+    extent.height=height>0?(u32)height:caps->minImageExtent.height;
+    if(extent.width<caps->minImageExtent.width) extent.width=caps->minImageExtent.width;
+    if(extent.width>caps->maxImageExtent.width) extent.width=caps->maxImageExtent.width;
+    if(extent.height<caps->minImageExtent.height) extent.height=caps->minImageExtent.height;
+    if(extent.height>caps->maxImageExtent.height) extent.height=caps->maxImageExtent.height;
+  }
+  return extent;
+}
+
 static int create_swapchain(void){
   VkSurfaceCapabilitiesKHR caps={0};
   VkResult r=vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_vk.physical,s_vk.surface,&caps);
@@ -303,11 +319,8 @@ static int create_swapchain(void){
   for(u32 i=0;i<nf;i++) if(formats[i].format==VK_FORMAT_R8G8B8A8_UNORM){ fmt=formats[i]; break; }
   free(formats);
   s_vk.format=fmt.format;
-  VkExtent2D e=caps.currentExtent;
-  if(e.width==UINT32_MAX){ extern void backend_window_size(int*,int*); int w=1280,h=720; backend_window_size(&w,&h);
-    e.width=(u32)w; e.height=(u32)h;
-    if(e.width<caps.minImageExtent.width)e.width=caps.minImageExtent.width; if(e.width>caps.maxImageExtent.width)e.width=caps.maxImageExtent.width;
-    if(e.height<caps.minImageExtent.height)e.height=caps.minImageExtent.height; if(e.height>caps.maxImageExtent.height)e.height=caps.maxImageExtent.height; }
+  extern void backend_window_size(int*,int*); int width=0,height=0; backend_window_size(&width,&height);
+  VkExtent2D e=presentation_extent(&caps,width,height);
   if(!e.width || !e.height) return 0;
   u32 count=caps.minImageCount+1; if(caps.maxImageCount && count>caps.maxImageCount) count=caps.maxImageCount;
   VkSwapchainCreateInfoKHR ci={0}; ci.sType=VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR; ci.surface=s_vk.surface;
@@ -344,10 +357,10 @@ static int create_staging(void){
 }
 static int recreate_if_resized(void){
   VkSurfaceCapabilitiesKHR caps={0}; if(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_vk.physical,s_vk.surface,&caps)!=VK_SUCCESS) return 0;
-  int w=1280,h=720; extern void backend_window_size(int*,int*); backend_window_size(&w,&h);
-  u32 sw=caps.currentExtent.width==UINT32_MAX?(u32)w:caps.currentExtent.width;
-  u32 sh=caps.currentExtent.height==UINT32_MAX?(u32)h:caps.currentExtent.height;
-  if(sw==s_vk.extent.width && sh==s_vk.extent.height) return 1;
+  int w=0,h=0; extern void backend_window_size(int*,int*); backend_window_size(&w,&h);
+  VkExtent2D extent=presentation_extent(&caps,w,h);
+  if(extent.width==s_vk.extent.width && extent.height==s_vk.extent.height) return 1;
+  if(!extent.width || !extent.height) return 0;
   vkDeviceWaitIdle(s_vk.device);
   if(s_vk.mapped){ vkUnmapMemory(s_vk.device,s_vk.staging_memory); s_vk.mapped=NULL; }
   if(s_vk.staging) vkDestroyBuffer(s_vk.device,s_vk.staging,NULL); s_vk.staging=VK_NULL_HANDLE;
@@ -401,13 +414,20 @@ int swr_vk_output_x11_present(void){
   if(!s_vk.enabled || !recreate_if_resized()) return 0;
   VkResult wr=vkWaitForFences(s_vk.device,1,&s_vk.fence,VK_TRUE,UINT64_MAX); if(wr!=VK_SUCCESS){ vk_log_error("frame fence wait",wr); return 0; }
   while(glGetError()!=GL_NO_ERROR){}
-  GLint old_read=GL_BACK, old_align=4, old_row=0, old_skip_px=0, old_skip_rows=0;
+  GLint old_read=GL_BACK, old_align=4, old_row=0, old_skip_px=0, old_skip_rows=0, old_fbo=0, old_pack=0;
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&old_fbo); glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,&old_pack);
   glGetIntegerv(GL_READ_BUFFER,&old_read); glGetIntegerv(GL_PACK_ALIGNMENT,&old_align);
   glGetIntegerv(GL_PACK_ROW_LENGTH,&old_row); glGetIntegerv(GL_PACK_SKIP_PIXELS,&old_skip_px); glGetIntegerv(GL_PACK_SKIP_ROWS,&old_skip_rows);
+  /* GL handles are not Vulkan image handles: read the completed window buffer
+     into CPU memory, then submit the existing staging copy to the acquired image. */
+  glBindFramebuffer(GL_READ_FRAMEBUFFER,0); glBindBuffer(GL_PIXEL_PACK_BUFFER,0);
   glReadBuffer(GL_BACK); glPixelStorei(GL_PACK_ALIGNMENT,1);
   glPixelStorei(GL_PACK_ROW_LENGTH,0); glPixelStorei(GL_PACK_SKIP_PIXELS,0); glPixelStorei(GL_PACK_SKIP_ROWS,0);
-  glReadPixels(0,0,(GLsizei)s_vk.extent.width,(GLsizei)s_vk.extent.height,GL_RGBA,GL_UNSIGNED_BYTE,s_vk.pixels);
-  GLenum ge=glGetError(); glReadBuffer((GLenum)old_read); glPixelStorei(GL_PACK_ALIGNMENT,old_align);
+  GLenum status=glCheckFramebufferStatus(GL_READ_FRAMEBUFFER);
+  if(status==GL_FRAMEBUFFER_COMPLETE) glReadPixels(0,0,(GLsizei)s_vk.extent.width,(GLsizei)s_vk.extent.height,GL_RGBA,GL_UNSIGNED_BYTE,s_vk.pixels);
+  GLenum ge=glGetError(); if(status!=GL_FRAMEBUFFER_COMPLETE) ge=GL_INVALID_FRAMEBUFFER_OPERATION;
+  glBindFramebuffer(GL_READ_FRAMEBUFFER,(GLuint)old_fbo); glBindBuffer(GL_PIXEL_PACK_BUFFER,(GLuint)old_pack);
+  glReadBuffer((GLenum)old_read); glPixelStorei(GL_PACK_ALIGNMENT,old_align);
   glPixelStorei(GL_PACK_ROW_LENGTH,old_row); glPixelStorei(GL_PACK_SKIP_PIXELS,old_skip_px); glPixelStorei(GL_PACK_SKIP_ROWS,old_skip_rows);
   if(ge!=GL_NO_ERROR){ WARN("vulkan output: OpenGL back-buffer read failed (%x)\n",ge); return 0; }
   u32* src=(u32*)s_vk.pixels; u32* dst=(u32*)s_vk.mapped; size_t stride=s_vk.extent.width;

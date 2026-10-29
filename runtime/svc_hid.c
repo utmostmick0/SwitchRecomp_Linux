@@ -115,7 +115,7 @@ static int hid_disp(SvcObj* o, IpcCtx* c){
       out_copy_h(c,h_new(&g_style_ev[i]->o)); return 0; }
     case 108: { u32 id=in32(c,0); u64 led= id<8? (1ull<<id) : 0; out64(c,led); return 0; }   /* GetPlayerLedPattern */
     case 120: g_hold_type=in64(c,8); return 0;
-    case 121: out64(c,g_hold_type); return 0;                                      /* GetNpadJoyHoldType */
+    case 121: out64(c,(u64)0); return 0;                                          /* GetNpadJoyHoldType: vertical baseline */
     case 127: g_handheld_mode=in64(c,8); return 0;
     case 128: out64(c,g_handheld_mode); return 0;                                  /* GetNpadHandheldActivationMode */
     case 129: out32(c,0); return 0;                                                /* GetNpadFullKeyGripColor... */
@@ -155,6 +155,12 @@ static void no1_setup(void){ if(!g_hid_shm) return; u8* b=kshmem_ptr(g_hid_shm);
 void svc_hid_init(void){
   g_hid_shm=kshmem_new(0x40000,"hid"); kobj_ref(&g_hid_shm->o);
   u8* b=kshmem_ptr(g_hid_shm);
+  /* Newer SDKs read GetNpadJoyHoldType directly from NpadCondition rather
+     than IPC command 121. Publish the vertical baseline and its valid flag. */
+  u8* condition=b+HO_HidSharedMemory_npad_condition;
+  u32 hold_type=0;
+  memcpy(condition+HO_HidNpadCondition_joy_hold_type,&hold_type,sizeof hold_type);
+  condition[HO_HidNpadCondition_initialized]=1;
   no1_setup();
   npad_setup(b,8,1u<<1,(1u<<2)|(1u<<3));              /* Handheld */
   hid_update(); hid_update();

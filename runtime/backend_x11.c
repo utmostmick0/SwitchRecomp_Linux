@@ -109,7 +109,7 @@ static const char* HELP=
   "  Arrows = D-Pad     W A S D = Left stick    I J K L = Right stick\n"
   "  X / Space = A    Z = B    C = X    V = Y\n"
   "  Q = L   E = R   1 = ZL   3 = ZR   Enter = +   Backspace = -\n\n"
-  "F1 = this help   F3 = screenshot   F4 = FPS limit 60 / unlimited   F5 = diagnostic dump (trace)\n"
+  "F1 = this help   F3 = screenshot   F4 = FPS limit 60 / 30 / unlimited   F5 = diagnostic dump (trace)\n"
   "F8 = instant full-resolution screenshot (PNG in the captures folder)\n"
   "F11 / Alt+Enter = fullscreen   Esc = quit";
 
@@ -227,7 +227,7 @@ static void key_down(XKeyEvent* e){
         plat_mkdir("captures"); FILE* f=fopen("captures/threads.txt","w");   /* written next to the trace */
         if(f){ g_log_redirect=f; kernel_dump_threads(); g_log_redirect=NULL; fclose(f); }
         kernel_dump_threads(); gpu_gl_dump_rts(); } return;
-    case XK_F4: if(once){ g_opt_fps= g_opt_fps==0? 1 : 0; char t[300]; snprintf(t,sizeof t,"%s  |  FPS limit: %s",g_title,g_opt_fps==0? "unlimited" : "60"); set_title(t);
+    case XK_F4: if(once){ g_opt_fps= g_opt_fps==0? 60 : g_opt_fps==30? 0 : 30; char t[300]; snprintf(t,sizeof t,"%s  |  FPS limit: %s",g_title,g_opt_fps==0? "unlimited" : g_opt_fps==30? "30" : "60"); set_title(t);
         extern void ini_set(const char*, const char*); char v[8]; snprintf(v,sizeof v,"%d",g_opt_fps); ini_set("fps_limit",v); } return;
   }
   keys_held|=keymap(k); }

@@ -104,7 +104,14 @@ static u64 alloc_tls(void){ u64 a=kmem_alloc(0x1000,MS_TLS,PERM_RW); memset(GP(a
 
 KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core){
   KThread* t=calloc(1,sizeof *t);
-  t->o.type=KO_THREAD; t->o.is_signaled=th_sig; t->o.destroy=th_destroy; t->o.name="thread";
+  t->o.type=KO_THREAD; t->o.is_signaled=th_sig; t->o.destroy=th_destroy;
+  
+  /* CRITICAL RTTI METADATA FIX: Force absolute string array initialization 
+     on both the core object descriptor and the thread tracking registers to satisfy 
+     the guest standard library's bad_typeid and polymorphic verification lookups. */
+  t->o.name = "KThread";
+  strcpy(t->name, "KThread");
+
   t->entry=entry; t->arg=arg; t->stack_top=stack_top; t->prio=prio; t->core=core<0? 0 : core; t->ideal=t->core; t->affinity=1ull<<t->core;
   t->tls=alloc_tls(); pc_init(&t->cv);
   pm_lock(&g_klock); t->id=g_next_tid++; if(g_nthreads<256) g_threads[g_nthreads++]=t; pm_unlock(&g_klock);
@@ -113,6 +120,8 @@ KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core){
   c->tpidrro=t->tls; c->x[0]=arg; c->x[31]=stack_top; c->pc=entry;
   return t;
 }
+
+
 
 void swr_fpcr_apply(CPU* c);
 
@@ -243,8 +252,10 @@ static u32 svc_arbitrate_lock(KThread* t, u32 owner, u64 addr, u32 tag){
     u32 nv=tag|(wl_count(2,addr)? HANDLE_WAIT : 0);
     int repaired=__atomic_compare_exchange_n(U32(addr),&v,nv,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST);
     int brake=0;
+    /* Successful repairs can immediately recur on the same guest mutex. Keep
+       their streak, but a lost repair race breaks consecutive repair tracking. */
     if(repaired){ heal_note("on request",addr,v); brake=mutex_retry_brake_due(t,addr); }
-    if(t && addr!=0x112f05d58ull){ t->mutex_retry_addr=0; t->mutex_retry_spins=0; }
+    else if(t){ t->mutex_retry_addr=0; t->mutex_retry_spins=0; }
     pm_unlock(&g_klock); if(brake) mutex_retry_brake(addr); return 0; }   /* caller rereads the word and retries */
   t->mutex_retry_addr=0; t->mutex_retry_spins=0;
   t->wait_kind=2; t->wait_addr=addr; t->wait_tag=tag; t->woken=0; wl_add(t);
@@ -664,6 +675,10 @@ void hle_install(void){
   extern GuestFn* g_disp; extern u64 g_code_lo, g_code_hi;
   gsym_load(); int n=0;
   for(int i=0;i<g_ngsyms;i++){ const char* nm=(const char*)GP(g_gstr[g_gsyms[i].mod]+g_gsyms[i].name_off); u64 a=g_gsyms[i].addr;
+    if(a>=g_code_lo && a<g_code_hi && !(a&3)){
+      GuestFn clock=hle_clock_adapter(nm,a,g_disp[(a-g_code_lo)/4]);
+      if(clock){ g_disp[(a-g_code_lo)/4]=clock; n++; LOG("hle: native clock_gettime at %llx\n",(unsigned long long)a); continue; }
+    }
     if(heap_fn_wanted(nm) && !getenv("SWR_NO_HEAP_LOCK") && a>=g_code_lo && a<g_code_hi && !(a&3) && g_nhl<HL_MAX){
       GuestFn* d=&g_disp[(a-g_code_lo)/4]; if(*d && *d!=hle_heap_locked){ if(!g_nhl) pm_init(&g_hl_m); g_hl[g_nhl].a=a; g_hl[g_nhl].f=*d; g_nhl++; *d=hle_heap_locked; }
       continue; }
@@ -782,7 +797,18 @@ static void swr_svc_(CPU* c, u32 imm){
   case 0x09: { KThread* n=(KThread*)h_get_type((u32)x[0],KO_THREAD); if(!n){ x[0]=R_BADHANDLE; return; }
     if(n->state==0) kthread_start(n); x[0]=0; return; }
   case 0x0A: svc_exit_thread(t); return;
-  case 0x0B: { i64 ns=(i64)x[0]; t->sleep_lr=x[30]; t->sleep_n++; memcpy(t->sleep_x,x,sizeof t->sleep_x);
+  case 0x0B: { i64 ns=(i64)x[0];
+    if(t){ t->sleep_lr=x[30]; t->sleep_n++; memcpy(t->sleep_x,x,sizeof t->sleep_x); }
+    if(ns<0) ns=0;
+    /* No kernel lock is held here. Restart the short-sleep streak after each
+       second-stage scheduling window instead of latching at the threshold. */
+    if(t && t->id==80 && ns<=20000){
+      if(++t->rapid_sleep_count>64){
+        t->rapid_sleep_count=0;
+        plat_sleep_ns(50000); plat_yield(); return;
+      }
+      if(!(t->rapid_sleep_count%32)){ plat_sleep_ns(20000); return; }
+    } else if(t) t->rapid_sleep_count=0;
     if(ns<=0) plat_yield(); else plat_sleep_ns(ns); return; }
   case 0x0C: { KThread* n=(KThread*)h_get_type((u32)x[1],KO_THREAD); if(!n){ x[0]=R_BADHANDLE; return; } x[0]=0; x[1]=(u32)n->prio; return; }
   case 0x0D: { KThread* n=(KThread*)h_get_type((u32)x[0],KO_THREAD); if(!n){ x[0]=R_BADHANDLE; return; } n->prio=(int)(u32)x[1]; x[0]=0; return; }

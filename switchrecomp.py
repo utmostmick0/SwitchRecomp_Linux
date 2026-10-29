@@ -29,7 +29,7 @@ sys.path.insert(0, HERE)
 import nxloader, codegen
 
 RT = os.path.join(HERE, 'runtime')
-RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'audio', 'svc_hid', 'svc_fs', 'svc_vi', 'nvdrv', 'gpu', 'gpu_engines',
+RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'hle_services', 'hle_heaps', 'audio', 'audio_effects', 'svc_hid', 'svc_fs', 'svc_vi', 'nvdrv', 'gpu', 'gpu_engines',
                'gpu_3d', 'loader', 'main']
 ABI = 1
 # portable compilers next to us: tcc\, the GCC package (gcc\), w64devkit

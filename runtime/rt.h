@@ -51,6 +51,7 @@ u64  plat_ns(void);                  /* monotonic */
 u64  plat_thread_cpu_ns(void);        /* cpu time, this thread */
 u64  plat_process_cpu_ns(void);       /* cpu time, whole process */
 i64  plat_unix_time(void);
+int  plat_realtime(u64* ns);
 i64  plat_tz_offset(void);           /* local - UTC, seconds */
 u8*  plat_vm_reserve(u64 size);
 int  plat_ww_collect(u8* base, u64 size, void (*cb)(u64));
@@ -174,6 +175,7 @@ struct KThread {
   int is_main;
   void* jmpbuf;
   u64 sleep_lr, sleep_n, sleep_x[31];   /* for threads.txt: catches SleepThread polling loops */
+  u32 rapid_sleep_count;       /* consecutive short SleepThread calls */
   u64 mutex_retry_addr; u32 mutex_retry_spins; /* thread 80: repeated arbitration on one mutex cell */
   u32 sync_poll_spins;           /* consecutive zero-timeout WaitSynchronization polls */
   struct { u32 imm, res, n, h0; u64 lr, a[4]; } svc_hist[24]; u32 svc_hist_n;   /* threads.txt: this thread's last SVCs */
@@ -250,6 +252,11 @@ SvcObj* svcobj_new(const char* name, int (*dispatch)(SvcObj*, IpcCtx*), size_t d
 void    svcobj_unref(SvcObj* o);
 u32     session_new(SvcObj* obj);
 void    ipc_handle(KThread* t, u32 handle, u64 msg_addr);
+void    hle_services_init(void);
+GuestFn hle_service_lookup(const char* name);
+GuestFn hle_clock_adapter(const char* name,u64 entry,GuestFn original);
+void    hle_heaps_init(void);
+GuestFn hle_heap_adapter(const char* name,u64 entry,GuestFn original);
 /* reading args */
 static inline u32 in32(IpcCtx* c, u32 off){ u32 v=0; if(off+4<=c->raw_size) memcpy(&v,c->raw+off,4); return v; }
 

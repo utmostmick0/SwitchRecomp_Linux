@@ -85,6 +85,13 @@ static void nvev_lock(void){ while(__atomic_exchange_n(&g_nvev_lk,1,__ATOMIC_ACQ
 
 static void nvev_unlock(void){ __atomic_store_n(&g_nvev_lk,0,__ATOMIC_RELEASE); }
 
+/* Every returned async token must refer to one stable, retained event object. */
+static KEvent* nv_event_get(u32 slot){
+  slot&=63; nvev_lock();
+  if(!nvev[slot].ev){ nvev[slot].ev=kevent_new("nvhost event",0); kobj_ref(&nvev[slot].ev->o); }
+  KEvent* event=nvev[slot].ev; nvev_unlock(); return event;
+}
+
 void nv_events_check(void){
   nvev_lock();
   for(int i=0;i<64;i++) if(nvev[i].armed && (i32)(syncpt_read(nvev[i].id)-nvev[i].thresh)>=0){ nvev[i].armed=0; kevent_signal(nvev[i].ev); }
@@ -177,12 +184,13 @@ static u32 ioctl_ctrl(u32 cmd, u8* d, u32 n){
       nvev_lock(); if(nvev[slot].ev){ nvev[slot].armed=0; kevent_signal(nvev[slot].ev); } nvev_unlock();
       { static int said; if(said<2){ said++; LOG("nvdrv: event %u signaled by the game\n",slot); } }
       return 0; }
-    case 0x1D: case 0x1E: { u32 id, th; i32 to; u32 ev; memcpy(&id,d,4); memcpy(&th,d+4,4); memcpy(&to,d+8,4); memcpy(&ev,d+12,4);
+    case 0x1D: case 0x1E: { if(n<16) return 1; u32 id, th; i32 to; u32 ev; memcpy(&id,d,4); memcpy(&th,d+4,4); memcpy(&to,d+8,4); memcpy(&ev,d+12,4);
       if(syncpt_wait(id,th,0)){ u32 v=syncpt_read(id); memcpy(d+12,&v,4); return 0; }
       if((cmd&0xFF)==0x1D && to!=0){ int ok=syncpt_wait(id,th,to<0? -1 : (i64)to*1000000); if(ok){ u32 v=syncpt_read(id); memcpy(d+12,&v,4); return 0; } }
-      u32 slot=ev&63; if(nvev[slot].ev){ nvev_lock(); kevent_clear(nvev[slot].ev); nvev[slot].id=id; nvev[slot].thresh=th; nvev[slot].armed=1; nvev_unlock(); nv_events_check(); }
+      u32 slot=ev&63; KEvent* event=nv_event_get(slot);
+      nvev_lock(); kevent_clear(event); nvev[slot].id=id; nvev[slot].thresh=th; nvev[slot].armed=1; nvev_unlock(); nv_events_check();
       u32 r=0x10000000u|(slot)|(id<<16); memcpy(d+12,&r,4); return 5; }       /* timeout, caller will wait on the event */
-    case 0x1F: { u32 ev; memcpy(&ev,d,4); ev&=63; if(!nvev[ev].ev){ nvev[ev].ev=kevent_new("nvhost event",0); kobj_ref(&nvev[ev].ev->o); } return 0; }
+    case 0x1F: { if(n<4) return 1; u32 ev; memcpy(&ev,d,4); nv_event_get(ev); return 0; }
     case 0x20: case 0x21: return 0;
   }
   WARN("ctrl ioctl %x\n",cmd); return 0; }
@@ -285,7 +293,7 @@ static int nvdrv_disp(SvcObj* o, IpcCtx* c){
     case 2: { u32 fd=in32(c,0); if(fd<256) nvf[fd].dev=0; out32(c,0); return 0; }
     case 3: out32(c,0); return 0;
     case 4: { u32 fd=in32(c,0), id=in32(c,4); (void)fd;
-      u32 slot=id&63; if(((id>>28)&0xF)==1 || id<64){ if(!nvev[slot].ev){ nvev[slot].ev=kevent_new("nv event",0); kobj_ref(&nvev[slot].ev->o); } out_copy_h(c,h_new(&nvev[slot].ev->o)); }
+      u32 slot=id&63; if(((id>>28)&0xF)==1 || id<64){ KEvent* event=nv_event_get(slot); out_copy_h(c,h_new(&event->o)); }
       else { KEvent* e=kevent_new("nv query",0); out_copy_h(c,h_new(&e->o)); }
       out32(c,0); return 0; }
     case 5: case 6: case 8: case 9: case 10: case 13: out32(c,0); return 0;

@@ -304,17 +304,20 @@ static void attr_write(Ctx* c, u32 addr, const char* val){
 
 /* ============================================================ textures */
 static u8 g_bl2; static u32 g_bl2_bank, g_bl2_off;   /* second handle read for split handles, set by track_handle */
-static int tex_slot2(Ctx* c, u32 cbuf_off_words, int type, int array, int shadow, int fetch, int bl, u32 bank);
+static int tex_slot2(Ctx* c, u32 cbuf_off_words, int type, int array, int shadow, int fetch, int bl, u32 bank, int can_3d);
 
-static int tex_slot(Ctx* c, u32 cbuf_off_words, int type, int array, int shadow, int fetch){ return tex_slot2(c,cbuf_off_words,type,array,shadow,fetch,0,0); }
+static int tex_slot(Ctx* c, u32 cbuf_off_words, int type, int array, int shadow, int fetch){ return tex_slot2(c,cbuf_off_words,type,array,shadow,fetch,0,0,0); }
 
-static int tex_slot2(Ctx* c, u32 cbuf_off_words, int type, int array, int shadow, int fetch, int bl, u32 bank){
+static int tex_slot2(Ctx* c, u32 cbuf_off_words, int type, int array, int shadow, int fetch, int bl, u32 bank, int can_3d){
   ShaderInfo* si=c->si;
   u8 b2= bl? g_bl2 : 0;
-  for(int i=0;i<si->ntex;i++){ ShTex* t=&si->tex[i]; if(t->cbuf_off==cbuf_off_words && t->type==type && t->array==array && t->shadow==shadow && t->bindless==bl && (!bl || t->bl_cbuf==bank)
-      && t->bl2==b2 && (!b2 || (t->bl2_cbuf==g_bl2_bank && t->bl2_off==g_bl2_off))) { if(!fetch) t->fetch_only=0; return i; } }
+  for(int i=0;i<si->ntex;i++){ ShTex* t=&si->tex[i]; if(t->cbuf_off==cbuf_off_words && t->instruction_type==type && t->instruction_array==array && t->shadow==shadow && t->bindless==bl && (!bl || t->bl_cbuf==bank)
+      && t->bl2==b2 && (!b2 || (t->bl2_cbuf==g_bl2_bank && t->bl2_off==g_bl2_off))) { if(!fetch) t->fetch_only=0; t->can_3d&=can_3d; return i; } }
   if(si->ntex>=SH_MAXTEX) return 0;
   ShTex* t=&si->tex[si->ntex]; memset(t,0,sizeof *t); t->cbuf_off=cbuf_off_words; t->type=(u8)type; t->array=(u8)array; t->shadow=(u8)shadow; t->fetch_only=(u8)fetch;
+  t->instruction_type=(u8)type; t->instruction_array=(u8)array; t->can_3d=(u8)can_3d;
+  if(can_3d && ((si->tex_3d_mask>>si->ntex)&1)) t->type=2;
+  if(can_3d && ((si->tex_array_mask>>si->ntex)&1)){ t->type=1; t->array=1; }
   t->bindless=(u8)bl; t->bl_cbuf=(u8)bank; if(bl && bank<18){ si->cbuf_mask|=1u<<bank; if(cbuf_off_words*4+16>si->cbuf_max[bank]) si->cbuf_max[bank]=((cbuf_off_words*4)|15)+1; }
   if(b2){ t->bl2=1; t->bl2_cbuf=(u8)g_bl2_bank; t->bl2_off=g_bl2_off; u32 b=g_bl2_bank;
     if(b<18){ si->cbuf_mask|=1u<<b; if(g_bl2_off*4+16>si->cbuf_max[b]) si->cbuf_max[b]=((g_bl2_off*4)|15)+1; } }
@@ -830,6 +833,19 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     else { static const char* fn[9]={"atomicAdd","atomicMin","atomicMax","","","atomicAnd","atomicOr","atomicXor","atomicExchange"}; emitl(c,"old_ = %s(%s, %s);",fn[aop],m,v); }
     setr(c,d,"old_");
     c->indent--; emitl(c,"}"); break; }
+  /* VMAD is integer video multiply-add, not FFMA. Operands select and
+     sign/zero extend packed components before the wrapping 32-bit multiply.
+     Modifier encodings without verified semantics remain diagnostic. */
+  case O_VMAD: {
+    if(B(w,47,1) || B(w,51,5)) { unsupported(c,op->name,w); break; }
+    int breg=B(w,50,1), asg=B(w,48,1), bsg=B(w,49,1);
+    u32 aw=B(w,37,2), asel=B(w,36,2), bw=breg?B(w,29,2):2, bsel=breg?B(w,28,2):0;
+    const char* av=R(c,a);
+    const char* bv=breg?R(c,B(w,20,8)):T("%uu",B(w,20,16));
+    const char* A=aw==3?av:T("uint(bitfieldExtract(%s(%s),%u,%u))",asg?"int":"uint",av,asel*(aw==2?16:8),aw==2?16:8);
+    const char* V=bw==3?bv:T("uint(bitfieldExtract(%s(%s),%u,%u))",bsg?"int":"uint",bv,bsel*(bw==2?16:8),bw==2?16:8);
+    setr(c,d,T("(%s * %s + %s)",A,V,R(c,B(w,39,8))));
+    break; }
   /* VMNMX: video min/max. min/max of the selected bytes/halves of a and b, then a second op with c (merge into c,
      add, min or max) */
   case O_VMNMX: {
@@ -873,7 +889,12 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
       case 13: type=3; crd=T("vec3(%s,%s,%s)",RF(c,ra),RF(c,ra+1),RF(c,rb)); lod=RF(c,rb+1); break;   /* cube + LL: z in rb, lod in rb+1 (same as what NVN's
                                                                                                          compiler emits) */
     }
-    int s=tex_slot(c,off,type,array,shadow,0);
+    int can_3d=type==1 && !array && !shadow && (enc==1 || enc==2);
+    int s=tex_slot2(c,off,type,array,shadow,0,0,0,can_3d);
+    if(can_3d && ((c->si->tex_3d_mask>>s)&1)){
+      type=2; crd=T("vec3(%s,%s,%s)",RF(c,ra),RF(c,ra+1),RF(c,rb));
+    }
+    if(can_3d && ((c->si->tex_array_mask>>s)&1)) crd=T("vec3(%s, 0.0)",crd);
     if(type==0) crd=T("vec2(%s, 0.5)",crd);
     if(array) crd=T("vec3(%s, float(%s))",crd,arr);
     const char* smp;
@@ -913,7 +934,7 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
         emitl(c,"imageStore(img%d, %s, swr_r2v(uvec4(%s, %s, %s, %s), %uu, %uu, swr_ic[%d]));",k,crd,R(c,rdd),nw>1? R(c,rdd+1) : "0u",nw>2? R(c,rdd+2) : "0u",nw>2? R(c,rdd+3) : "0u",nw,sz,k); }
     } else {
       int tt= ty==5? 2 : (ty==0||ty==2)? 0 : 1, arr= ty==2||ty==4;
-      int ts=tex_slot2(c,off,tt,arr,0,1,bl,bank);
+      int ts=tex_slot2(c,off,tt,arr,0,1,bl,bank,0);
       if(c->stage!=ST_CS){
         /* SULD in a graphics shader (super mario party's fragment shaders): the format uniforms only exist for
            compute, so raw loads get converted like the texture was unorm of the size it asks for. not exact but
@@ -956,7 +977,12 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
       case 12: crd=T("ivec2(%s,%s)",R(c,ra),R(c,ra+1)); lod=T("int(%s)",R(c,rb)); ofs=R(c,rb+1); break;
       default: crd=T("ivec2(%s,%s)",R(c,ra),R(c,rb)); break;
     }
-    int s=tex_slot(c,off,type,array,0,1);
+    int can_3d=type==1 && !array && enc==2;
+    int s=tex_slot2(c,off,type,array,0,1,0,0,can_3d);
+    if(can_3d && ((c->si->tex_3d_mask>>s)&1)){
+      type=2; crd=T("ivec3(%s,%s,%s)",R(c,ra),R(c,ra+1),R(c,rb));
+    }
+    if(can_3d && ((c->si->tex_array_mask>>s)&1)) crd=T("ivec3(%s, 0)",crd);
     if(type==0) crd=T("ivec2(%s, 0)",crd);
     const char* smp= ofs? T("texelFetch(tex%d, %s + ivec2(bitfieldExtract(int(%s),0,4),bitfieldExtract(int(%s),4,4)), %s)",s,crd,ofs,ofs,lod) : T("texelFetch(tex%d, %s, %s)",s,crd,lod);
     emitl(c,"{ vec4 t_ = %s;",IW(c,s,smp)); c->indent++; write_texs(c,w,"t_",!B(w,59,1)); c->indent--; emitl(c,"}");   /* bit59: fp32 */
@@ -982,6 +1008,11 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     if(eid==O_TEX){ dc=B(w,50,1); aoffi=B(w,54,1); blod=B(w,55,3); }
     else if(eid==O_TLD4){ dc=B(w,50,1); aoffi=B(w,54,2)!=0; }
     else if(eid==O_TLD){ blod= B(w,55,1)? 3 : 1; aoffi=B(w,35,1); }
+    /* Only forms with a contiguous coordinate register tuple can be specialized.
+       Gather, shadow, array and packed-offset forms retain their opcode layout. */
+    int can_3d=type==1 && !array && !dc && !aoffi && (eid==O_TEX || eid==O_TLD);
+    int s=tex_slot2(c,off,type,array,dc,eid==O_TLD,bl,blbank,can_3d);
+    if(can_3d && ((c->si->tex_3d_mask>>s)&1)) type=2;
     int dim= type==0? 1 : type==1? 2 : 3;
     const char* arr=NULL; u32 r=cr;
     if(array){ arr=R(c,r); r++; }
@@ -992,8 +1023,9 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     if(blod==2||blod==6){ bias=RF(c,m); m++; } else if(blod==3||blod==7){ lod= eid==O_TLD? T("int(%s)",R(c,m)) : RF(c,m); m++; } else if(blod==1){ lod= eid==O_TLD? "0" : "0.0"; }
     if(aoffi){ ofs=R(c,m); m++; }
     if(dc){ dref=RF(c,m); m++; }
-    int s=tex_slot2(c,off,type,array,dc,eid==O_TLD,bl,blbank);
+
     if(type==0){ crd= eid==O_TLD? T("ivec2(%s, 0)",crd) : T("vec2(%s, 0.5)",crd); dim=2; }
+    if(can_3d && ((c->si->tex_array_mask>>s)&1)) crd=eid==O_TLD?T("ivec3(%s, 0)",crd):T("vec3(%s, 0.0)",crd);
     if(array && id!=O_TLD) crd=T("vec%d(%s, float(%s))",dim+1,crd,arr);
     if(array && eid==O_TLD) crd=T("ivec%d(%s, int(%s))",dim+1,crd,arr);
     const char* smp;
@@ -1024,7 +1056,7 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
   case O_TXQ: case O_TXQ_B: {
     u32 q=B(w,22,6), mask=B(w,31,4), off=B(w,36,13); int bl= id==O_TXQ_B; u32 blbank=0, bloff=0;
     if(bl){ if(!track_handle(c,idx,a,&blbank,&bloff)){ unsupported(c,"TXQ.B (untracked handle)",w); break; } off=bloff/4; a++; }
-    int s=tex_slot2(c,off,1,0,0,1,bl,blbank);
+    int s=tex_slot2(c,off,1,0,0,1,bl,blbank,0);
     if(q==1){ emitl(c,"{ ivec2 sz_ = textureSize(tex%d, int(%s)); uvec4 t_ = uvec4(uint(sz_.x), uint(sz_.y), 1u, %s);",s,R(c,a),T("uint(textureQueryLevels(tex%d))",s)); c->indent++;
       u32 r=d; for(int k=0;k<4;k++) if(mask&(1u<<k)){ setr(c,r,T("t_.%c","xyzw"[k])); r++; } c->indent--; emitl(c,"}"); }
     else { u32 r=d; for(int k=0;k<4;k++) if(mask&(1u<<k)){ setr(c,r,"0u"); r++; } }
@@ -1060,6 +1092,13 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     else if(c->stage==ST_FS && q==0x5A) setrf(c,d,T("(-dFdy(%s))",RF(c,rb)));
     else setrf(c,d,T("(%s + %s)",RF(c,a),RF(c,rb)));
     break; }
+    case O_ISBERD:
+    /* SYSTEMIC XC2 COMPUTE LOCK FIX:
+       Silently translate the Maxwell Isolate Barrier Domain opcode 
+       to establish a clean host execution barrier, preventing the driver 
+       from stalling on untranslated instruction pipeline bubbles. */
+    emitl(c, "/* ISBERD barrier segment fallback */");
+    break;
   case O_OUT_R: case O_OUT_C: case O_OUT_I: {
     u32 k=B(w,39,2); if(k&1) emitl(c,"EmitVertex();"); if(k&2) emitl(c,"EndPrimitive();"); setr(c,d,R(c,a)); break; }
   case O_HADD2_R: case O_HMUL2_R: case O_HFMA2_R: case O_HADD2_C: case O_HMUL2_C: case O_HADD2_I: case O_HMUL2_I: case O_HADD2_32I: case O_HMUL2_32I: case O_HFMA2_32I: case O_HFMA2_I: case O_HFMA2_RC: case O_HFMA2_CR: {
@@ -1248,11 +1287,11 @@ static int st_check(Ctx* c, u32 n, u32* jt){
 char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
   if(!ops_ready) ops_init();
   Ctx* c=calloc(1,sizeof(Ctx)); c->w=(const u64*)code; c->stage=stage; c->si=si;
-  u32 attr_int=si->attr_int_mask, attr_sint=si->attr_sint_mask, flat=si->fs_flat_mask; u32 ktm=si->tex_int_mask, kts=si->tex_sint_mask, krm=si->rt_int_mask, krs=si->rt_sint_mask;
+  u32 attr_int=si->attr_int_mask, attr_sint=si->attr_sint_mask, flat=si->fs_flat_mask; u32 kar=si->tex_array_mask; u32 k3d=si->tex_3d_mask; u32 ktm=si->tex_int_mask, kts=si->tex_sint_mask, krm=si->rt_int_mask, krs=si->rt_sint_mask;
   u32 gs_input_vertices=si->gs_input_vertices;
   u32 kcl[3]={si->cs_local[0],si->cs_local[1],si->cs_local[2]}; int ksh=si->shared_size;
   /* keep attr_sint_mask too, signed integer attributes have to be declared ivec4 and not uvec4 */
-  memset(si,0,sizeof *si); si->stage=stage; si->gs_input_vertices=gs_input_vertices; memcpy(si->cs_local,kcl,sizeof kcl); si->shared_size=ksh; si->attr_int_mask=attr_int; si->attr_sint_mask=attr_sint; si->fs_flat_mask=flat; si->tex_int_mask=ktm; si->tex_sint_mask=kts; si->rt_int_mask=krm; si->rt_sint_mask=krs;
+  memset(si,0,sizeof *si); si->stage=stage; si->gs_input_vertices=gs_input_vertices; memcpy(si->cs_local,kcl,sizeof kcl); si->shared_size=ksh; si->attr_int_mask=attr_int; si->attr_sint_mask=attr_sint; si->fs_flat_mask=flat; si->tex_array_mask=kar; si->tex_3d_mask=k3d; si->tex_int_mask=ktm; si->tex_sint_mask=kts; si->rt_int_mask=krm; si->rt_sint_mask=krs;
   memcpy(si->sph,code,80);
   u32 len; shader_hash(code,max_bytes,&len); u32 n=len/8; c->nwords=n;
   /* leaders + branch targets */

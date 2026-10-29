@@ -142,6 +142,13 @@ static int am_window(SvcObj* o, IpcCtx* c){
   switch(c->cmd){ case 1: out64(c,0x1234); return 0; case 10: case 11: case 12: return 0; }
   return stub_ok(o,c); }
 
+static const char* language_codes[]={"ja","en-US","fr","de","it","es","zh-CN","ko","nl","pt","ru","zh-TW","en-GB","fr-CA","es-419","zh-Hans","zh-Hant","pt-BR"};
+static u64 configured_language_code(void){
+  unsigned index=(unsigned)g_opt_lang;
+  if(index>=sizeof language_codes/sizeof language_codes[0]) index=1;
+  u64 code=0; memcpy(&code,language_codes[index],strlen(language_codes[index])); return code;
+}
+
 static int am_appfn(SvcObj* o, IpcCtx* c){         /* IApplicationFunctions */
   switch(c->cmd){
     case 1: { u32 kind=in32(c,0);
@@ -153,12 +160,12 @@ static int am_appfn(SvcObj* o, IpcCtx* c){         /* IApplicationFunctions */
       return RC(128,2); }
     case 10: out_obj(c,am_storage_new(in64(c,0),NULL)); return 0;
     case 20: out64(c,0); return 0;                                     /* EnsureSaveData */
-    case 21: { const char* l[]={"ja","en-US","fr","de","it","es","zh-CN","ko","nl","pt","ru","zh-TW","en-GB","fr-CA","es-419"};
-      u64 v=0; const char* s=l[g_opt_lang%15]; memcpy(&v,s,strlen(s)); out64(c,v); return 0; }
+    case 21: out64(c,configured_language_code()); return 0; /* GetDesiredLanguage: inline u64 */
     case 25: out64(c,0); return 0;                                     /* ExtendSaveData */
     case 26: out64(c,0x4000000); out64(c,0x4000000); return 0;       /* GetSaveDataSize */
     case 110: out32(c,0); return 0;
-    case 22: case 27: case 28: case 32: case 33: case 34: case 35: case 36: case 37: case 66: case 67: case 68: case 90: case 100: case 101: case 120: case 124: return 0;
+    case 22: return 0; /* SetTerminateResult: no output buffer or language payload. */
+    case 27: case 28: case 32: case 33: case 34: case 35: case 36: case 37: case 66: case 67: case 68: case 90: case 100: case 101: case 120: case 124: return 0;
     case 151: return RC(128,2);                                      /* TryPopFromNotificationStorageChannel: nothing queued */
     case 23: { char v[16]="1.0.0"; outbytes(c,v,16); return 0; }         /* GetDisplayVersion */
     case 40: out8(c,0); return 0;                                      /* NotifyRunning */
@@ -364,9 +371,9 @@ static SvcObj* new_appletae(void){ return svcobj_new("appletAE",am_oe,0); }
 
 /* ================================================================ set */
 static int set_disp(SvcObj* o, IpcCtx* c){
-  static const char* codes[]={"ja","en-US","fr","de","it","es","zh-CN","ko","nl","pt","ru","zh-TW","en-GB","fr-CA","es-419","zh-Hans","zh-Hant","pt-BR"};
+  const char* const* codes=language_codes;
   switch(c->cmd){
-    case 0: { u64 v=0; const char* s=codes[g_opt_lang%18]; memcpy(&v,s,strlen(s)); out64(c,v); return 0; }     /* GetLanguageCode */
+    case 0: out64(c,configured_language_code()); return 0;     /* GetLanguageCode */
     case 1: case 5: { u64 a,s; buf_out(c,0,&a,&s); u32 n=(u32)(s/8); u32 max= c->cmd==1? 15 : 18; if(n>max) n=max;
       for(u32 i=0;i<n;i++){ u64 v=0; memcpy(&v,codes[i],strlen(codes[i])); gw64(a+i*8,v); } out32(c,n); return 0; }
     case 2: { u32 idx=in32(c,0); u64 v=0; if(idx<18) memcpy(&v,codes[idx],strlen(codes[idx])); out64(c,v); return 0; }   /* MakeLanguageCode */
@@ -552,10 +559,17 @@ static int acc_disp(SvcObj* o, IpcCtx* c){
     case 100: case 140: case 111: return 0;
     case 150: out8(c,0); return 0;   /* IsUserAccountSwitchLocked */
     case 101: out_obj(c,new_accmgr()); return 0;
-    case 110: return 0;
-    /* LoadOpenContext gives back the manager of the user the game started with. splatoon 3 calls through it in
-       IsNetworkServiceAccountAvailable */
-    case 130: out_obj(c,new_accmgr()); return 0;
+        case 110: { u64 a, s; 
+      /* UNITY ACCOUNT INITIALIZATION FIX: Extract the out-of-line buffer pointer description 
+         and copy the g_user_id data directly into guest virtual address memory */
+      if (buf_out(c, 0, &a, &s) && a && s >= 16) { 
+        memcpy(GP(a), g_user_id, 16); 
+      } else {
+        outbytes(c, g_user_id, 16); /* Fallback inline option if descriptor is omitted */
+      }
+      return 0; }
+
+
     /* ListOpenContextStoredUsers: the user the game started with and the rest of the list zeroed.
        nn::account::PopOpenUsers counts the non-zero entries and aborts if there's more than it asked for
        (bayonetta 3 at boot, it had stack garbage in the buffer) */
@@ -679,6 +693,9 @@ static int g_aud_catchup;
 /* a late AUX renderer catches up one guest turn at a time. the event has to be signaled again even if its normal
    timer wakeups got merged */
 void audren_signal_ready(int ready){ __atomic_store_n(&g_aud_catchup,ready,__ATOMIC_RELEASE); if(ready && g_aud_ev) kevent_signal(g_aud_ev); }
+void audren_notify_update(SvcObj* renderer){
+  if(renderer->u[3]==0 && g_aud_ev) kevent_signal(g_aud_ev);
+}
 static void aout_tick(void);
 
 /* renderer event fires every 5 ms (240 samples at 48k) like on HOS */
