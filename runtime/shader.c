@@ -1092,12 +1092,9 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     else if(c->stage==ST_FS && q==0x5A) setrf(c,d,T("(-dFdy(%s))",RF(c,rb)));
     else setrf(c,d,T("(%s + %s)",RF(c,a),RF(c,rb)));
     break; }
-    case O_ISBERD:
-    /* SYSTEMIC XC2 COMPUTE LOCK FIX:
-       Silently translate the Maxwell Isolate Barrier Domain opcode 
-       to establish a clean host execution barrier, preventing the driver 
-       from stalling on untranslated instruction pipeline bubbles. */
-    emitl(c, "/* ISBERD barrier segment fallback */");
+  case O_ISBERD:
+    /* Deterministic register fallback until ISBE addressing is implemented. */
+    if(d!=255) setr(c,d,"0u");
     break;
   case O_OUT_R: case O_OUT_C: case O_OUT_I: {
     u32 k=B(w,39,2); if(k&1) emitl(c,"EmitVertex();"); if(k&2) emitl(c,"EndPrimitive();"); setr(c,d,R(c,a)); break; }
