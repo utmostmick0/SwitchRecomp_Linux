@@ -429,8 +429,21 @@ typedef struct { PThreadFn fn; void* arg; } TArg;
 static void* tstart(void* p){ TArg a=*(TArg*)p; free(p); a.fn(a.arg); return NULL; }
 
 int plat_thread(PThreadFn fn, void* arg, size_t stack){
-  TArg* a=malloc(sizeof *a); a->fn=fn; a->arg=arg; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,stack);
-  pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED); pthread_t t; int r=pthread_create(&t,&at,tstart,a); pthread_attr_destroy(&at); return r? -1 : 0; }
+  TArg* a=malloc(sizeof *a); if(!a) return -1; a->fn=fn; a->arg=arg;
+  pthread_attr_t at; if(pthread_attr_init(&at)){ free(a); return -1; }
+  if(stack) pthread_attr_setstacksize(&at,stack);
+  pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
+  pthread_t t; int r=pthread_create(&t,&at,tstart,a); pthread_attr_destroy(&at);
+  /* A loaded game's static TLS must fit alongside the requested stack. glibc
+     can accept a 64 KiB attribute then reject creation with EINVAL for that TLS.
+     Retry with the platform default instead of silently losing service timers. */
+  if(r==EINVAL && stack){
+    if(pthread_attr_init(&at)){ free(a); return -1; }
+    pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
+    r=pthread_create(&t,&at,tstart,a); pthread_attr_destroy(&at);
+  }
+  if(r) free(a);
+  return r? -1 : 0; }
 
 void plat_thread_exit(void){ pthread_exit(NULL); }
 
@@ -486,13 +499,15 @@ int plat_mkdir(const char* p){ return mkdir(p,0755); }
 
 int plat_is_dir(const char* p){ struct stat s; return !stat(p,&s) && S_ISDIR(s.st_mode); }
 
-typedef struct { DIR* d; char path[1024]; } PD_;
+typedef struct { DIR* d; } PD_;
 
-int plat_dir_open(PDir* d, const char* path){ PD_* p=malloc(sizeof *p); p->d=opendir(path); if(!p->d){ free(p); return -1; } strncpy(p->path,path,1023); p->path[1023]=0; d->h=p; return 0; }
+int plat_dir_open(PDir* d, const char* path){ PD_* p=malloc(sizeof *p); if(!p) return -1; p->d=opendir(path); if(!p->d){ free(p); return -1; } d->h=p; return 0; }
 
 int plat_dir_next(PDir* d){ PD_* p=d->h; struct dirent* e;
   while((e=readdir(p->d))){ if(!strcmp(e->d_name,".")||!strcmp(e->d_name,"..")) continue; strncpy(d->name,e->d_name,511); d->name[511]=0;
-    char f[1600]; snprintf(f,sizeof f,"%s/%s",p->path,e->d_name); struct stat s; if(stat(f,&s)) continue; d->is_dir=S_ISDIR(s.st_mode); d->size=(u64)s.st_size; return 1; }
+    /* Resolve only the child name, rather than walking the full RomFS root
+       path again for every file. Flags 0 retain stat's symlink-following behavior. */
+    struct stat s; if(fstatat(dirfd(p->d),e->d_name,&s,0)) continue; d->is_dir=S_ISDIR(s.st_mode); d->size=(u64)s.st_size; return 1; }
   return 0; }
 
 void plat_dir_close(PDir* d){ PD_* p=d->h; closedir(p->d); free(p); }

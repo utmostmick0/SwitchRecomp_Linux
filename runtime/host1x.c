@@ -14,14 +14,23 @@
 #endif
 
 u64 nvmap_addr(u32 h); u64 nvmap_addr_by_id(u32 id);
-u32 syncpt_read(u32 id); void syncpt_incr(u32 id); u32 syncpt_alloc(void);
+u32 syncpt_read(u32 id); void syncpt_incr(u32 id); u32 syncpt_alloc(void); u32 syncpt_reserve(u32 id,u32 count);
 
 /* ------------------------------------------------------------ IOVA (what the video engines see through the SMMU) */
 typedef struct { u32 iova, size; u64 addr; u32 h; } IoMap;
 
 static IoMap g_iom[1024]; static int g_niom; static u32 g_iova_next=0x10000000u; static PMutex g_hlk; static int g_hinit;
+static PMutex g_video_queue_lock;
+static PCond g_video_work,g_video_space;
 
-static void h_init(void){ if(!g_hinit){ pm_init(&g_hlk); g_hinit=1; } }
+static void h_init(void){
+  if(__atomic_load_n(&g_hinit,__ATOMIC_ACQUIRE)==2) return;
+  int zero=0;
+  if(__atomic_compare_exchange_n(&g_hinit,&zero,1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
+    pm_init(&g_hlk); pm_init(&g_video_queue_lock); pc_init(&g_video_work); pc_init(&g_video_space);
+    __atomic_store_n(&g_hinit,2,__ATOMIC_RELEASE);
+  } else while(__atomic_load_n(&g_hinit,__ATOMIC_ACQUIRE)!=2) plat_yield();
+}
 
 /* The game reads WebM through RomFS storage and then submits VP9 frame jobs to NVDEC. */
 #ifdef SWR_HAVE_VP9
@@ -170,11 +179,15 @@ static int dec_open(void){
 #ifndef SWR_NO_H264
 static void keep_frame(unsigned char** pl, SBufferInfo* bi){
   u32 w=(u32)bi->UsrData.sSystemBuffer.iWidth, h=(u32)bi->UsrData.sSystemBuffer.iHeight; int sy=bi->UsrData.sSystemBuffer.iStride[0], sc=bi->UsrData.sSystemBuffer.iStride[1];
-  if(!w || !h || w>4096 || h>4096) return;
-  u32 need=w*h; if(g_fcap<need){ free(g_fy); free(g_fuv); g_fy=malloc(need); g_fuv=malloc(need/2+w+16); g_fuv_cap=need/2+w+16; g_fcap=need; }
+  if(!w || !h || w>4096 || h>4096 || (w&1) || !pl[0] || !pl[1] || !pl[2] || sy<(int)w || sc<(int)(w/2)) return;
+  u32 need=w*h,uvneed=w*((h+1)/2);
+  if(g_fcap<need || g_fuv_cap<uvneed){
+    u8* y=malloc(need),*uv=malloc(uvneed+16); if(!y || !uv){ free(y); free(uv); return; }
+    free(g_fy); free(g_fuv); g_fy=y; g_fuv=uv; g_fcap=need; g_fuv_cap=uvneed+16;
+  }
   if(!g_fy || !g_fuv) return;
   for(u32 y=0;y<h;y++) memcpy(g_fy+(u64)y*w,pl[0]+(u64)y*sy,w);
-  for(u32 y=0;y<h/2;y++){ u8* d=g_fuv+(u64)y*w; const u8* u=pl[1]+(u64)y*sc; const u8* v=pl[2]+(u64)y*sc; for(u32 x=0;x<w/2;x++){ d[2*x]=u[x]; d[2*x+1]=v[x]; } }
+  for(u32 y=0;y<(h+1)/2;y++){ u8* d=g_fuv+(u64)y*w; const u8* u=pl[1]+(u64)y*sc; const u8* v=pl[2]+(u64)y*sc; for(u32 x=0;x<w/2;x++){ d[2*x]=u[x]; d[2*x+1]=v[x]; } }
   g_fw=w; g_fh=h; g_vframes++; }
 #endif
 
@@ -208,15 +221,15 @@ static void nvdec_execute(u32* r){
   u32 slen=rd32(ps,0x48); if(!slen || slen>(16u<<20)) return;
   u8* bs=iova_ptr(bs_iova,slen); if(!bs){ static int said; if(said<4){ said++; LOG("video: NVDEC bitstream at iova %llx (%u bytes) not mapped\n",(unsigned long long)bs_iova,slen); } return; }
   u8 hdr[512]; u32 hn=build_headers(ps,hdr,sizeof hdr);
-  static u8* buf; static u32 bcap; u32 need=hn+slen+8; if(bcap<need){ buf=realloc(buf,need); bcap=need; }
+  static u8* buf; static u32 bcap; u32 need=hn+slen+8; if(bcap<need){ u8* grown=realloc(buf,need); if(!grown) return; buf=grown; bcap=need; }
   u32 o=0;
   if(hn!=g_last_hdr_n || memcmp(hdr,g_last_hdr,hn)){ memcpy(buf,hdr,hn); o=hn; memcpy(g_last_hdr,hdr,hn); g_last_hdr_n=hn; }
-  if(bs[0]==0 && bs[1]==0 && (bs[2]==1 || (bs[2]==0 && bs[3]==1))){ memcpy(buf+o,bs,slen); o+=slen; }
+  if(slen>=4 && bs[0]==0 && bs[1]==0 && (bs[2]==1 || (bs[2]==0 && bs[3]==1))){ memcpy(buf+o,bs,slen); o+=slen; }
   else {
     /* mp4 style 4 byte BE lengths -> start codes, if not just put one in front */
     u32 p=0, ok=1; while(p+4<=slen){ u32 L=((u32)bs[p]<<24)|((u32)bs[p+1]<<16)|((u32)bs[p+2]<<8)|bs[p+3]; if(!L || (u64)p+4+L>slen || (bs[p+4]&0x80)){ ok=0; break; }   /* 64-bit: a huge L must not wrap past the check */ p+=4+L; }
-    if(ok && p==slen){ static u8* t; static u32 tc; if(tc<slen+64){ t=realloc(t,slen+64); tc=slen+64; } (void)t;
-      if(bcap<o+slen+slen/4+16){ bcap=o+slen+slen/4+16; buf=realloc(buf,bcap); }
+    if(ok && p==slen){
+      if(bcap<o+slen+slen/4+16){ u32 cap=o+slen+slen/4+16; u8* grown=realloc(buf,cap); if(!grown) return; buf=grown; bcap=cap; }
       for(p=0;p<slen;){ u32 L=((u32)bs[p]<<24)|((u32)bs[p+1]<<16)|((u32)bs[p+2]<<8)|bs[p+3]; buf[o++]=0; buf[o++]=0; buf[o++]=0; buf[o++]=1; memcpy(buf+o,bs+p+4,L); o+=L; p+=4+L; } }
     else { buf[o++]=0; buf[o++]=0; buf[o++]=1; memcpy(buf+o,bs,slen); o+=slen; } }
   unsigned char* pl[3]={0,0,0}; SBufferInfo bi; memset(&bi,0,sizeof bi);
@@ -239,52 +252,89 @@ static u8 clamp8(int v){ return v<0? 0 : v>255? 255 : (u8)v; }
 
 static void vic_put(u8* base, u64 off, const u8* src, u32 n, u64 lim){ if(off+n<=lim) memcpy(base+off,src,n); }
 
+/* Two owned composition surfaces. A completed surface is immutable until its
+   slot is reused by the ordered worker; repeated VIC copies reuse conversion.
+   Guest destination writes still finish before the job's syncpoint is signaled. */
+typedef struct {
+  u8* pixels; u64 capacity,frame; const u8* input;
+  u32 w,h,fw,fh,fmt;
+} VicFrame;
+static VicFrame vic_frames[2]; static unsigned vic_frame_next;
+static VicFrame* vic_compose(const u8* fy,const u8* uv,u32 fw,u32 fh,u32 w,u32 h,u32 fmt,u64 frame){
+  if(!fy || !uv || !w || !h || w>4096 || h>4096) return NULL;
+  for(unsigned i=0;i<2;i++){ VicFrame* f=&vic_frames[i];
+    if(f->pixels && f->frame==frame && f->input==fy && f->w==w && f->h==h && f->fw==fw && f->fh==fh && f->fmt==fmt) return f;
+  }
+  int rgba=fmt==0x1F || fmt==0x20; u64 bytes=(u64)w*h*(rgba?4:1)+(rgba?0:(u64)w*(h/2));
+  VicFrame* f=&vic_frames[vic_frame_next];
+  if(f->capacity<bytes){ u8* p=realloc(f->pixels,(size_t)bytes); if(!p) return NULL; f->pixels=p; f->capacity=bytes; }
+  if(rgba){ int ri=fmt==0x1F?0:2,bi=fmt==0x1F?2:0;
+    for(u32 y=0;y<h;y++) for(u32 x=0;x<w;x++){
+      int c=((int)fy[(u64)y*fw+x]-16)*298;
+      const u8* pair=uv+(u64)(y/2)*fw+(x&~1u);
+      int d=(int)pair[0]-128,e=(int)pair[1]-128; u8* out=f->pixels+((u64)y*w+x)*4;
+      out[ri]=clamp8((c+409*e+128)>>8); out[1]=clamp8((c-100*d-208*e+128)>>8);
+      out[bi]=clamp8((c+516*d+128)>>8); out[3]=255;
+    }
+  } else {
+    for(u32 y=0;y<h;y++) memcpy(f->pixels+(u64)y*w,fy+(u64)y*fw,w);
+    for(u32 y=0;y<h/2;y++) memcpy(f->pixels+(u64)w*h+(u64)y*w,uv+(u64)y*fw,w);
+  }
+  f->frame=frame; f->input=fy; f->w=w; f->h=h; f->fw=fw; f->fh=fh; f->fmt=fmt;
+  vic_frame_next^=1; return f;
+}
+
 static void vic_execute(u32* r){
   if(!g_vframes) return;
+  u64 frame_id=g_vframes;
 #ifdef SWR_HAVE_VP9
   u8* fy=g_fy; u8* fuv=g_fuv; u32 fw=g_fw, fh=g_fh;
   DecodedSurface* picture=decoded_surface_find((u64)r[0x400/4]<<8);
-  if(picture){ fy=picture->y; fuv=picture->uv; fw=picture->w; fh=picture->h; }
+  if(picture){ fy=picture->y; fuv=picture->uv; fw=picture->w; fh=picture->h; frame_id=picture->used; }
 #else
   u8* fy=g_fy; u8* fuv=g_fuv; u32 fw=g_fw, fh=g_fh;
 #endif
   { static u32 nv; nv++; if(nv%120==0) LOG("video: %u VIC jobs so far\n",nv); }
   u64 ly=(u64)r[0x720/4]<<8, lc=(u64)r[0x724/4]<<8, cfg_iova=(u64)r[0x708/4]<<8;
-  u8* cs=iova_ptr(cfg_iova,0x28); u64 cfg=0; if(cs) memcpy(&cfg,cs+0x20,8);
+  u8* cs=iova_ptr(cfg_iova,0x30); u64 cfg=0; if(cs) memcpy(&cfg,cs+0x20,8);
   u32 fmt=(u32)(cfg&0x7F), blk=(u32)((cfg>>11)&15), bh=(u32)((cfg>>15)&15);
   u32 sw=(u32)((cfg>>32)&0x3FFF)+1, sh=(u32)((cfg>>46)&0x3FFF)+1;
-  if(!cs){ fmt=0x44; sw=fw; sh=fh; }
+  u32 lw=sw,lh=sh,cw=(sw+1)/2,ch=(sh+1)/2;
+  if(cs){ u32 luma=rd32(cs,0x28),chroma=rd32(cs,0x2c);
+    lw=(luma&0x3fff)+1; lh=((luma>>14)&0x3fff)+1;
+    cw=(chroma&0x3fff)+1; ch=((chroma>>14)&0x3fff)+1;
+  } else { fmt=0x44; sw=lw=fw; sh=lh=fh; cw=(fw+1)/2; ch=(fh+1)/2; }
   if(getenv("SWR_VIC_FMT")) fmt=(u32)strtoul(getenv("SWR_VIC_FMT"),0,0);
   u32 w=fw<sw? fw : sw, h=fh<sh? fh : sh;
+  if(w>lw) w=lw; if(h>lh) h=lh;
+  VicFrame* frame=vic_compose(fy,fuv,fw,fh,w,h,fmt,frame_id); if(!frame) return;
   { static int said; if(said<3){ said++; LOG("video: VIC config %016llx: format %x, %s (block height %u), surface %ux%u, picture %ux%u\n",(unsigned long long)cfg,fmt,blk? "block linear" : "pitch linear",1u<<bh,sw,sh,fw,fh); } }
   if(fmt==0x1F || fmt==0x20){
-    u32 pitch=sw*4; u64 lim= blk? (u64)pitch*(((sh+(8u<<bh)-1)/(8u<<bh))*(8u<<bh)) : (u64)pitch*sh;
+    u32 pitch=(lw*4+15)&~15u;
+    u64 lim= blk? (u64)((pitch+63)&~63u)*(((lh+(8u<<bh)-1)/(8u<<bh))*(8u<<bh)) : (u64)pitch*lh;
     u8* py=iova_ptr(ly,lim); if(!py){ py=iova_ptr(ly,(u64)pitch*h); lim=(u64)pitch*h; }
     if(!py){ static int said; if(said<4){ said++; LOG("video: VIC output at iova %llx not mapped\n",(unsigned long long)ly); } return; }
-    static u8* row; static u32 rcap; if(rcap<pitch){ row=realloc(row,pitch); rcap=pitch; }
-    int ri= fmt==0x1F? 0 : 2, bi= fmt==0x1F? 2 : 0;
     for(u32 y=0;y<h;y++){
-      const u8* Y=fy+(u64)y*fw; const u8* UV=fuv+(u64)(y/2)*fw;
-      for(u32 x=0;x<w;x++){
-        /* BT.601, limited range */
-        int c=((int)Y[x]-16)*298, d=(int)UV[x&~1u]-128, e=(int)UV[(x&~1u)+1]-128; u8* o=row+x*4;
-        o[ri]=clamp8((c+409*e+128)>>8); o[1]=clamp8((c-100*d-208*e+128)>>8); o[bi]=clamp8((c+516*d+128)>>8); o[3]=255; }
+      const u8* row=frame->pixels+(u64)y*w*4;
       if(!blk) vic_put(py,(u64)y*pitch,row,w*4,lim);
-      else for(u32 xb=0;xb<w*4;xb+=16){ u32 n=w*4-xb<16? w*4-xb : 16; vic_put(py,bl_offset(xb,y,0,pitch,sh,bh,0),row+xb,n,lim); } }
+      else for(u32 xb=0;xb<w*4;xb+=16){ u32 n=w*4-xb<16? w*4-xb : 16; vic_put(py,bl_offset(xb,y,0,pitch,lh,bh,0),row+xb,n,lim); } }
     { static int said; if(said<2){ said++; LOG("video: VIC wrote a %ux%u RGBA picture at iova %llx\n",w,h,(unsigned long long)ly); } }
     return; }
-  /* NV12. pitch linear rows are 256 aligned */
-  u32 pitch= blk? sw : (sw+255)&~255u;
-  u64 ylim=(u64)pitch*sh, clim=(u64)pitch*((sh+1)/2);
-  if(blk){ u32 gy=8u<<bh; ylim=(u64)pitch*((sh+gy-1)/gy*gy); clim=(u64)pitch*(((sh+1)/2+gy-1)/gy*gy); }
+  /* NV12 plane allocations have independent dimensions and 16-byte linear
+     strides. A forced 256-byte stride corrupts 1920-wide video rows. */
+  u32 pitch=(lw+15)&~15u, cpitch=(cw*2+15)&~15u;
+  u64 ylim=(u64)pitch*lh, clim=(u64)cpitch*ch;
+  if(blk){ u32 gy=8u<<bh; ylim=(u64)((pitch+63)&~63u)*((lh+gy-1)/gy*gy);
+    clim=(u64)((cpitch+63)&~63u)*((ch+gy-1)/gy*gy); }
   u8* py=iova_ptr(ly,ylim); u8* pc= lc? iova_ptr(lc,clim) : NULL;
   if(!py){ static int said; if(said<4){ said++; LOG("video: VIC output luma at iova %llx not mapped\n",(unsigned long long)ly); } return; }
-  for(u32 y=0;y<h;y++){ const u8* s=fy+(u64)y*fw;
+  for(u32 y=0;y<h;y++){ const u8* s=frame->pixels+(u64)y*w;
     if(!blk) vic_put(py,(u64)y*pitch,s,w,ylim);
-    else for(u32 x=0;x<w;x+=16){ u32 n=w-x<16? w-x : 16; vic_put(py,bl_offset(x,y,0,pitch,sh,bh,0),s+x,n,ylim); } }
-  if(pc) for(u32 y=0;y<h/2;y++){ const u8* s=fuv+(u64)y*fw;
-    if(!blk) vic_put(pc,(u64)y*pitch,s,w,clim);
-    else for(u32 x=0;x<w;x+=16){ u32 n=w-x<16? w-x : 16; vic_put(pc,bl_offset(x,y,0,pitch,(sh+1)/2,bh,0),s+x,n,clim); } }
+    else for(u32 x=0;x<w;x+=16){ u32 n=w-x<16? w-x : 16; vic_put(py,bl_offset(x,y,0,pitch,lh,bh,0),s+x,n,ylim); } }
+  u32 uvbytes=w<cw*2?w:cw*2,uvrows=h/2<ch?h/2:ch;
+  if(pc) for(u32 y=0;y<uvrows;y++){ const u8* s=frame->pixels+(u64)w*h+(u64)y*w;
+    if(!blk) vic_put(pc,(u64)y*cpitch,s,uvbytes,clim);
+    else for(u32 x=0;x<uvbytes;x+=16){ u32 n=uvbytes-x<16? uvbytes-x : 16; vic_put(pc,bl_offset(x,y,0,cpitch,ch,bh,0),s+x,n,clim); } }
   { static int said; if(said<2){ said++; LOG("video: VIC wrote a %ux%u NV12 picture (luma iova %llx, chroma %llx, pitch %u)\n",w,h,(unsigned long long)ly,(unsigned long long)lc,pitch); } } }
 
 /* ------------------------------------------------------------ host1x command stream */
@@ -318,24 +368,98 @@ static void run_words(H1Ch* ch, const u32* w, u32 n){
    end of the table (smo crashed in NvRmStreamBegin on its first VIC job) */
 static H1Ch g_ch[2];
 
+/* One ordered engine worker retains codec references and NVDEC -> VIC ordering.
+   The submitter only copies pushbuffers and reserves fences. GL/Vulkan objects
+   stay on their existing graphics thread. Queue memory and depth are bounded. */
+typedef struct { const u32* source; u32 offset,count; } VideoCmd;
+typedef struct { u32 id,count; } VideoInc;
+typedef struct VideoJob {
+  struct VideoJob* next; H1Ch* ch; int is_vic;
+  VideoCmd* cmds; VideoInc* incs; u32* words; u32 ncmd,ninc; u64 bytes,serial;
+} VideoJob;
+static VideoJob* video_head,*video_tail;
+static u32 video_pending; static u64 video_bytes; static int video_worker_state;
+static u64 video_queued,video_completed;
+#define VIDEO_QUEUE_BYTES (32ull<<20)
+#define VIDEO_QUEUE_DEPTH 8
+
+static void video_job_free(VideoJob* j){ free(j->cmds); free(j->incs); free(j->words); free(j); }
+static void video_job_run(VideoJob* j){
+  pm_lock(&g_hlk); j->ch->is_vic=j->is_vic;
+  for(u32 i=0;i<j->ncmd;i++) if(j->cmds[i].count) run_words(j->ch,j->words+j->cmds[i].offset,j->cmds[i].count);
+  pm_unlock(&g_hlk);
+  /* All pixel/status writes precede completion. No early success fences. */
+  for(u32 i=0;i<j->ninc;i++) for(u32 k=0;k<j->incs[i].count;k++) syncpt_incr(j->incs[i].id);
+}
+static void video_worker(void* unused){
+  (void)unused;
+  for(;;){
+    pm_lock(&g_video_queue_lock);
+    while(!video_head) pc_wait(&g_video_work,&g_video_queue_lock,-1);
+    VideoJob* j=video_head; video_head=j->next; if(!video_head) video_tail=NULL;
+    pm_unlock(&g_video_queue_lock);
+    video_job_run(j); u64 bytes=j->bytes,serial=j->serial; video_job_free(j);
+    pm_lock(&g_video_queue_lock); video_pending--; video_bytes-=bytes; video_completed=serial;
+    pc_broadcast(&g_video_space); pm_unlock(&g_video_queue_lock);
+  }
+}
+static u32 video_submit(int is_vic,u8* d,u32 n){
+  if(n<16) return 1;
+  u32 ncb=rd32(d,0),nrel=rd32(d,4),nsp=rd32(d,8),nfe=rd32(d,12);
+  u64 spo=16+(u64)ncb*12+(u64)nrel*20,feo=spo+(u64)nsp*20;
+  if(feo+(u64)nfe*4>n) return 1;
+  VideoJob* j=calloc(1,sizeof *j); if(!j) return 1;
+  j->ch=&g_ch[is_vic?1:0]; j->is_vic=is_vic; j->ncmd=ncb; j->ninc=nsp;
+  j->cmds=calloc(ncb?ncb:1,sizeof *j->cmds); j->incs=calloc(nsp?nsp:1,sizeof *j->incs);
+  if(!j->cmds || !j->incs){ video_job_free(j); return 1; }
+  u64 words=0;
+  extern u32 nvmap_size(u32);
+  for(u32 i=0;i<ncb;i++){
+    u32 mem=rd32(d,16+i*12),off=rd32(d,20+i*12),wc=rd32(d,24+i*12);
+    u64 a=nvmap_addr(mem); if(!a) a=nvmap_addr_by_id(mem); u32 size=nvmap_size(mem);
+    if(!a || !wc || wc>0x100000) continue;
+    if(a>=AS_SIZE || off>AS_SIZE-a || (u64)wc*4>AS_SIZE-a-off || off>size || (u64)wc*4>size-off){ video_job_free(j); return 1; }
+    j->cmds[i].source=(const u32*)GP(a+off); j->cmds[i].offset=(u32)words; j->cmds[i].count=wc; words+=wc;
+  }
+  j->bytes=sizeof *j+(u64)ncb*sizeof *j->cmds+(u64)nsp*sizeof *j->incs+words*4;
+  if(j->bytes>VIDEO_QUEUE_BYTES){ video_job_free(j); return 1; }
+  u32 fallback=__atomic_load_n(&j->ch->syncpt,__ATOMIC_ACQUIRE);
+  if(!fallback){ pm_lock(&g_hlk); fallback=j->ch->syncpt;
+    if(!fallback){ fallback=syncpt_alloc(); __atomic_store_n(&j->ch->syncpt,fallback,__ATOMIC_RELEASE); }
+    pm_unlock(&g_hlk);
+  }
+  pm_lock(&g_video_queue_lock);
+  while(video_pending>=VIDEO_QUEUE_DEPTH || video_bytes+j->bytes>VIDEO_QUEUE_BYTES) pc_wait(&g_video_space,&g_video_queue_lock,-1);
+  j->words=malloc(words?words*4:4); if(!j->words){ pm_unlock(&g_video_queue_lock); video_job_free(j); return 1; }
+  for(u32 i=0;i<ncb;i++) if(j->cmds[i].count) memcpy(j->words+j->cmds[i].offset,j->cmds[i].source,(size_t)j->cmds[i].count*4);
+  if(!video_worker_state){
+    video_worker_state=getenv("SWR_SYNC_VIDEO") || plat_thread(video_worker,NULL,2u<<20)?-1:1;
+    LOG("video: %s NVDEC/VIC submissions (ordered, bounded queue)\n",video_worker_state>0?"asynchronous":"synchronous");
+  }
+  int has_completion=0;
+  for(u32 i=0;i<nsp;i++){
+    u32 id=rd32(d,(u32)spo+i*20),count=rd32(d,(u32)spo+i*20+4); if(!id) id=fallback; if(count>64) count=64;
+    j->incs[i]=(VideoInc){id,count}; u32 value=syncpt_reserve(id,count);
+    if(count) has_completion=1;
+    if(i<nfe) memcpy(d+feo+i*4,&value,4);
+  }
+  if(video_worker_state<0){ video_job_run(j); video_job_free(j); pm_unlock(&g_video_queue_lock); return 0; }
+  u64 serial=++video_queued; j->serial=serial;
+  video_pending++; video_bytes+=j->bytes;
+  if(video_tail) video_tail->next=j; else video_head=j; video_tail=j;
+  pc_signal(&g_video_work);
+  /* A submit with no advancing fence has no asynchronous completion token. */
+  while(!has_completion && video_completed<serial) pc_wait(&g_video_space,&g_video_queue_lock,-1);
+  pm_unlock(&g_video_queue_lock); return 0;
+}
+
 u32 host1x_ioctl(int is_vic, u32 cmd, u8* d, u32 n){
-  h_init(); pm_lock(&g_hlk);
-  H1Ch* ch=&g_ch[is_vic? 1 : 0]; ch->is_vic=is_vic; if(!ch->syncpt) ch->syncpt=syncpt_alloc();
+  h_init(); if(((cmd>>8)&0xFF)==0 && (cmd&0xFF)==1) return video_submit(is_vic,d,n);
+  pm_lock(&g_hlk);
+  H1Ch* ch=&g_ch[is_vic? 1 : 0]; ch->is_vic=is_vic; if(!ch->syncpt) __atomic_store_n(&ch->syncpt,syncpt_alloc(),__ATOMIC_RELEASE);
   u32 r=0, grp=(cmd>>8)&0xFF, nr=cmd&0xFF;
   if(grp==0x48){ /* SET_NVMAP_FD etc */ }
   else if(grp==0) switch(nr){
-    case 0x01: { /* SUBMIT: counts, cmdbufs {memid, offset, words}, relocs, reloc shifts, syncpt incrs {id, n, ?x3}, fences {id, value} */
-      u32 ncb=rd32(d,0), nrel=rd32(d,4), nsp=rd32(d,8), nfe=rd32(d,12); u64 o=16;   /* 64-bit: guest counts must not wrap past the size check */
-      u32 cbo=(u32)o; o+=(u64)ncb*12+(u64)nrel*20; u32 spo=(u32)o; o+=(u64)nsp*20; u32 feo=(u32)o;
-      if(o>n){ r=1; break; }
-      for(u32 i=0;i<ncb;i++){ u32 mem=rd32(d,cbo+i*12), off=rd32(d,cbo+i*12+4), wc=rd32(d,cbo+i*12+8);
-        u64 a=nvmap_addr(mem); if(!a) a=nvmap_addr_by_id(mem); if(!a || !wc || wc>0x100000) continue;
-        run_words(ch,(const u32*)GP(a+off),wc); }
-      for(u32 i=0;i<nsp;i++){ u32 id=rd32(d,spo+i*20), inc=rd32(d,spo+i*20+4); if(!id) id=ch->syncpt;
-        for(u32 k=0;k<inc && k<64;k++) syncpt_incr(id);
-        if(i<nfe && feo+i*4+4<=n){ u32 v=syncpt_read(id); memcpy(d+feo+i*4,&v,4); } }   /* fence thresholds, u32 each */
-      { static int said; if(said<3){ said++; LOG("video: %s submit: %u command buffers, %u relocs, %u syncpoint increments, %u fences (%u bytes)\n",is_vic? "vic" : "nvdec",ncb,nrel,nsp,nfe,n); } }
-      break; }
     case 0x02: { u32 v=ch->syncpt; memcpy(d+4,&v,4); break; }          /* GET_SYNCPOINT */
     case 0x03: { u32 v=0; memcpy(d+4,&v,4); break; }                    /* GET_WAITBASE */
     case 0x07: break;                                                   /* SET_SUBMIT_TIMEOUT */

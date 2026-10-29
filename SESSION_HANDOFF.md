@@ -6,7 +6,7 @@ Updated: 2026-10-29. This file is the current status summary; dated sections in 
 
 - Workspace: `/mnt/Media2/SwitchRecomp_Linux`.
 - Runtime: `v199-array-sampler-variants`, [Linux X11 binary](bin/runtime_linux_x11).
-- SHA256: `2709826f8e6297b65347f9c8faab97b51996149fbf8ed0738f5a9c2384ba67f2`.
+- SHA256: `c4831e9a56fd19a3bce38052532535c1d3600da1c15cb3a2801b66e5241a8e16`.
 - Matching executables are staged for Balatro, Belmonts Curse, Bubble Bobble, FFRS, SMW, smo, and XC2. Launch through SwitchRecomp normally.
 - Rollback executables remain under `games/*.pre-*`. No saves, regular logs, game assets, generated game code, or rollbacks were removed during cleanup.
 
@@ -107,3 +107,31 @@ See [array sampler report](ARRAY_SAMPLER_FIX.md). TIC 5 is 2D array, not 1D arra
 ## Three-state FPS option
 
 F4 now cycles 60 → 30 → unlimited → 60 in X11 and Windows source, with matching labels and help. An isolated X11 check verified all three persisted values and window titles. Linux runtime rebuilt and staged to 10 game launchers; existing game configs remain at fps_limit=30. Windows behavior was not executable-tested.
+
+## RomFS scan verification and directory-relative metadata
+
+The existing scanner already sorts entries with attached metadata, avoiding the old quadratic name join, and builds serialized parent/name hash tables. No redundant full-path hash table was added. POSIX directory iteration now uses fstatat(dirfd(directory), name, ..., 0), avoiding repeated traversal of the RomFS root and preserving symlink following. Open-directory allocation failure is handled.
+
+Direct TotK runs over 2,665 directories and 304,207 files: prior builder 7.204 / 1.319 / 1.135 s; updated builder 1.296 / 1.130 / 1.112 s. Host caches were not flushed; the first-run difference is not a controlled optimization comparison. All serialized-image fingerprints match 8cf75e70a090bfcc. Hash table construction costs about 0.08–0.14 s; metadata scanning dominates. No under-three-second cold-start or menu-ready guarantee is made. Sanitized fixture layout/hash checks and concurrent filesystem/6 GiB archive checks pass. Linux runtime rebuilt and staged to 13 launchers; FPS settings unchanged.
+
+## Register-safe ISBERD fallback
+
+Commit e635aaa initializes every writable ISBERD destination to 0u, with RZ discarded, alongside FSWZADD. This is a deterministic fallback, not native ISBE emulation or a host barrier. All 255 writable register targets and RZ passed focused translator checks; generated GLSL passed glslangValidator. The full Linux X11 source rebuild passed and was staged to 13 game launchers. Other working-tree changes were not included in this commit.
+
+## Explicit vertex block and clock getter repair
+
+Vertex layer-writing shaders now redeclare the invariant gl_PerVertex block as requested. Both declaration variants passed glslangValidator; NVIDIA live linkage remains untested. The missing system_clock_context helper now uses a zero-initialized packed SWR_SystemClockContext wrapper, with validity set to 1 as host metadata. The serialized guest ABI remains 32 bytes (offset, steady time, source ID); no extra validity byte is appended to guest IPC. Clock getters and fallback snapshots use this helper.
+
+The focused clock-context getter/bounds test passed ASan/UBSan. The broader native runner passed shader dimensions and clock retry checks, then stopped at the existing account-service short-input assertion in test_service_ports.c:22. Full Linux X11 source rebuild passed. Central binary SHA-256: d7fc5c9466894125065dfafb57edce005e355b408d44827ee13c1a04b87a79df. This build includes the pending video-worker changes already present in the worktree; per-game launchers were not overwritten.
+
+## Unconditional vertex built-in block guard
+
+The vertex declaration path now emits gl_PerVertex once unconditionally, including layer-writing shaders; the extra layer-path invariant statement is separate. Actual translator regression coverage checks normal/layer-writing shaders with layer extension enabled/disabled. All four generated shaders pass ASan/UBSan assertions and glslangValidator with the viewport uniform normally injected by the GL backend. The test is registered in the native check runner. Full Linux X11 source rebuild passed; central binary SHA-256 336c9adcf9859593128021d1de61ad7254f92853d042b208e50dbfc36431e7bd. Nicola live NVIDIA linkage has not been verified. Per-game launchers were not replaced.
+
+## Latest game-log review repairs
+
+Reviewed 14 top-level game logs; see [LOG_REVIEW.md](LOG_REVIEW.md). Filesystem command 205 returns a real primary-program storage object. Account qualified-user lists and user identity checks are restored; settings device-name writes are bounded. MP4 advances beyond its address-zero crash but still aborts on a rejected newer splitter packet; diagnostic identifies size 129056, 128 splitters and 768 destination updates. SMW reaches 338 frames then stalls; no wait-semantics workaround applied. Independent native groups and focused sanitized bounds checks pass; the full runner still fails on the pre-existing audio time-limit getter stub. Final Linux X11 rebuild passed and was staged to 14 launchers, preserving saves and INIs. SHA-256 a5eeb172786ce0ed5fa9b624d8587d4c66a3839d7e4184697b369cc85b57406c.
+
+## v202 startup/audio/timer and shader validation
+
+See the updated [LOG_REVIEW.md](LOG_REVIEW.md), which supersedes its earlier entries. POSIX service-thread creation retries EINVAL using the platform default stack: runtime static TLS (~174 KiB) exceeds the old 64 KiB audio-timer request. Host debugger confirmed that timer was absent. MP4 now reaches its title screen after REV12/15 splitter packet, filter and timer repairs. Audio time-limit getters/setters and parameter bounds are implemented. Guest-clock stale samples cannot underflow after a rebase. VSETP passes 1,024 actual GPU predicate cases and removes observed XC2/PJ037 VSETP warnings. VIC honors separate plane dimensions and 16-byte linear strides; 1920-wide output, queue ownership and fence tests pass ASan/UBSan/TSan. DK title and SMO menu screenshots are clean, but reported gameplay rendering is not claimed fixed. FFRS/Nicola do not reach menus in 45/75-second tests. PJ037 progresses late but retains other unknown instructions. Pokeza SURED remains unsupported. All 16 native check groups pass, including service_ports. Full Linux X11 rebuild passed and was staged to 14 launchers with original INIs/saves preserved. Marker v202-service-timers-audio-layout; SHA-256 08a6b25ced7905e0f42b6289d9c9e118d18ac49095f315d0d1d9743d62bbc19f. No commit/push.

@@ -59,7 +59,15 @@ static u32 syncpt[256]; static u32 syncpt_max[256]; static PCond g_sync_cv; stat
 
 u32 syncpt_read(u32 id){ return __atomic_load_n(&syncpt[id&255],__ATOMIC_SEQ_CST); }
 
-void syncpt_incr(u32 id){ pm_lock(&g_sync_lk); syncpt[id&255]++; pc_broadcast(&g_sync_cv); pm_unlock(&g_sync_lk);
+/* Reserve completion values without publishing completion before engine writes. */
+u32 syncpt_reserve(u32 id, u32 count){
+  id&=255; pm_lock(&g_sync_lk);
+  if((i32)(syncpt_max[id]-syncpt[id])<0) syncpt_max[id]=syncpt[id];
+  syncpt_max[id]+=count; u32 value=syncpt_max[id];
+  pm_unlock(&g_sync_lk); return value;
+}
+
+void syncpt_incr(u32 id){ pm_lock(&g_sync_lk); __atomic_add_fetch(&syncpt[id&255],1,__ATOMIC_SEQ_CST); pc_broadcast(&g_sync_cv); pm_unlock(&g_sync_lk);
   extern void nv_events_check(void); nv_events_check(); }
 
 int syncpt_wait(u32 id, u32 thresh, i64 timeout){

@@ -164,7 +164,7 @@ typedef struct { u64 addr,size,context,context_size; i32 start,end; u8 loop,slot
 typedef struct { i64 frame; i16 h0,h1,seed0,pcm[14],previous[14]; } Adpcm;
 typedef struct { float x1,x2,y1,y2; } BiquadState;
 typedef struct { u32* destinations; u32 count; } AudioSplitter;
-typedef struct { u32 mix; u8 used; float volume[NC],previous[NC]; } AudioDestination;
+typedef struct { u32 mix; u8 used,enabled[2]; float volume[NC],previous[NC],coeff[2][5]; BiquadState filter[2]; } AudioDestination;
 typedef struct { Wave q[4]; u32 nq,consumed; u64 played; double pos,fraction;
   i16 carry0,carry1; u8 carry_valid; unsigned defer_blocks;
   u8 busy[4],seen[4],sent[4],was_playing,was_logged,signal_logged; u64 signature[4],accepted_update[4]; Adpcm ad; BiquadState filter[2][6];
@@ -183,7 +183,11 @@ void swr_audio_begin_update(SvcObj* o,unsigned blocks){ AudioState* a=audio_stat
 
 /* SNDH/SNDI/SNDD wire layout adapted from PrimeRecomp's update_splitters.
    Validate the complete packet before changing a renderer's incremental routes. */
-int swr_audio_configure_splitters(SvcObj* o,const u8* data,u32 size,u32 count,u32 destinations){
+/* REV12 adds Q14 biquads; REV15 replaces those coefficients with floats.
+   Layout sizes/offsets follow the renderer's SNDD parameter versions. */
+int swr_audio_configure_splitters_revision(SvcObj* o,const u8* data,u32 size,u32 count,u32 destinations,u32 revision){
+  u32 stride=revision>=15?0xa8:revision>=12?0x90:0x70;
+  u32 used_offset=revision>=15?0x9c:revision>=12?0x84:0x6c;
   if(count>4096 || destinations>65536 || (size && (!data || size<0x20))) return 0;
   u32 infos=0,updates=0; size_t offset=0;
   if(size){
@@ -197,10 +201,16 @@ int swr_audio_configure_splitters(SvcObj* o,const u8* data,u32 size,u32 count,u3
       for(u32 k=0;k<n;k++) if(rd32(data+offset+16+k*4)>=destinations) return 0;
       offset+=0x1c+(size_t)n*4;
     }
-    if(updates>(size-offset)/0x70) return 0;
+    if(updates>(size-offset)/stride) return 0;
     for(u32 i=0;i<updates;i++){
       if(rd32(data+offset)!=0x44444e53 || rd32(data+offset+4)>=destinations) return 0;
-      offset+=0x70;
+      const u8* p=data+offset;
+      for(unsigned k=0;k<NC;k++) if((rd32(p+8+k*4)&0x7f800000u)==0x7f800000u) return 0;
+      if(revision>=15) for(unsigned stage=0;stage<2;stage++){
+        const u8* f=p+0x6c+stage*0x18;
+        if(f[0]) for(unsigned k=0;k<5;k++) if((rd32(f+4+k*4)&0x7f800000u)==0x7f800000u) return 0;
+      }
+      offset+=stride;
     }
   }
   AudioState* a=audio_state(o); if(!a) return 0;
@@ -224,10 +234,20 @@ int swr_audio_configure_splitters(SvcObj* o,const u8* data,u32 size,u32 count,u3
     const u8* p=data+offset; AudioDestination* d=&a->destinations[rd32(p+4)];
     int fresh=!d->used || d->mix!=rd32(p+0x68); d->mix=rd32(p+0x68);
     for(unsigned k=0;k<NC;k++) d->volume[k]=rdf(p+8+k*4);
-    if(fresh) memcpy(d->previous,d->volume,sizeof d->previous);
-    d->used=p[0x6c]!=0; offset+=0x70;
+    if(fresh || (revision>=13 && p[used_offset+1])) memcpy(d->previous,d->volume,sizeof d->previous);
+    for(unsigned stage=0;stage<2;stage++){
+      const u8* f=p+0x6c+(revision>=12?stage*(revision>=15?0x18:0xc):0);
+      int enabled=revision>=12 && f[0];
+      if(fresh || !enabled || !d->enabled[stage]) memset(&d->filter[stage],0,sizeof d->filter[stage]);
+      d->enabled[stage]=(u8)enabled;
+      if(enabled) for(unsigned k=0;k<5;k++) d->coeff[stage][k]=revision>=15?rdf(f+4+k*4):rd16(f+2+k*2)/16384.f;
+    }
+    d->used=p[used_offset]!=0; offset+=stride;
   }
   return 1;
+}
+int swr_audio_configure_splitters(SvcObj* o,const u8* data,u32 size,u32 count,u32 destinations){
+  return swr_audio_configure_splitters_revision(o,data,size,count,destinations,0);
 }
 
 static AudioDestination* splitter_destination(AudioState* a,u32 id,u32 index){
@@ -278,6 +298,15 @@ static float biquad(BiquadState* h,const float* c,float x){
   float y=c[0]*x+c[1]*h->x1+c[2]*h->x2+c[3]*h->y1+c[4]*h->y2;
   if(!isfinite(y)){ memset(h,0,sizeof *h); y=0; }
   h->x2=h->x1; h->x1=x; h->y2=h->y1; h->y1=y; return y;
+}
+static const float* splitter_filter(AudioDestination* d,const float* input,unsigned frames,float* output){
+  if(!d->enabled[0] && !d->enabled[1]) return input;
+  for(unsigned f=0;f<frames;f++){
+    float x=input[f];
+    for(unsigned stage=0;stage<2;stage++) if(d->enabled[stage]) x=biquad(&d->filter[stage],d->coeff[stage],x);
+    output[f]=x;
+  }
+  return output;
 }
 /* aux effects swap signed PCM through shared rings in guest memory. each ring has two 0x40 byte headers and then
    int32 samples in planar blocks of 240 per channel. the renderer owns send.write and return.read in the second
@@ -497,8 +526,10 @@ int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* reso
             u32 splitter=rd32(vi+0x5c);
             for(u32 k=ch;k<a->splitters[splitter].count;k+=channels){
               AudioDestination* d=splitter_destination(a,splitter,k);
-              if(d && map[d->mix]>=0) route_voice(a,v,d->mix,nbuf[d->mix],decoded[ch],produced,
-                v->ramp_valid?v->previous_volume:vol,vol,d->previous,d->volume);
+              if(d && map[d->mix]>=0){ float filtered[NF];
+                const float* signal=splitter_filter(d,decoded[ch],produced,filtered);
+                route_voice(a,v,d->mix,nbuf[d->mix],signal,produced,
+                  v->ramp_valid?v->previous_volume:vol,vol,d->previous,d->volume); }
             }
           } else if(channels==1){
             for(unsigned f=0;f<produced;f++){ float x=decoded[ch][f]*vol*.70710678f; stereo[f*2]+=x; stereo[f*2+1]+=x; }
@@ -547,9 +578,11 @@ int swr_audio_mix(SvcObj* o,const u8* voices,u32 count,u32 stride,const u8* reso
       u32 splitter=rd32(mi[i]+0x928);
       if(splitter<a->nsplitters) for(u32 k=0;k<a->splitters[splitter].count;k++){
         AudioDestination* d=splitter_destination(a,splitter,k); if(!d || d->mix==i || map[d->mix]<0) continue;
+        float filtered[NF];
+        const float* src=splitter_filter(d,a->mix+(i*NC+k%nbuf[i])*NF,NF,filtered);
         for(unsigned dc=0;dc<nbuf[d->mix];dc++){
           float g=gain(mi[i])*d->volume[dc];
-          const float* src=a->mix+(i*NC+k%nbuf[i])*NF; float* target=a->mix+(d->mix*NC+dc)*NF;
+          float* target=a->mix+(d->mix*NC+dc)*NF;
           for(unsigned f=0;f<NF;f++) target[f]+=src[f]*g;
         }
       }

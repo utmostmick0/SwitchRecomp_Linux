@@ -499,6 +499,11 @@ static int fsp_disp(SvcObj* o, IpcCtx* c){
       out_obj(c,hostfs_new(p)); return 0; }
     case 22: case 23: case 25: case 26: case 27: case 28: case 32: case 33: case 34: case 35: case 36: case 37: return 0;
     case 60: case 61: case 62: out_obj(c,svcobj_new("ISaveDataInfoReader",savereader,0)); return 0;
+    /* OpenDataStorageWithProgramIndex: only the extracted primary program is mounted. */
+    case 205:
+      if(!c->raw || c->raw_size<1 || in8(c,0)!=0) return FS_NOTFOUND;
+      /* Index zero uses the same real storage interface as the current process. */
+      /* fall through */
     case 200: { if(!rtotal) { WARN("fs: the game requests the RomFS but there is none (put the romfs folder in %s)\n",g_datadir); }
       out_obj(c,svcobj_new("IStorage(romfs)",romstorage,0)); return 0; }
     case 202: { u64 id=in64(c,8); SvcObj* syn=sysdata_open(id);

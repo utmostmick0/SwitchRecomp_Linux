@@ -833,6 +833,24 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     else { static const char* fn[9]={"atomicAdd","atomicMin","atomicMax","","","atomicAnd","atomicOr","atomicXor","atomicExchange"}; emitl(c,"old_ = %s(%s, %s);",fn[aop],m,v); }
     setr(c,d,"old_");
     c->indent--; emitl(c,"}"); break; }
+  /* Packed integer comparison: component extension is per operand; comparison
+     signedness follows B. Snapshot predicate inputs before writing either result. */
+  case O_VSETP: {
+    u32 cmp=B(w,43,5), aw=B(w,37,2), bw=B(w,29,2);
+    int br=B(w,50,1), asg=B(w,48,1), bsg=B(w,49,1);
+    if(cmp>3 && (cmp<16 || cmp>19)){ unsupported(c,op->name,w); break; }
+    const char* av=R(c,a); const char* bv=br?R(c,B(w,20,8)):T("%uu",B(w,20,16));
+    if(!br) bw=2;
+    const char* va=aw==3?av:T("uint(bitfieldExtract(%s(%s),%u,%u))",asg?"int":"uint",av,B(w,36,2)*(aw==2?16:8),aw==2?16:8);
+    const char* vb=bw==3?bv:T("uint(bitfieldExtract(%s(%s),%u,%u))",bsg?"int":"uint",bv,(br?B(w,28,2):0)*(bw==2?16:8),bw==2?16:8);
+    static const char* ops[]={NULL,"<","==","<=",">","!=",">=",NULL};
+    u32 kind=cmp<4?cmp:cmp-12;
+    const char* test=kind==0?"false":kind==7?"true":T("(%s(%s) %s %s(%s))",bsg?"int":"uint",va,ops[kind],bsg?"int":"uint",vb);
+    const char* pc=PN(c,B(w,39,3),B(w,42,1));
+    emitl(c,"{ bool vc_ = %s; bool vp_ = %s;",test,pc); c->indent++;
+    setp(c,B(w,3,3),bop(B(w,45,2),"vc_","vp_"));
+    setp(c,B(w,0,3),bop(B(w,45,2),"(!vc_)","vp_"));
+    c->indent--; emitl(c,"}"); break; }
   /* VMAD is integer video multiply-add, not FFMA. Operands select and
      sign/zero extend packed components before the wrapping 32-bit multiply.
      Modifier encodings without verified semantics remain diagnostic. */
@@ -1328,7 +1346,7 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
       c->indent=sp+1;
       c->nest=sp;   /* forward only, so writes in any branch already clear the labels as we go */
       const Op* op=decode(c->w[i]);
-      if(!op){ c->si->unsupported++; emitl(c,"/* unknown %016llx */",(unsigned long long)c->w[i]); continue; }
+      if(!op){ unsupported(c,"unknown opcode",c->w[i]); continue; }
       u32 t=st_jump(c,i,op);
       if(t){ if(jt[i]!=~0u){ u64 w=c->w[i]; u32 pg=B(w,16,3); if(jt[i]) t=jt[i];
           emitl(c,"if(%s) {", pg==7? "false" : B(w,19,1)? P(c,pg) : T("(!%s)",P(c,pg)));
@@ -1354,7 +1372,7 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
     else if(opens){ c->indent=2; emitl(c,"case %uu:",i); c->indent=3; }   /* no 'pc = i; break;', fall through */
     if(is_leader(c,i)) memset(c->wtag,0,sizeof c->wtag);
     const Op* op=decode(c->w[i]);
-    if(!op){ c->si->unsupported++; emitl(c,"/* unknown %016llx */",(unsigned long long)c->w[i]); continue; }
+    if(!op){ unsupported(c,"unknown opcode",c->w[i]); continue; }
     emit_tracked(c,i,c->w[i],op);
     int id=op->id; u64 w=c->w[i];
     if(!flow && id==O_EXIT && B(w,16,3)==7 && !B(w,19,1)) exit_end=c->out.n;
@@ -1411,9 +1429,10 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
   if(stage==ST_VS){
     for(int i=0;i<32;i++) if(c->in_used[i]){ si->in_mask|=1u<<i; int isint=(attr_int>>i)&1; sb_f(D,"layout(location=%d) in %s in_attr%d;\n",i,isint? ((si->attr_sint_mask>>i)&1? "ivec4":"uvec4") : "vec4",i); }
     for(int i=0;i<32;i++) if(c->out_used[i]){ si->out_mask|=1u<<i; sb_f(D,"layout(location=%d) out vec4 out_attr%d;\n",i,i); }
-    /* invariant so depth matches across passes with different shaders */
-    if(si->writes_layer) sb_put(D,"invariant gl_Position;\nout float gl_ClipDistance[8];\n");   /* Mesa drops gl_Layer when the block is redeclared */
-    else sb_put(D,"out gl_PerVertex { invariant vec4 gl_Position; float gl_PointSize; float gl_ClipDistance[8]; };\n");
+    /* Separate shader objects require the complete built-in block, including layer writers.
+       Keep position invariant so depth matches across passes with different shaders. */
+    sb_put(D,"out gl_PerVertex { invariant vec4 gl_Position; float gl_PointSize; float gl_ClipDistance[8]; };\n");
+    if(si->writes_layer) sb_put(D,"invariant gl_Position;\n");
   } else if(stage==ST_FS){
     const u8* imap=(const u8*)si->sph+0x18;
     for(int i=0;i<32;i++) if(c->in_used[i]){ si->in_mask|=1u<<i; u8 m=imap[i]; int f=(m&3)==1 || ((m>>2)&3)==1 || (flat>>i)&1; int lin=(m&3)==3;

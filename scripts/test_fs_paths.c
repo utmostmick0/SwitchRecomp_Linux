@@ -2,7 +2,8 @@
 #include "../runtime/svc_fs.c"
 #include <assert.h>
 u8* g_mem;
-char g_exedir[1024],g_exename[256];
+char g_exedir[1024],g_exename[256],g_datadir[1024];
+SvcObj* svc_generic(const char* name){ (void)name; assert(0); return NULL; }
 static FileData shared_file;
 static const char* archive_path;
 static RFile archive_file;
@@ -55,6 +56,16 @@ int main(void){
   assert(fs_read_exact(file,exact,65,(6ull<<30)+6*4096)<0);
   assert(fs_read_exact(file,exact,1,~0ull)<0);
   rraw=file; rtotal=(6ull<<30)+6*4096+65;
+  /* Indexed RomFS open returns an actual IStorage, not an empty success. */
+  for(int index=0;index<2;index++){
+    u8 raw_index=(u8)index; IpcCtx open={0}; open.cmd=205; open.raw=&raw_index; open.raw_size=1;
+    int rc=fsp_disp(NULL,&open);
+    assert(index?(rc==FS_NOTFOUND && !open.nout_objs):(!rc && open.nout_objs==1));
+    if(!index){ SvcObj* storage=open.out_objs[0]; IpcCtx size={0}; size.cmd=4;
+      assert(!storage->dispatch(storage,&size)); u64 bytes; memcpy(&bytes,size.out,8); assert(bytes==rtotal);
+      svcobj_unref(storage); }
+  }
+  IpcCtx missing={0}; missing.cmd=205; assert(fsp_disp(NULL,&missing)==FS_NOTFOUND && !missing.nout_objs);
   u64 request[2]={(6ull<<30)+6*4096,65}; memset(&io,0,sizeof io);
   io.raw=(u8*)request; io.raw_size=sizeof request; io.nb=1; io.b[0].addr=1024; io.b[0].size=65;
   assert(romstorage(NULL,&io)==FS_NOTFOUND); rraw=NULL;

@@ -382,7 +382,7 @@ static int set_disp(SvcObj* o, IpcCtx* c){
     case 4: out32(c,1); return 0;                     /* GetRegionCode: usa */
     case 7: case 9: { u64 a,s; buf_out(c,0,&a,&s); memset(GP(a),0,s); return 0; }
     case 8: out32(c,0); return 0;
-    case 11: { u64 a,s; buf_out(c,0,&a,&s); memset(GP(a),0,s); strcpy((char*)GP(a),"SwitchRecomp"); return 0; }
+    case 11: { u64 a,s; buf_out(c,0,&a,&s); if(a && s){ static const char name[]="SwitchRecomp"; memset(GP(a),0,s); memcpy(GP(a),name,s<sizeof name?s:sizeof name); } return 0; }
   }
   return stub_ok(o,c); }
 
@@ -404,18 +404,40 @@ static SvcObj* new_setsys(void){ return svcobj_new("set:sys",setsys_disp,0); }
 
 /* ================================================================ time */
 static KShmem* g_time_shm;
+static u8 g_clock_id[16]={1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+
+#pragma pack(push,1)
+typedef struct {
+  i64 steady_offset;
+  i64 steady_time;
+  u8 source_id[16];
+  /* Host metadata; the guest SystemClockContext ends at source_id. */
+  u8 valid;
+  u8 reserved[7];
+} SWR_SystemClockContext;
+#pragma pack(pop)
+_Static_assert(offsetof(SWR_SystemClockContext,valid)==0x20,"SystemClockContext ABI");
+
+static void system_clock_context(u8* payload){
+  SWR_SystemClockContext ctx;
+  memset(&ctx,0,sizeof ctx);
+  ctx.steady_time=(i64)(plat_ns()/1000000000ull);
+  ctx.steady_offset=plat_unix_time()-ctx.steady_time;
+  memcpy(ctx.source_id,g_clock_id,sizeof ctx.source_id);
+  ctx.valid=1;
+  memcpy(payload,&ctx,offsetof(SWR_SystemClockContext,valid));
+}
 
 static int sysclock_disp(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 0: out64(c,(u64)plat_unix_time()); return 0;
     case 1: return 0;
-    case 2: { u8 ctx[0x20]; memset(ctx,0,sizeof ctx); i64 t=plat_unix_time(); memcpy(ctx,&t,8); outbytes(c,ctx,0x20); return 0; }
+    case 2: { u8 ctx[0x20]; system_clock_context(ctx); outbytes(c,ctx,sizeof ctx); return 0; }
     case 3: return 0;
     case 4: out_copy_h(c,ev_handle(kevent_new("clock op",0))); return 0;   /* GetOperationEventReadableHandle */
   }
   return stub_ok(o,c); }
 
-static u8 g_clock_id[16]={1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
 
 static int steady_disp(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
@@ -453,7 +475,7 @@ static void to_calendar(i64 t, IpcCtx* c){ u8 cal[8], add[0x18]; calendar_of(t,c
 static void clock_snapshot(u8* p, u8 type, const u8* uctx, const u8* nctx){
   { static int tzi; if(!tzi){ tzi=1; if(!g_tz_off) g_tz_off=plat_tz_offset(); } }   /* the time zone service may not have run yet */
   i64 steady=(i64)(plat_ns()/1000000000ull), now=plat_unix_time();
-  u8 own[0x20]; { i64 off=now-steady; memcpy(own,&off,8); memcpy(own+8,&steady,8); memcpy(own+16,g_clock_id,16); }
+  u8 own[0x20]; system_clock_context(own);
   memset(p,0,0xD0); memcpy(p,uctx? uctx : own,0x20); memcpy(p+0x20,nctx? nctx : own,0x20);
   for(int k=0;k<2;k++){ const u8* x=p+k*0x20; i64 off; memcpy(&off,x,8);
     i64 t= !memcmp(x+16,g_clock_id,16)? off+steady : now;   /* a context from another steady clock: just the PC time */
@@ -549,8 +571,8 @@ static SvcObj* new_accmgr(void){ return svcobj_new("IManagerForApplication",accm
 static int acc_disp(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 0: out32(c,1); return 0;
-    case 1: out8(c,1); return 0;
-    case 2: case 3: { u64 a,s; buf_out(c,0,&a,&s); if(a){ memset(GP(a),0,s); if(s>=16) memcpy(GP(a),g_user_id,16); } return 0; }
+    case 1: out8(c,c->raw && c->raw_size>=16 && !memcmp(c->raw,g_user_id,16)); return 0;
+    case 2: case 3: case 141: { u64 a,s; buf_out(c,0,&a,&s); if(a){ memset(GP(a),0,s); if(s>=16) memcpy(GP(a),g_user_id,16); } return 0; }
     case 4: outbytes(c,g_user_id,16); return 0;
     case 5: out_obj(c,svcobj_new("IProfile",profile_disp,0)); return 0;
     case 50: out8(c,0); return 0;
@@ -722,7 +744,9 @@ static int audren_obj(SvcObj* o, IpcCtx* c){
     case 5: o->u[3]=0; o->u[6]=0; return 0;
     case 6: o->u[3]=1; o->u[6]=0; audren_signal_ready(0); return 0;
     case 7: out_copy_h(c,ev_handle(g_aud_ev)); return 0;
-    case 8: case 9: return 0;
+    case 8: { u32 limit=in32(c,0); if(c->raw_size<4 || limit>100 || !o->data) return RC(153,4);
+      memcpy((u8*)o->data+0x34,&limit,4); return 0; }
+    case 9: { u32 limit=100; if(o->data) memcpy(&limit,(u8*)o->data+0x34,4); out32(c,limit); return 0; }
     case 11: out32(c,0); return 0;
   }
   return quiet_ok(o,c); }
@@ -739,12 +763,16 @@ static int auddev_disp(SvcObj* o, IpcCtx* c){ (void)o;
   return 0; }
 
 static int audren_disp(SvcObj* o, IpcCtx* c){
+  if(c->cmd==0 || c->cmd==1){
+    if(!c->raw || c->raw_size<0x34 || in32(c,8)>1536 || in32(c,0xc)>=64 ||
+       in32(c,0x10)>4096 || in32(c,0x14)>64 || in32(c,0x18)>4096) return RC(153,4);
+  }
   switch(c->cmd){
     case 0: { SvcObj* r=svcobj_new("IAudioRenderer",audren_obj,0x100); r->destroy=swr_audio_destroy;
-      memcpy(r->data,c->raw,0x34<0x100?0x34:0x100);
+      memcpy(r->data,c->raw,0x34); { u32 limit=100; memcpy((u8*)r->data+0x34,&limit,4); }
       r->u[0]=in32(c,0); r->u[1]=in32(c,4); r->u[2]=in32(c,8); r->u[3]=1;
       out_obj(c,r); return 0; }
-    case 1: { u64 sz=0x4000; u32 voices=in32(c,0x10), sinks=in32(c,0x14), effects=in32(c,0x1C); sz+= (u64)voices*0x400 + sinks*0x200 + effects*0x800 + 0x40000; out64(c,sz); return 0; }
+    case 1: { u64 sz=0x4000; u32 voices=in32(c,0x10), sinks=in32(c,0x14), effects=in32(c,0x18); sz+= (u64)voices*0x400 + sinks*0x200 + effects*0x800 + 0x40000; out64(c,sz); return 0; }
     case 2: case 4: out_obj(c,svcobj_new("IAudioDevice",auddev_disp,0)); return 0;
   }
   return quiet_ok(o,c); }
@@ -1182,7 +1210,7 @@ void svc_core_init(void){
   pm_init(&g_aout_lk);
   /* the runtime keeps signaling these, so we hold a reference and a game closing its handles can't free them */
   kobj_ref(&g_msg_event->o); kobj_ref(&g_launch_ev->o); kobj_ref(&g_res_ev->o); kobj_ref(&g_opmode_ev->o); kobj_ref(&g_aud_ev->o);
-  plat_thread(audio_clock,NULL,64*1024);
+  if(plat_thread(audio_clock,NULL,64*1024)) WARN("audren: renderer timer thread unavailable\n");
   if(plat_thread(aout_clock,NULL,256*1024)) WARN("audout: timer thread unavailable, using frontend playback pump\n");
   am_push_msg(0xF);          /* FocusStateChanged */
   /* ChangeIntoForeground: the app is in the foreground now. newer SDKs wait for this before they create the

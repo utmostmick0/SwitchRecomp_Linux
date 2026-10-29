@@ -7,7 +7,7 @@
 /* the runtime version goes in every log, so you can tell a crash report from an old or third party build by the
    first line */
 #ifndef SWR_RUNTIME_VERSION
-#define SWR_RUNTIME_VERSION "v200-romfs-scan-index"
+#define SWR_RUNTIME_VERSION "v202-service-timers-audio-layout"
 #endif
 const char* g_runtime_version=SWR_RUNTIME_VERSION;
 #include "rt.h"
@@ -63,11 +63,15 @@ static PMutex g_vt_m; static int g_vt_mi;
 static u64 g_vt_ar, g_vt_av, g_vt_lastfr; static double g_vt_s=1.0, g_vt_fr=0;   /* anchor + rate */
 static volatile u64 g_vt_max;
 
-static u64 guest_ns_raw(u64 r){ return g_vt_av+(u64)((double)(r-g_vt_ar)*g_vt_s); }
+static u64 guest_ns_raw(u64 r){
+  /* A sample taken before the clock lock can predate another thread's rebase.
+     Unsigned subtraction would jump to ~2^64 and freeze all later deadlines. */
+  return g_vt_av+(u64)((double)(r>=g_vt_ar?r-g_vt_ar:0)*g_vt_s);
+}
 
 u64 guest_ns(void){
   u64 r=plat_ns()-g_t0, v;
-  if(!g_vt_mi){ v=r; } else { pm_lock(&g_vt_m); v=guest_ns_raw(r); pm_unlock(&g_vt_m); }
+  if(!g_vt_mi){ v=r; } else { pm_lock(&g_vt_m); v=guest_ns_raw(plat_ns()-g_t0); pm_unlock(&g_vt_m); }
   u64 m=__atomic_load_n(&g_vt_max,__ATOMIC_RELAXED);
   while(v>m){ if(__atomic_compare_exchange_n(&g_vt_max,&m,v,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) return v; }
   return m; }
@@ -533,7 +537,12 @@ int audren_update(SvcObj* o, IpcCtx* c){
     return RC(153,4); }
   u32 splitter_count=0,destination_count=0;
   if(o->data){ memcpy(&splitter_count,(u8*)o->data+0x24,4); memcpy(&destination_count,(u8*)o->data+0x28,4); }
-  if(!swr_audio_configure_splitters(o,splitter_in,splitter_size,splitter_count,destination_count)) return RC(153,4);
+  if(!swr_audio_configure_splitters_revision(o,splitter_in,splitter_size,splitter_count,destination_count,(u32)revn)){
+    u32 counts[2]={0}; if(splitter_size>=12) memcpy(counts,splitter_in+4,sizeof counts);
+    WARN("audren: rejected splitter update (size %u, splitters %u, destinations %u, info %u, updates %u)\n",
+      splitter_size,splitter_count,destination_count,
+      counts[0],counts[1]);
+    return RC(153,4); }
   static int said; if(!said){ said=1; LOG("audren: REV%d, %u pools, %u voices, %u effects, %u sinks\n",revn,npools,nvoices,neff,nsinks); }
   memset(out,0,oh[15]); memcpy(out,oh,64);
   u8* q=out+0x40;
