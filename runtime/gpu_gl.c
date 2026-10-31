@@ -247,9 +247,9 @@ static u64 g_tm[TM_N], g_tmp[TM_N]; static u64 st_sh_new;
    lit material, so the whole level was black. we keep a DEPTH_COMPONENT32F copy and redo it when the data changes
    (uploads by hash, render targets by write generation). desktop GL only (glGetTexImage) */
 static GLuint shadow_depth_copy(Tex* t){
-  if(t->zc_ok==2) return 0;
-  if(t->target!=GL_TEXTURE_2D || t->f.depth || t->f.is_int || t->f.compressed) return 0;
-  if(t->f.ifmt!=GL_R32F && t->f.ifmt!=GL_R16F && t->f.ifmt!=GL_R16) return 0;
+  if(!t || t->zc_ok==2) return 0;
+  if(t->target!=GL_TEXTURE_2D || t->f.depth || t->f.is_int || t->f.compressed){ t->zc_ok=2; return 0; }
+  if(t->f.ifmt!=GL_R32F && t->f.ifmt!=GL_R16F && t->f.ifmt!=GL_R16){ t->zc_ok=2; return 0; }
   if(t->is_rt && (u64)t->w*t->h>512u*512u){ t->zc_ok=2; return 0; }   /* a big render target would need a readback every frame */
   if(t->zc && t->zc_hash==t->hash && t->zc_wgen==t->wgen) return t->zc;
   u64 n=(u64)t->w*t->h; float* px=malloc(n*4); if(!px){ t->zc_ok=2; return 0; }
@@ -422,6 +422,12 @@ static u32 g_tex_bud_frame; static i64 g_tex_bud; static u64 st_tex_chk;
 static u64 fast_hash(const u8* p, u64 size, int sampled){
   const u64* q=(const u64*)p; u64 n=size/8, step= (sampled && n>8192)? 16 : 1;   /* sample one word per 128 bytes */
   u64 a=0x9E3779B97F4A7C15ull, b=0xC2B2AE3D27D4EB4Full, c=0x165667B19E3779F9ull, d=0x27D4EB2F165667C5ull; u64 i=0;
+  if(step==1){
+    for(; i+7<n; i+=8){
+      a=(a^q[i])*0x100000001B3ull; b=(b^q[i+1])*0x100000001B3ull; c=(c^q[i+2])*0x100000001B3ull; d=(d^q[i+3])*0x100000001B3ull;
+      a=(a^q[i+4])*0x100000001B3ull; b=(b^q[i+5])*0x100000001B3ull; c=(c^q[i+6])*0x100000001B3ull; d=(d^q[i+7])*0x100000001B3ull;
+    }
+  }
   for(; i+3*step<n; i+=4*step){ a=(a^q[i])*0x100000001B3ull; b=(b^q[i+step])*0x100000001B3ull; c=(c^q[i+2*step])*0x100000001B3ull; d=(d^q[i+3*step])*0x100000001B3ull; }
   for(; i<n; i+=step){ a=(a^q[i])*0x100000001B3ull; }
   for(u64 k=n*8;k<size;k++){ b=(b^p[k])*0x100000001B3ull; }
@@ -2237,6 +2243,7 @@ static void bind_textures(GpuChannel* ch, int stage, Sh* s){
     memcpy(g_tb_last[slot],tids,(size_t)nt*4); memcpy(g_sb_last[slot],sids,(size_t)nt*4); g_tb_n[slot]=nt; g_tb_ok[slot]=1; } }
 
 static u8* g_stage_buf; static size_t g_stage_cap;
+static u32* g_quad_idx_buf; static size_t g_quad_idx_cap;
 /* buffer cache keyed by guest range, validated once per submit */
 u32 g_submit_epoch;
 typedef struct VbC { u64 start, len, hash, cpu; u32 epoch, used; GLuint id; struct VbC* next; u32 stable, chk_epoch; int dirty; u32 csseen; u64 shash; u32 schk; u8* mirror; } VbC;
@@ -2770,18 +2777,23 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,g_ibuf);
     GLenum it= isz==1? GL_UNSIGNED_BYTE : isz==2? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT;
     if(topology==7){ /* quads -> tris */
-      u32 nq=count/4; u32* idx=malloc((size_t)nq*6*4); if(!idx) return;
+      u32 nq=count/4; size_t need=(size_t)nq*6*sizeof(u32);
+      if(need>g_quad_idx_cap){ size_t nc=need*2; u32* nb=realloc(g_quad_idx_buf,nc); if(!nb) return; g_quad_idx_buf=nb; g_quad_idx_cap=nc; }
+      u32* idx=g_quad_idx_buf;
       for(u32 k=0;k<nq;k++){ u32 v[4]; for(int j=0;j<4;j++){ u64 o=((u64)first+(u64)k*4+j)*isz; v[j]= isz==1? src[o] : isz==2? *(u16*)(src+o) : *(u32*)(src+o); }
         u32 t6[6]={v[0],v[1],v[2],v[0],v[2],v[3]}; memcpy(idx+k*6,t6,24); }
-      glBufferData(GL_ELEMENT_ARRAY_BUFFER,(GLsizeiptr)nq*24,idx,GL_STREAM_DRAW); free(idx);
+      glBufferData(GL_ELEMENT_ARRAY_BUFFER,(GLsizeiptr)need,idx,GL_STREAM_DRAW);
       glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES,nq*6,GL_UNSIGNED_INT,0,instances,(GLint)base_vertex,base_instance);
     } else {
       buf_cached(GL_ELEMENT_ARRAY_BUFFER,ia+(u64)first*isz,(u64)count*isz,0);   /* just this draw's range */
       glDrawElementsInstancedBaseVertexBaseInstance(mode,count,it,(void*)0,instances,(GLint)base_vertex,base_instance);
     }
   } else {
-    if(topology==7){ u32 nq=count/4; u32* idx=malloc((size_t)nq*24+4); for(u32 k=0;k<nq;k++){ u32 b=first+k*4; u32 t6[6]={b,b+1,b+2,b,b+2,b+3}; memcpy(idx+k*6,t6,24); }
-      glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,g_ibuf); glBufferData(GL_ELEMENT_ARRAY_BUFFER,(GLsizeiptr)nq*24,idx,GL_STREAM_DRAW); free(idx);
+    if(topology==7){ u32 nq=count/4; size_t need=(size_t)nq*6*sizeof(u32);
+      if(need>g_quad_idx_cap){ size_t nc=need*2; u32* nb=realloc(g_quad_idx_buf,nc); if(!nb) return; g_quad_idx_buf=nb; g_quad_idx_cap=nc; }
+      u32* idx=g_quad_idx_buf;
+      for(u32 k=0;k<nq;k++){ u32 b=first+k*4; u32 t6[6]={b,b+1,b+2,b,b+2,b+3}; memcpy(idx+k*6,t6,24); }
+      glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,g_ibuf); glBufferData(GL_ELEMENT_ARRAY_BUFFER,(GLsizeiptr)need,idx,GL_STREAM_DRAW);
       glDrawElementsInstancedBaseVertexBaseInstance(GL_TRIANGLES,nq*6,GL_UNSIGNED_INT,0,instances,0,base_instance); }
     else glDrawArraysInstancedBaseInstance(mode,first,count,instances,base_instance);
   }

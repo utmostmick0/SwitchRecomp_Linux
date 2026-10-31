@@ -22,9 +22,9 @@ static void sb_put(Sb* s, const char* t){ size_t l=strlen(t); if(s->n+l+1>s->cap
 static void sb_f(Sb* s, const char* f, ...){ char tmp[2048]; va_list ap; va_start(ap,f); vsnprintf(tmp,sizeof tmp,f,ap); va_end(ap); sb_put(s,tmp); }
 
 /* scratch string ring for building expressions */
-static __thread char ring[64][384]; static __thread int ringi;
+static __thread char ring[128][384]; static __thread int ringi;
 
-static char* T(const char* f, ...){ char* r=ring[ringi++&63]; va_list ap; va_start(ap,f); vsnprintf(r,384,f,ap); va_end(ap); return r; }
+static char* T(const char* f, ...){ char* r=ring[ringi++&127]; va_list ap; va_start(ap,f); vsnprintf(r,384,f,ap); va_end(ap); return r; }
 
 /* ============================================================ opcode table */
 enum {
