@@ -1145,6 +1145,34 @@ static void mark_tgt(Ctx* c, u32 i){ mark(c,i); if(i<65536) c->tgt[i>>3]|=1<<(i&
 
 static int is_tgt(Ctx* c, u32 i){ return i<65536 && (c->tgt[i>>3]>>(i&7))&1; }
 
+static u32 ampere_bits(const u32 words[4], u32 lo, u32 count){
+  if(lo>=128 || count>32 || count>128-lo) return 0;
+  u32 index=lo>>5, shift=lo&31;
+  u64 value=words[index]>>shift;
+  if(shift && count>32-shift && index<3) value|=(u64)words[index+1]<<(32-shift);
+  return count==32? (u32)value : (u32)(value&((1u<<count)-1));
+}
+
+int shader_ampere_lower_hsetp2(const u32 words[4], u64* out){
+  if(!words || !out || ampere_bits(words,0,12)!=0x234 || ampere_bits(words,16,8)!=0 ||
+     ampere_bits(words,64,5)!=0 || ampere_bits(words,69,2)>2 ||
+     ampere_bits(words,91,1) || (words[1]&0x0fffff00U) ||
+     ampere_bits(words,9,3)!=1) return 0;
+  u32 predicate=ampere_bits(words,12,4), a=ampere_bits(words,24,8), b=ampere_bits(words,32,8);
+  u32 a_swizzle=ampere_bits(words,74,2), b_swizzle=ampere_bits(words,60,2);
+  u32 a_absolute=ampere_bits(words,73,1), a_negate=ampere_bits(words,72,1);
+  u32 b_absolute=ampere_bits(words,62,1), b_negate=ampere_bits(words,63,1);
+  *out=0x5d20000000000000ULL | ((u64)predicate<<16) |
+       ((u64)ampere_bits(words,81,3)<<3) | ampere_bits(words,84,3) |
+       ((u64)ampere_bits(words,80,1)<<6) | ((u64)a<<8) | ((u64)b<<20) |
+       ((u64)b_swizzle<<28) | ((u64)b_absolute<<30) | ((u64)b_negate<<31) |
+       ((u64)ampere_bits(words,76,4)<<35) | ((u64)ampere_bits(words,87,4)<<39) |
+       ((u64)a_negate<<43) | ((u64)a_absolute<<44) |
+       ((u64)ampere_bits(words,69,2)<<45) | ((u64)a_swizzle<<47) |
+       ((u64)ampere_bits(words,71,1)<<49);
+  return 1;
+}
+
 int (*g_shader_cb_read)(u32 idx, u32 off, u32* out);
 
 u64 shader_hash(const u8* code, u32 max_bytes, u32* out_len){

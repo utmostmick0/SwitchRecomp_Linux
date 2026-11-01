@@ -214,6 +214,15 @@ u32 swr_cas16(u16* p, u16 o, u16 n){ u16 prev=o; __asm__ __volatile__("lock; cmp
 
 u32 swr_cas8(u8* p, u8 o, u8 n){ u8 prev=o; __asm__ __volatile__("lock; cmpxchgb %2,%1" : "+a"(prev), "+m"(*p) : "q"(n) : "memory","cc"); return prev==o; }
 
+u64 swr_cas_value(void* ptr, u32 size, u64 expected, u64 desired){
+  switch(size){
+    case 1: { u8 prev=(u8)expected; __asm__ __volatile__("lock; cmpxchgb %2,%1" : "+a"(prev), "+m"(*(u8*)ptr) : "q"((u8)desired) : "memory","cc"); return prev; }
+    case 2: { u16 prev=(u16)expected; __asm__ __volatile__("lock; cmpxchgw %2,%1" : "+a"(prev), "+m"(*(u16*)ptr) : "r"((u16)desired) : "memory","cc"); return prev; }
+    case 4: { u32 prev=(u32)expected; __asm__ __volatile__("lock; cmpxchgl %2,%1" : "+a"(prev), "+m"(*(u32*)ptr) : "r"((u32)desired) : "memory","cc"); return prev; }
+    default: { u64 prev=expected; __asm__ __volatile__("lock; cmpxchgq %2,%1" : "+a"(prev), "+m"(*(u64*)ptr) : "r"(desired) : "memory","cc"); return prev; }
+  }
+}
+
 /* cmpxchg16b clobbers rbx (and we use rdi), tcc won't save them so the asm does it */
 u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1){
   u64 a[5]; u64 r; a[0]=(u64)p; a[1]=o0; a[2]=o1; a[3]=n0; a[4]=n1;
@@ -234,6 +243,15 @@ static volatile LONG g_fz; void swr_fence(void){ InterlockedExchange(&g_fz,0); }
 void swr_fence(void){ __asm__ __volatile__("mfence" : : : "memory"); }
 #endif
 #else
+u64 swr_cas_value(void* ptr, u32 size, u64 expected, u64 desired){
+  switch(size){
+    case 1: { u8 old=(u8)expected; __atomic_compare_exchange_n((u8*)ptr,&old,(u8)desired,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST); return old; }
+    case 2: { u16 old=(u16)expected; __atomic_compare_exchange_n((u16*)ptr,&old,(u16)desired,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST); return old; }
+    case 4: { u32 old=(u32)expected; __atomic_compare_exchange_n((u32*)ptr,&old,(u32)desired,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST); return old; }
+    default: { u64 old=expected; __atomic_compare_exchange_n((u64*)ptr,&old,desired,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST); return old; }
+  }
+}
+
 u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1){
 #if defined(__x86_64__) && defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16)
   unsigned __int128 o=((unsigned __int128)o1<<64)|o0, n=((unsigned __int128)n1<<64)|n0;
@@ -245,6 +263,34 @@ u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1){
 #endif
 }
 #endif
+
+static i64 swr_lse_signed(u64 value, u32 size){
+  switch(size){ case 1: return (i8)value; case 2: return (i16)value; case 4: return (i32)value; default: return (i64)value; }
+}
+
+u64 swr_lse_op(void* ptr, u32 size, u32 op, u64 operand){
+  const u64 mask=size==8? ~0ull : (1ull<<(size*8))-1;
+  const u64 source=operand&mask;
+  u64 old=swr_cas_value(ptr,size,0,0);
+  for(;;){
+    u64 result;
+    switch(op){
+      case 0: result=old+source; break;
+      case 1: result=old&~source; break;
+      case 2: result=old^source; break;
+      case 3: result=old|source; break;
+      case 4: result=swr_lse_signed(old,size)>swr_lse_signed(source,size)? old : source; break;
+      case 5: result=swr_lse_signed(old,size)<swr_lse_signed(source,size)? old : source; break;
+      case 6: result=old>source? old : source; break;
+      case 7: result=old<source? old : source; break;
+      default: result=source; break;
+    }
+    result&=mask;
+    u64 observed=swr_cas_value(ptr,size,old,result);
+    if(observed==old) return old;
+    old=observed;
+  }
+}
 
 /* ================================================================ system */
 #define SYSREG(op0,op1,crn,crm,op2) ((((op0)&1)<<14)|((op1)<<11)|((crn)<<7)|((crm)<<3)|(op2))

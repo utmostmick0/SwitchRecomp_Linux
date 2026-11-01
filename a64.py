@@ -19,6 +19,7 @@ FIELDS = {
     'V': (26, 1), 'L': (22, 1), 'mode': (23, 2), 'imode': (10, 2), 'op31': (21, 3), 'o2': (23, 1),
     'dpop': (10, 6), 'fop1': (15, 6), 'fop2': (12, 4), 'fcmpop': (3, 2), 'Q': (30, 1), 'lsop1': (21, 1),
     'op0_1': (21, 3), 'CRn': (12, 4), 'op1': (16, 3), 'b24': (24, 1), 'b21': (21, 1), 'b10': (10, 1), 'b11': (11, 1),
+    'lseop': (12, 4),
 }
 
 
@@ -320,6 +321,31 @@ def _(g): return ('blr', g.X('rn'))
 def _(g): return ('ret', g.X('rn'))
 
 
+@ins('RETAA', '11010110 01011111 0000101111111111')
+@ins('RETAB', '11010110 01011111 0000111111111111')
+def _(g): return ('ret', 'c->x[30]')
+
+
+@ins('BRAA', '1101 0111 0001 1111 0000 10xx xxxx xxxx')
+@ins('BRAB', '1101 0111 0001 1111 0000 11xx xxxx xxxx')
+def _(g): return ('br', g.X('rn'))
+
+
+@ins('BRAAZ', '1101 0110 0001 1111 0000 10xx xxx1 1111')
+@ins('BRABZ', '1101 0110 0001 1111 0000 11xx xxx1 1111')
+def _(g): return ('br', g.X('rn'))
+
+
+@ins('BLRAA', '1101 0111 0011 1111 0000 10xx xxxx xxxx')
+@ins('BLRAB', '1101 0111 0011 1111 0000 11xx xxxx xxxx')
+def _(g): return ('blr', g.X('rn'))
+
+
+@ins('BLRAAZ', '1101 0110 0011 1111 0000 10xx xxx1 1111')
+@ins('BLRABZ', '1101 0110 0011 1111 0000 11xx xxx1 1111')
+def _(g): return ('blr', g.X('rn'))
+
+
 # ------------------------------------------------------------------ system
 @ins('SVC', '11010100 000 xxxxxxxxxxxxxxxx 00001')
 def _(g): return ('svc', g.f('imm16'))
@@ -365,6 +391,10 @@ def _(g):
             return 'dc_zva(M,%s);' % g.X('rt')
         return ''
     return 'if(%s==3&&%s==7&&%s==4&&%s==1) dc_zva(M,%s);' % (g.f('op1'), g.f('CRn'), g.f('CRm'), g.f('op2'), g.X('rt'))
+
+
+@ins('XPACI', '1101 1010 1100 0001 0100 0011 111x xxxx')
+def _(g): return ''
 
 
 SR_TPIDR = (1 << 14) | (3 << 11) | (13 << 7) | (0 << 3) | 2
@@ -418,6 +448,22 @@ def ldst_body(g, size, V, opc, A):
 
 def ls_scale(size, V, opc):
     return 4 if (V and opc >= 2) else size
+
+
+def ldr_auth(g, writeback):
+    off = lit(g.v('imm9') * 8) if g.static else '((u64)(i64)%s*8)' % g.f('imm9')
+    addr = '(%s+%s)' % (g.XS('rn'), off)
+    if writeback:
+        return '{ u64 a_=%s; %s %s }' % (addr, g.setX('rt', 'RD64(a_)'), g.setXS('rn', 'a_'))
+    return g.setX('rt', 'RD64(%s)' % addr)
+
+
+@ins('LDRAA_LDRAB_OFF', '1111 1000 x01x xxxx xxxx 01xx xxxx xxxx')
+def _(g): return ldr_auth(g, False)
+
+
+@ins('LDRAA_LDRAB_PRE', '1111 1000 x11x xxxx xxxx 11xx xxxx xxxx')
+def _(g): return ldr_auth(g, True)
 
 
 @ins('LDST_UIMM', 'xx 111 x 01 xx xxxxxxxxxxxx xxxxx xxxxx', spec=('size', 'V', 'lopc'))
@@ -509,6 +555,31 @@ def _(g):
     if mode == 1: s += g.setXS('rn', 'a_+%s' % off)
     elif mode == 3: s += g.setXS('rn', 'a_')
     return s + ' }'
+
+
+@ins('CAS', 'xx 001000 1 x 1 xxxxx x 11111 xxxxx xxxxx', spec=('size',))
+def _(g):
+    size = g.v('size')
+    expected = g.X('rs') if size == 3 else g.W('rs')
+    desired = g.X('rt') if size == 3 else g.W('rt')
+    old = 'swr_cas_value(MP(%s),%d,%s,%s)' % (g.XS('rn'), 1 << size, expected, desired)
+    return g.setX('rs', old) if size == 3 else g.setW('rs', old)
+
+
+@ins('LDAPR', 'xx 111000 10 111111 110000 xxxxx xxxxx', spec=('size',))
+def _(g):
+    size = g.v('size')
+    load = 'LDAR_(%s,%s)' % (['u8', 'u16', 'u32', 'u64'][size], g.XS('rn'))
+    return g.setX('rt', load) if size == 3 else g.setW('rt', load)
+
+
+@ins('LSE', 'xx 111000 x x 1 xxxxx xxxx 00 xxxxx xxxxx', spec=('size', 'lseop'))
+def _(g):
+    size, op = g.v('size'), g.v('lseop')
+    if op > 8: return None
+    operand = g.X('rs') if size == 3 else g.W('rs')
+    old = 'swr_lse_op(MP(%s),%d,%d,%s)' % (g.XS('rn'), 1 << size, op, operand)
+    return g.setX('rt', old) if size == 3 else g.setW('rt', old)
 
 
 @ins('LDSTX', 'xx 001000 x x x xxxxx x xxxxx xxxxx xxxxx', spec=('size', 'o2', 'L', 'o1'))

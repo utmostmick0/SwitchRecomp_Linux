@@ -278,6 +278,8 @@ SWR_INLINE void dc_zva(u8* M, u64 a){ memset(MP(a&~63ull),0,64); }
 u32 swr_cas64(u64* p, u64 o, u64 n); u32 swr_cas32(u32* p, u32 o, u32 n);
 u32 swr_cas16(u16* p, u16 o, u16 n); u32 swr_cas8(u8* p, u8 o, u8 n);
 u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1);
+u64 swr_cas_value(void* p, u32 size, u64 expected, u64 desired);
+u64 swr_lse_op(void* p, u32 size, u32 op, u64 operand);
 #define SWR_FENCE() swr_fence()
 void swr_fence(void);
 #else
@@ -290,6 +292,8 @@ SWR_INLINE u32 swr_cas16(u16* p, u16 o, u16 n){ return __atomic_compare_exchange
 SWR_INLINE u32 swr_cas8(u8* p, u8 o, u8 n){ return __atomic_compare_exchange_n(p,&o,n,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST); }
 
 u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1);
+u64 swr_cas_value(void* p, u32 size, u64 expected, u64 desired);
+u64 swr_lse_op(void* p, u32 size, u32 op, u64 operand);
 #define SWR_FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 #endif
 /* LDAR/STLR and DMB LD. a volatile access only orders against other volatile accesses, the compiler could still

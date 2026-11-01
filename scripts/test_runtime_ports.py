@@ -3,12 +3,14 @@
 from pathlib import Path
 import os
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKS = [
     ("shader_dimensions", [], True),
     ("clock", [], True),
+    ("lse_atomics", [], True),
     ("service_ports", ["runtime/ipc.c", "runtime/audio.c", "runtime/audio_effects.c"], False),
     ("ipc_sessions", ["runtime/ipc.c", "runtime/kernel.c"], True),
     ("audio_effects", ["runtime/audio_effects.c"], True),
@@ -21,6 +23,7 @@ CHECKS = [
 
 
 def main():
+    subprocess.run([sys.executable, "scripts/test_lse_decode.py"], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="swr-runtime-checks-") as directory:
         for name, sources, address_sanitizer in CHECKS:
             print(f"Checking {name}...", flush=True)
