@@ -6,6 +6,7 @@
 
 u8* g_mem;
 int g_opt_lang=1;
+volatile int g_quit;
 void logf_(int lvl,const char* fmt,...){ (void)lvl; (void)fmt; }
 u64 plat_ns(void){ return 123000000000ull; }
 i64 plat_unix_time(void){ return 1700000000; }
@@ -13,6 +14,12 @@ int audren_update(SvcObj* object,IpcCtx* context){ (void)object; (void)context; 
 u32 h_new(KObj* object){ (void)object; assert(0); return 0; }
 KEvent* kevent_new(const char* name,int autoclear){ (void)name; (void)autoclear; assert(0); return NULL; }
 void kevent_signal(KEvent* event){ (void)event; assert(0); }
+/* Manager discovery must not start playback or access guest PCM buffers. */
+void pm_lock(PMutex* mutex){ (void)mutex; assert(0); }
+void pm_unlock(PMutex* mutex){ (void)mutex; assert(0); }
+void mem_query(u64 address,MemBlock* block){ (void)address; (void)block; assert(0); }
+void plat_sleep_ns(i64 ns){ (void)ns; assert(0); }
+u64 guest_ns(void){ assert(0); return 0; }
 
 int main(void){
   u8 memory[256], raw[32]={0}; g_mem=memory;
@@ -21,6 +28,7 @@ int main(void){
   assert(acc_disp(NULL,&c)==0 && c.out_size==1 && c.out[0]==1);
   raw[0]^=1; c.out_size=0; acc_disp(NULL,&c); assert(!c.out[0]);
   c.raw_size=8; c.out_size=0; acc_disp(NULL,&c); assert(!c.out[0]);
+  c.raw=NULL; c.raw_size=16; c.out_size=0; acc_disp(NULL,&c); assert(!c.out[0]);
 
   /* Exercise both auto-select descriptor forms, including short buffers. */
   for(int kind=0;kind<2;kind++) for(int size=0;size<=32;size++){
@@ -45,6 +53,8 @@ int main(void){
   u8 ctx[32]; i64 offset,steady; system_clock_context(ctx);
   memcpy(&offset,ctx,8); memcpy(&steady,ctx+8,8);
   assert(steady==123 && offset+steady==1700000000 && !memcmp(ctx+16,g_clock_id,16));
+  memset(&c,0,sizeof c); c.cmd=2; assert(!sysclock_disp(NULL,&c));
+  assert(c.out_size==sizeof ctx && !memcmp(c.out,ctx,sizeof ctx));
   g_opt_lang=17; memset(&c,0,sizeof c); set_disp(NULL,&c);
   assert(c.out_size==8 && !memcmp(c.out,"pt-BR",5));
   g_opt_lang=-1; memset(&c,0,sizeof c); set_disp(NULL,&c);
@@ -65,8 +75,14 @@ int main(void){
   SvcObj* renderer=c.out_objs[0]; memset(&c,0,sizeof c); c.cmd=9;
   assert(!renderer->dispatch(renderer,&c)); memcpy(&n,c.out,4); assert(n==100);
   u32 limit=37; memset(&c,0,sizeof c); c.cmd=8; c.raw=(u8*)&limit; c.raw_size=4;
+  renderer->u[5]=123; /* RequestUpdate's frame counter is independent of CPU limit. */
   assert(!renderer->dispatch(renderer,&c)); memset(&c,0,sizeof c); c.cmd=9;
   assert(!renderer->dispatch(renderer,&c)); memcpy(&n,c.out,4); assert(n==37);
+  assert(renderer->u[5]==123);
+  limit=101; memset(&c,0,sizeof c); c.cmd=8; c.raw=(u8*)&limit; c.raw_size=4;
+  assert(renderer->dispatch(renderer,&c)==RC(153,4));
+  memset(&c,0,sizeof c); c.cmd=9; assert(!renderer->dispatch(renderer,&c));
+  memcpy(&n,c.out,4); assert(n==37 && renderer->u[5]==123);
   /* Start/stop dispatch through the returned renderer, not a fabricated token. */
   memset(&c,0,sizeof c); c.cmd=5; assert(!renderer->dispatch(renderer,&c));
   memset(&c,0,sizeof c); c.cmd=3; assert(!renderer->dispatch(renderer,&c));
@@ -94,10 +110,32 @@ int main(void){
   }
   n=1537; memcpy(params+8,&n,4); memset(&c,0,sizeof c); c.raw=params; c.raw_size=sizeof params;
   assert(audren_disp(NULL,&c)==RC(153,4) && !c.nout_objs);
+  /* NS2 aud:u returns real independent managers, usable through dispatch. */
+  u32 client_arg=0;
+  SvcObj* user=new_ns2_auduser(); assert(user);
+  for(u32 command=1;command<=2;command++){
+    memset(&c,0,sizeof c); c.cmd=command; c.raw=(u8*)&client_arg; c.raw_size=4;
+    assert(!user->dispatch(user,&c) && c.nout_objs==1);
+    SvcObj* manager=c.out_objs[0];
+    assert(manager->dispatch==(command==1?audout_disp:audren_disp));
+    memset(&c,0,sizeof c);
+    if(command==1){ assert(!manager->dispatch(manager,&c)); memcpy(&n,c.out,4); assert(n==1); }
+    else { c.cmd=1; memset(params,0,sizeof params); c.raw=params; c.raw_size=sizeof params;
+      assert(!manager->dispatch(manager,&c) && c.out_size==8);
+      u64 work_size; memcpy(&work_size,c.out,8); assert(work_size>0); }
+    svcobj_unref(manager);
+  }
+  memset(&c,0,sizeof c); c.cmd=2;
+  assert(user->dispatch(user,&c)==RC(153,4) && !c.nout_objs);
+  memset(&c,0,sizeof c); c.cmd=999;
+  assert(user->dispatch(user,&c)==0xf601 && !c.nout_objs);
+  svcobj_unref(user);
   memset(params,0,sizeof params);
   n=4097; memcpy(params+0x18,&n,4); memset(&c,0,sizeof c); c.raw=params; c.raw_size=sizeof params;
   assert(audren_disp(NULL,&c)==RC(153,4) && !c.nout_objs);
   c.cmd=1; assert(audren_disp(NULL,&c)==RC(153,4));
+  memset(&c,0,sizeof c); c.raw=params; c.raw_size=0x33;
+  assert(audren_disp(NULL,&c)==RC(153,4) && !c.nout_objs);
   puts("Service port checks passed.");
   return 0;
 }

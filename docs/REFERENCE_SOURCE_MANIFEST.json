@@ -1,0 +1,167 @@
+{
+  "review_date": "2026-11-05",
+  "purpose": "Provenance for NS2_TECHNICAL_INTEGRATION.md; source statements are not local implementation or game-validation claims.",
+  "local_reference_documents": [
+    {
+      "filename": "audio.md",
+      "original_path": "/home/mick0/Downloads/Reference/audio.md",
+      "sha256": "f19b9df6dc79491837e60bd1506d95148e57993285b6794de3668a3830001bff",
+      "bytes": 41689,
+      "lines": 290,
+      "redistributed": false
+    },
+    {
+      "filename": "frame-rate.md",
+      "original_path": "/home/mick0/Downloads/Reference/frame-rate.md",
+      "sha256": "f27bce7b18f34d6f312484f3af3a53e6097ed831552876666da5ca71b81cca54",
+      "bytes": 66875,
+      "lines": 306,
+      "redistributed": false
+    },
+    {
+      "filename": "game-state.md",
+      "original_path": "/home/mick0/Downloads/Reference/game-state.md",
+      "sha256": "e58cc3871a7e88d9ff4b7c6dfc209d69c3c0d357264941e9530b66ba6f0488e3",
+      "bytes": 5277,
+      "lines": 50,
+      "redistributed": false
+    },
+    {
+      "filename": "memory.md",
+      "original_path": "/home/mick0/Downloads/Reference/memory.md",
+      "sha256": "d86c49d5002a35264bb14fa035d8ab440ecdd50f8ddb3c95c6275c640fd97d8c",
+      "bytes": 90966,
+      "lines": 382,
+      "redistributed": false
+    },
+    {
+      "filename": "movies.md",
+      "original_path": "/home/mick0/Downloads/Reference/movies.md",
+      "sha256": "7352d63a791c673ad6d9a4a91cdcfdf2fecf264ee29e4654ba45ea6a10977673",
+      "bytes": 31599,
+      "lines": 219,
+      "redistributed": false
+    },
+    {
+      "filename": "nvn-objects.md",
+      "original_path": "/home/mick0/Downloads/Reference/nvn-objects.md",
+      "sha256": "c5cad6c40460ecbafaf53afded19e2cf5eb49f27169dddd378f4aa914960adac",
+      "bytes": 101048,
+      "lines": 578,
+      "redistributed": false
+    },
+    {
+      "filename": "packing.md",
+      "original_path": "/home/mick0/Downloads/Reference/packing.md",
+      "sha256": "e87364a8de310fb47d1003b1a50e8dda6533df3cff6fbe5f54943d7e5bc89467",
+      "bytes": 27817,
+      "lines": 139,
+      "redistributed": false
+    },
+    {
+      "filename": "rendering.md",
+      "original_path": "/home/mick0/Downloads/Reference/rendering.md",
+      "sha256": "54193edf182361f6e1ba5a103308eaaed73597b8530b0de3ffda4605a2f38f40",
+      "bytes": 211641,
+      "lines": 1107,
+      "redistributed": false
+    },
+    {
+      "filename": "rewriter.md",
+      "original_path": "/home/mick0/Downloads/Reference/rewriter.md",
+      "sha256": "2b4943a3c004b88ebb9d806050352eccfa95ce3996cb3a3c6aceeeac356c6ff1",
+      "bytes": 47154,
+      "lines": 322,
+      "redistributed": false
+    },
+    {
+      "filename": "services.md",
+      "original_path": "/home/mick0/Downloads/Reference/services.md",
+      "sha256": "ca1a199ef9e36e540ae892495934af79c760de929f5534430799db097a34e54b",
+      "bytes": 128342,
+      "lines": 769,
+      "redistributed": false
+    },
+    {
+      "filename": "shaders.md",
+      "original_path": "/home/mick0/Downloads/Reference/shaders.md",
+      "sha256": "ba93d4ee04872081f9a7b257532b2f0daee35b489b3b34f0f8c4322a3cd964c2",
+      "bytes": 253145,
+      "lines": 1139,
+      "redistributed": false
+    },
+    {
+      "filename": "threads.md",
+      "original_path": "/home/mick0/Downloads/Reference/threads.md",
+      "sha256": "49b7e388f1c18b4ea98dd9df07c809cd05a0764df4a40b4ef6c89e7d83c54e49",
+      "bytes": 44640,
+      "lines": 221,
+      "redistributed": false
+    }
+  ],
+  "upstream_documents": [
+    {
+      "filename": "NS1_NS2_HOST_SOURCE_RECONCILIATION_2026-11-04.md",
+      "url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/NS1_NS2_HOST_SOURCE_RECONCILIATION_2026-11-04.md",
+      "retrieval_url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/raw/branch/main/docs/NS1_NS2_HOST_SOURCE_RECONCILIATION_2026-11-04.md",
+      "sha256": "9557f2354c9bf647d9c61e47ed1eff0e3e28181db732e93d37b711a277aadc74",
+      "bytes": 5540,
+      "lines": 61,
+      "redistributed": false
+    },
+    {
+      "filename": "NS1_NS2_ROADMAP_RECONCILIATION_2026-11-04.md",
+      "url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/NS1_NS2_ROADMAP_RECONCILIATION_2026-11-04.md",
+      "retrieval_url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/raw/branch/main/docs/NS1_NS2_ROADMAP_RECONCILIATION_2026-11-04.md",
+      "sha256": "12a35118ff1135ec8ac80fd8dada726d152540c7a89fee72b0edc007f649f101",
+      "bytes": 6667,
+      "lines": 55,
+      "redistributed": false
+    },
+    {
+      "filename": "NS2_ATOMIC_SPAN_QMD3_2026-11-05.md",
+      "url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/NS2_ATOMIC_SPAN_QMD3_2026-11-05.md",
+      "retrieval_url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/raw/branch/main/docs/NS2_ATOMIC_SPAN_QMD3_2026-11-05.md",
+      "sha256": "9c0048772ce4259c9640afce1a18e885823a7ffffda4f6206538f779e38358a2",
+      "bytes": 2517,
+      "lines": 48,
+      "redistributed": false
+    },
+    {
+      "filename": "NS2_GSV_NATIVE_MEMORY_REVIEW_2026-11-01.md",
+      "url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/NS2_GSV_NATIVE_MEMORY_REVIEW_2026-11-01.md",
+      "retrieval_url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/raw/branch/main/docs/NS2_GSV_NATIVE_MEMORY_REVIEW_2026-11-01.md",
+      "sha256": "18b76fb7122a9682c82f76bdd1e300e101ce9978cf9378c8fbfa5a24db1e41bc",
+      "bytes": 8855,
+      "lines": 145,
+      "redistributed": false
+    },
+    {
+      "filename": "NS2_HLE_BOOTSTRAP_2026-11-01.md",
+      "url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/NS2_HLE_BOOTSTRAP_2026-11-01.md",
+      "retrieval_url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/raw/branch/main/docs/NS2_HLE_BOOTSTRAP_2026-11-01.md",
+      "sha256": "a31976a557caac4877a551e73494516113d4e2b31638b86bed2c24e5406da70d",
+      "bytes": 8521,
+      "lines": 110,
+      "redistributed": false
+    },
+    {
+      "filename": "NS2_SHADER_TEXTURE_UPSTREAM_AUDIT_2026-11-01.md",
+      "url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/NS2_SHADER_TEXTURE_UPSTREAM_AUDIT_2026-11-01.md",
+      "retrieval_url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/raw/branch/main/docs/NS2_SHADER_TEXTURE_UPSTREAM_AUDIT_2026-11-01.md",
+      "sha256": "da0569113b2b0603998324710b068fe809c6ff11384a8527113e3a617007752b",
+      "bytes": 8683,
+      "lines": 54,
+      "redistributed": false
+    },
+    {
+      "filename": "ROADMAP_NS1_NS2_UNIFIED.md",
+      "url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/ROADMAP_NS1_NS2_UNIFIED.md",
+      "retrieval_url": "https://git.eden-emu.dev/niakw/ProsperoEden-Encore/raw/branch/main/docs/ROADMAP_NS1_NS2_UNIFIED.md",
+      "sha256": "16a43cd50b45d028e878aaf34486bae550e27c0f466bef22f21cff4780aa71c9",
+      "bytes": 65863,
+      "lines": 989,
+      "redistributed": false
+    }
+  ]
+}

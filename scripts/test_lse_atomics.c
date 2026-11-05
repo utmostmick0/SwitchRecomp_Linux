@@ -12,6 +12,14 @@ static void* add_repeatedly(void* arg){
 }
 
 int main(void){
+  u64 pair[2] __attribute__((aligned(16)))={0x0123456789abcdefull,0xfedcba9876543210ull};
+  u64 old0=0,old1=0;
+  assert(swr_cas128_value(pair,pair[0],pair[1],1,2,&old0,&old1));
+  assert(old0==0x0123456789abcdefull && old1==0xfedcba9876543210ull);
+  assert(pair[0]==1 && pair[1]==2);
+  assert(!swr_cas128_value(pair,3,4,5,6,&old0,&old1));
+  assert(old0==1 && old1==2 && pair[0]==1 && pair[1]==2);
+
   u8 b=0x12; assert(swr_cas_value(&b,1,0x12,0x34)==0x12 && b==0x34);
   assert(swr_cas_value(&b,1,0x12,0x56)==0x34 && b==0x34);
   b=0xff; assert(swr_lse_op(&b,1,0,1)==0xff && b==0);

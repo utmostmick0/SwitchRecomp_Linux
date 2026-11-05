@@ -114,10 +114,16 @@ KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core){
 
   t->entry=entry; t->arg=arg; t->stack_top=stack_top; t->prio=prio; t->core=core<0? 0 : core; t->ideal=t->core; t->affinity=1ull<<t->core;
   t->tls=alloc_tls(); pc_init(&t->cv);
-  pm_lock(&g_klock); t->id=g_next_tid++; if(g_nthreads<256) g_threads[g_nthreads++]=t; pm_unlock(&g_klock);
+  pm_lock(&g_klock); t->id=g_next_tid++; pm_unlock(&g_klock);
   CPU* c=&t->cpu; memset(c,0,sizeof *c);
   c->mem=g_mem; c->disp=g_disp; c->code_lo=g_code_lo; c->code_hi=g_code_hi; c->rt=&g_rtapi; c->thread=t;
+  const char* trace_pc=getenv("SWR_TRACE_GUEST_PC");
+  if(trace_pc && *trace_pc) c->user[7]=strtoull(trace_pc,NULL,0);
   c->tpidrro=t->tls; c->x[0]=arg; c->x[31]=stack_top; c->pc=entry;
+  /* SDK 22 critical sections read the kernel thread ID here, before nnMain.
+     The SDK still owns +0x1f8 for its thread-object pointer. */
+  gw32(t->tls+0x110,(u32)t->id);
+  pm_lock(&g_klock); if(g_nthreads<256) g_threads[g_nthreads++]=t; pm_unlock(&g_klock);
   return t;
 }
 
@@ -584,6 +590,7 @@ static u32 svc_get_info_(u32 id0, u32 h, u64 id1, u64* out){
     case 0xF0000002: { KThread* t=kthread_cur(); (void)t; *out=plat_ns()*192/10000; return 0; }
     case 26: *out=1; return 0;
     case 27: case 28: *out=0; return 0;
+    case 33: *out=0x1000; return 0;                             /* allocation alignment (4 KiB pages) */
     default: WARN("GetInfo %u/%llu not implemented\n",id0,(unsigned long long)id1); *out=0; return 0;
   }
   (void)h;

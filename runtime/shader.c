@@ -163,6 +163,7 @@ typedef struct {
   u8 leader[65536/8];
   int max_idx;
   int has_flow;
+  int uses_call;
   int indent;
   u8 gtag[256];        /* reg -> global buffer it holds the base of (index+1) */
   u8 tgt[65536/8];     /* branch targets (BRA/SSY/PBK/PCNT and BRX table) */
@@ -1055,10 +1056,18 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
   case O_SYNC: if(c->stk_static) emitl(c,"pc = %uu; break;",c->pop_tgt[idx]); else { c->uses_stk[0]=1; emitl(c,"pc = ssy[--ssy_sp]; break;"); } break;
   case O_BRK: if(c->stk_static) emitl(c,"pc = %uu; break;",c->pop_tgt[idx]); else { c->uses_stk[1]=1; emitl(c,"pc = pbk[--pbk_sp]; break;"); } break;
   case O_CONT: if(c->stk_static) emitl(c,"pc = %uu; break;",c->pop_tgt[idx]); else { c->uses_stk[2]=1; emitl(c,"pc = pcnt[--pcnt_sp]; break;"); } break;
+  case O_CAL:
+    emitl(c,"if(call_sp>=32) return;");
+    emitl(c,"call_stack[call_sp++] = %uu;",idx+1);
+    emitl(c,"pc = %uu; break;",bra_target(w,idx));
+    break;
   case O_EXIT: exit_epilogue(c); break;
   /* PRET/RET without CAL: RET goes to the PRET target = end of the program (early exit in compute) */
   case O_PRET: break;
-  case O_RET: exit_epilogue(c); break;
+  case O_RET:
+    if(c->uses_call) emitl(c,"if(call_sp>0){ pc = call_stack[--call_sp]; break; }");
+    exit_epilogue(c);
+    break;
   case O_KIL: emitl(c,"discard;"); break;
   case O_NOP: case O_VOTE_VTG: case O_DEPBAR: case O_MEMBAR: case O_CCTL: case O_CCTLL: case O_IDE: break;
   case O_BAR: if(c->stage==ST_CS) emitl(c,"barrier();"); break;
@@ -1135,7 +1144,7 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
 }
 
 /* ============================================================ walk */
-static int is_term(int id){ return id==O_BRA||id==O_BRX||id==O_SYNC||id==O_BRK||id==O_CONT||id==O_EXIT||id==O_RET||id==O_JMP; }
+static int is_term(int id){ return id==O_BRA||id==O_BRX||id==O_CAL||id==O_SYNC||id==O_BRK||id==O_CONT||id==O_EXIT||id==O_RET||id==O_JMP; }
 
 static void mark(Ctx* c, u32 i){ if(i<65536) c->leader[i>>3]|=1<<(i&7); }
 
@@ -1173,6 +1182,21 @@ int shader_ampere_lower_hsetp2(const u32 words[4], u64* out){
   return 1;
 }
 
+int shader_ampere_lower_hsetp2_imm(const u32 words[4], u64 out[2]){
+  if(!words || !out || ampere_bits(words,0,12)!=0x434) return 0;
+  u64 predicate=(u64)ampere_bits(words,12,4)<<16;
+  u32 a=ampere_bits(words,24,8);
+  out[0]=0x0100000000000000ULL | predicate | 250 | (u64)15<<12 | (u64)words[1]<<20;
+  out[1]=0x5d20000000000000ULL | predicate | ampere_bits(words,84,3) |
+         ((u64)ampere_bits(words,81,3)<<3) | ((u64)ampere_bits(words,80,1)<<6) |
+         ((u64)a<<8) | ((u64)250<<20) | ((u64)ampere_bits(words,76,4)<<35) |
+         ((u64)ampere_bits(words,87,3)<<39) | ((u64)ampere_bits(words,90,1)<<42) |
+         ((u64)ampere_bits(words,72,1)<<43) | ((u64)ampere_bits(words,73,1)<<44) |
+         ((u64)ampere_bits(words,69,2)<<45) | ((u64)ampere_bits(words,74,2)<<47) |
+         ((u64)ampere_bits(words,71,1)<<49);
+  return 1;
+}
+
 int (*g_shader_cb_read)(u32 idx, u32 off, u32* out);
 
 u64 shader_hash(const u8* code, u32 max_bytes, u32* out_len){
@@ -1185,7 +1209,9 @@ u64 shader_hash(const u8* code, u32 max_bytes, u32* out_len){
     const Op* op=decode(w[i]); last=i;
     if(!op) continue;
     if(op->id==O_BRA||op->id==O_SSY||op->id==O_PBK||op->id==O_PCNT){ u32 t=bra_target(w[i],i); if(t>maxt) maxt=t; }
+    if(op->id==O_CAL){ u32 t=bra_target(w[i],i); if(t>maxt) maxt=t; }
     if(op->id==O_EXIT && B(w[i],16,4)==7 && i>=maxt) break;
+    if(op->id==O_RET && B(w[i],16,4)==7 && i>=maxt) break;
     if(op->id==O_BRA && B(w[i],16,4)==7 && B(w[i],0,5)==15 && i>=maxt && bra_target(w[i],i)<=i) break;
     if(i>16384) break;
   }
@@ -1303,6 +1329,7 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
   for(u32 i=11;i<n;i++){ if(!IDX_OK(i)) continue; const Op* op=decode(c->w[i]); if(!op) continue;
     int id=op->id;
     if(id==O_BRA||id==O_SSY||id==O_PBK||id==O_PCNT){ mark_tgt(c,bra_target(c->w[i],i)); flow=1; }
+    if(id==O_CAL){ mark_tgt(c,bra_target(c->w[i],i)); c->uses_call=1; flow=1; }
     if(id==O_SSY||id==O_PBK||id==O_PCNT) has_stk=1;
     if(id==O_BRX){ u32 tg[64]; int nt=brx_targets(c->w,i,n,tg,64); has_brx=1;  /* with a known table only its targets go in the switch */
       if(nt>=0){ for(int q=0;q<nt;q++) mark_tgt(c,tg[q]); } else { all_ldr=1; for(u32 k=11;k<n;k++) if(IDX_OK(k)) mark_tgt(c,k); } flow=1; }
@@ -1317,7 +1344,7 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
     else if(id==O_PCNT||id==O_CONT||id==O_CAL||id==O_RET||id==O_JMP) fwd=0;
     else if((id==O_BRA||id==O_SSY||id==O_PBK) && bra_target(c->w[i],i)<=i) fwd=0; }
   /* resolve the stacks. a BRX can reach any block so all of them count as successors */
-  if(flow && has_stk && !all_ldr && !getenv("SWR_SHADER_DYNSTACK")){
+  if(flow && has_stk && !all_ldr && !c->uses_call && !getenv("SWR_SHADER_DYNSTACK")){
     u32* bl=NULL; int nb=0; if(has_brx){ bl=malloc(sizeof(u32)*(n+1)); for(u32 i=11;i<n;i++) if(IDX_OK(i) && is_leader(c,i)) bl[nb++]=i; }
     c->stk_static=stk_resolve(c,n,fwd,bl,nb); free(bl); }
   /* linear, no BRX: only branch targets need a guard */
@@ -1365,7 +1392,7 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
     emit_tracked(c,i,c->w[i],op);
     int id=op->id; u64 w=c->w[i];
     if(!flow && id==O_EXIT && B(w,16,3)==7 && !B(w,19,1)) exit_end=c->out.n;
-    if(flow && !dead && B(w,16,3)==7 && !B(w,19,1) && (id==O_BRA||id==O_BRX||id==O_SYNC||id==O_BRK||id==O_CONT||id==O_EXIT)){
+    if(flow && !dead && B(w,16,3)==7 && !B(w,19,1) && (id==O_BRA||id==O_BRX||id==O_CAL||id==O_SYNC||id==O_BRK||id==O_CONT||id==O_EXIT||id==O_RET)){
       dead=1; live=c->out; memset(&c->out,0,sizeof c->out); }
   }
   if(dead){ free(c->out.p); c->out=live; }
@@ -1481,6 +1508,7 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
   if(c->uses_stk[0]) sb_put(D,"  uint ssy[16]; int ssy_sp=0;\n");
   if(c->uses_stk[1]) sb_put(D,"  uint pbk[16]; int pbk_sp=0;\n");
   if(c->uses_stk[2]) sb_put(D,"  uint pcnt[16]; int pcnt_sp=0;\n");
+  if(c->uses_call) sb_put(D,"  uint call_stack[32]; int call_sp=0;\n");
   if(stage==ST_FS){ u32 target=si->sph[18]; for(int rt=0;rt<8;rt++) if((target>>(rt*4))&15) sb_f(D,"  frag_color%d = %s(0);\n",rt,((si->rt_int_mask>>rt)&1)? (((si->rt_sint_mask>>rt)&1)? "ivec4" : "uvec4") : "vec4"); }
   sb_put(D,c->out.p? c->out.p : ""); sb_put(D,"}\n");
   char* r=D->p; free(c->out.p); free(c->pop_tgt); free(c);

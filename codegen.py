@@ -233,7 +233,43 @@ def fix_undef(code, pc, w):
     return code.replace('UNDEF()', 'c->rt->undef(c,%s,%s)' % (lit(pc), lit(w)))
 
 
-def emit_function(prog, f, funcs):
+SWITCH2_REMOTE_MEMORY_BOOT_SYMBOLS = {
+    '_ZN2nn3gsv20BootWithRemoteMemoryEv',
+    '_ZN2nn5nvsrv20BootWithRemoteMemoryENS_3gsv12MemoryRegionEPDoFNS_2os17RemoteMemoryUsageEvE',
+}
+SWITCH2_SYNCPOINT_INIT_SYMBOL = '_ZN2nn6syncpt3sdk10InitializeEv'
+SWITCH2_NATIVE_MEMORY_INIT_SYMBOL = '_ZN2nn2gs3sdk26BootNativeMemoryManagementENS_3gsv19MemoryBlockModeBitsE'
+SWITCH2_FRAME_MANAGEMENT_INIT_SYMBOL = '_ZN2nn2gs3sdk27BootGraphicsFrameManagementEv'
+SWITCH2_DONATED_TRANSFER_MEMORY_QUERY_SYMBOL = '_ZN2nn3gpu3sdk34TryQueryDonatedTransferMemoryUsageEPmS2_S2_'
+
+
+def switch2_graphics_boot_stub(f, skip_remote_memory, skip_syncpoint_init,
+                               skip_native_memory_init, skip_frame_management_init,
+                               skip_donated_transfer_memory_query=False):
+    if f.mod.name != 'sdk':
+        return None
+    symbol = f.mod.syms.get(f.start - f.mod.base)
+    if skip_donated_transfer_memory_query and symbol == SWITCH2_DONATED_TRANSFER_MEMORY_QUERY_SYMBOL:
+        return 'void %s(CPU* RESTRICT c, u64 e){ (void)e; c->x[0]=0; c->pc=c->x[30]; }' % f.name
+    if skip_native_memory_init and symbol == SWITCH2_NATIVE_MEMORY_INIT_SYMBOL:
+        return 'void %s(CPU* RESTRICT c, u64 e){ (void)e; c->x[0]=0; c->pc=c->x[30]; }' % f.name
+    if skip_frame_management_init and symbol == SWITCH2_FRAME_MANAGEMENT_INIT_SYMBOL:
+        return 'void %s(CPU* RESTRICT c, u64 e){ (void)e; c->pc=c->x[30]; }' % f.name
+    if ((skip_remote_memory and symbol in SWITCH2_REMOTE_MEMORY_BOOT_SYMBOLS) or
+            (skip_syncpoint_init and symbol == SWITCH2_SYNCPOINT_INIT_SYMBOL)):
+        return 'void %s(CPU* RESTRICT c, u64 e){ (void)e; c->pc=c->x[30]; }' % f.name
+    return None
+
+
+def emit_function(prog, f, funcs, skip_switch2_remote_memory=False, skip_switch2_syncpoint_init=False,
+                  skip_switch2_native_memory_init=False, skip_switch2_frame_management_init=False,
+                  skip_switch2_donated_transfer_memory_query=False):
+    stub = switch2_graphics_boot_stub(f, skip_switch2_remote_memory, skip_switch2_syncpoint_init,
+                                      skip_switch2_native_memory_init, skip_switch2_frame_management_init,
+                                      skip_switch2_donated_transfer_memory_query)
+    if stub is not None:
+        return stub
+
     s = f.addrs; sset = set(s)
     L = f.leaders
     out = ['void %s(CPU* RESTRICT c, u64 e){' % f.name, ' u8* const M=c->mem;']

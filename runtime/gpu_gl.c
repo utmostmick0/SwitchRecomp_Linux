@@ -12,6 +12,9 @@
 #include <math.h>
 #include "glfn.h"
 #include "shader.h"
+#ifdef SWR_NS2_SHADER
+#include "ns2_shader.h"
+#endif
 
 int g_gl=0;                     /* active renderer */
 static int g_gl_ready;
@@ -919,43 +922,95 @@ static char* sh_post(char* src, int stage){
       *o=0; free(src); src=out; } }
   return src; }
 
+/* Explicit shader ISA selection; engine/QMD compatibility is a separate
+   contract. Unknown native instructions must never become success-shaped GLSL. */
+static int native_shader_mode(void){
+#ifdef SWR_NS2_SHADER
+  static int mode=-1;
+  if(mode<0){ const char* value=getenv("SWR_SHADER_ISA"); mode=value && !strcmp(value,"ampere");
+    if(mode) LOG("shaders: explicit Ampere ISA selected (native services and QMD3 still required)\n"); }
+  return mode;
+#else
+  return 0;
+#endif
+}
+
+#ifdef SWR_NS2_SHADER
+static int native_shader_read(void* context,uint64_t address,void* dest,uint32_t size){
+  (void)context;
+  if(address>UINT64_MAX-size) return 0;
+  for(u64 offset=0;offset<size;){
+    u64 current=address+offset;
+    if(!gmmu_translate(current)) return 0;
+    u64 step=0x1000-(current&0xfff); if(step>size-offset) step=size-offset;
+    offset+=step;
+  }
+  if(dest) gmem_read(address,dest,size); return 1;
+}
+#endif
+
 static Sh* shader_get(u64 gva_code, int stage, u32 attr_int, u32 attr_sint){
   st_shaders++; g_sh_bind= stage==ST_VS? 0 : stage==ST_GS? 3 : 4; g_shader_cb_read=sh_cb_read; /* BRX table is only used to mark targets, length doesn't change */
   u32 key2= stage==ST_VS? (attr_int^(attr_sint*31)^((g_last_r3d && (g_last_r3d[0x840]&1))? 0xA341316Cu : 0)) : stage==ST_GS? (g_gs_input_vertices*0x85EBCA6Bu) : (attr_int*0x9E3779B1u ^ attr_sint*0x85EBCA6Bu ^ g_fs_rtk);
   u32 tex3d=stage==ST_FS?g_fs_t3d:0; key2^=tex3d*0xD168AAADu;
+  if(native_shader_mode()) key2^=0x4e533201u;
   ShA* ca=&sha[(u32)((gva_code>>6)^(gva_code>>18)^((u64)key2*0x9E3779B1u)^((u32)stage<<11))&4095];
   if(ca->s && ca->gva==gva_code && ca->stage==stage && ca->key2==key2 && ca->s->si.tex_3d_mask==tex3d){
     if(ca->epoch==g_submit_epoch){ st_sh_fast++; return ca->s; }
     Sh* s=ca->s;
     /* write tracking says nothing touched the code since the last check, so no need to hash it again (hashing
        every shader of every submit cost ~2 ms a frame on a slow cpu) */
-    if(g_ww>0 && ca->cpu && g_submit_epoch-ca->chk<240 && gmmu_translate(gva_code)==ca->cpu && !ww_dirty(ca->cpu,s->clen,ca->chk)){
+    if(!native_shader_mode() && g_ww>0 && ca->cpu && g_submit_epoch-ca->chk<240 && gmmu_translate(gva_code)==ca->cpu && !ww_dirty(ca->cpu,s->clen,ca->chk)){
       ca->epoch=g_submit_epoch; st_sh_fast++; return s; }
+#ifdef SWR_NS2_SHADER
+    if(native_shader_mode() && !native_shader_read(NULL,gva_code,NULL,s->clen)){
+      static Sh failed={.failed=1}; return &failed;
+    }
+#endif
     u8* p=gmem_ptr(gva_code,s->clen); u64 q;
     if(p) q=fast_hash(p,s->clen,0); else { u8* t2=malloc(s->clen? s->clen : 1); gmem_read(gva_code,t2,s->clen); q=fast_hash(t2,s->clen,0); free(t2); }
     if(q==s->qh){ ca->epoch=g_submit_epoch; ca->chk=g_submit_epoch; ca->cpu=gmmu_translate(gva_code); st_sh_fast++; return s; } }
-  u8* code=gmem_ptr(gva_code,0x10000); u8* tmp=NULL;
-  if(!code){ tmp=malloc(0x10000); gmem_read(gva_code,tmp,0x10000); code=tmp; }
-  u32 len; u64 h=shader_hash(code,0x10000,&len);
+  u8* code=NULL; u8* tmp=NULL; u32 code_size=0x10000, native_len=0; u64 native_qh=0;
+#ifdef SWR_NS2_SHADER
+  if(native_shader_mode()){
+    SwrNs2Shader image;
+    if(!swr_ns2_shader_capture(gva_code,0,native_shader_read,NULL,&image)){
+      static Sh failed={.failed=1}; static int warned;
+      if(warned++<32) WARN("native shader %llx rejected at +%#x: %s\n",(unsigned long long)gva_code,image.error_offset,image.error);
+      return &failed;
+    }
+    code=tmp=image.code; code_size=image.size; native_len=image.consumed;
+    u8* raw=malloc(native_len);
+    if(!raw || !native_shader_read(NULL,gva_code,raw,native_len)){
+      static Sh failed={.failed=1}; free(raw); free(tmp); return &failed;
+    }
+    native_qh=fast_hash(raw,native_len,0); free(raw);
+  } else
+#endif
+  { code=gmem_ptr(gva_code,0x10000);
+    if(!code){ tmp=malloc(0x10000); gmem_read(gva_code,tmp,0x10000); code=tmp; } }
+  u32 len; u64 h=shader_hash(code,code_size,&len);
+  if(native_len){ h=native_qh^0x4e5332414d503031ULL; len=native_len; }
   for(Sh* s=shh[h&1023];s;s=s->next) if(s->hash==h && s->stage==stage && s->key2==key2 && s->si.tex_3d_mask==tex3d){
     ca->gva=gva_code; ca->key2=key2; ca->stage=stage; ca->epoch=g_submit_epoch; ca->chk=g_submit_epoch; ca->cpu=gmmu_translate(gva_code); ca->s=s; free(tmp); return s; }
   Sh* s=calloc(1,sizeof *s); s->hash=h; s->stage=stage; s->key2=key2; st_sh_new++;
-  s->clen=len; s->qh=fast_hash(code,len,0);
+  s->clen=len; s->qh=native_len?native_qh:fast_hash(code,len,0);
   ca->gva=gva_code; ca->key2=key2; ca->stage=stage; ca->epoch=g_submit_epoch; ca->chk=g_submit_epoch; ca->cpu=gmmu_translate(gva_code); ca->s=s;
   if(stage==ST_FS){ s->si.tex_3d_mask=tex3d; s->si.tex_int_mask=attr_int; s->si.tex_sint_mask=attr_sint; s->si.rt_int_mask=g_fs_rtm; s->si.rt_sint_mask=g_fs_rts; }
   else { s->si.attr_int_mask=attr_int; s->si.attr_sint_mask=attr_sint; }
   if(stage==ST_GS) s->si.gs_input_vertices=g_gs_input_vertices;
-  char* src=shader_to_glsl(code,0x10000,stage,&s->si);
+  char* src=shader_to_glsl(code,code_size,stage,&s->si);
+  if(native_len && s->si.unsupported){ free(src); src=NULL; s->failed=1; }
   /* dump shaders with indirect branches (code + cbufs) for offline analysis */
   { extern int g_opt_diag; if(g_opt_diag && src && strstr(src,"uint t_ = uint(")){ static int nb; if(nb<24){ nb++; plat_mkdir("captures"); plat_mkdir("captures/failed"); char fp[200];
-      snprintf(fp,sizeof fp,"captures/failed/%016llx_%s.bin",(unsigned long long)h,stage==ST_VS?"vs":"fs"); FILE* f=fopen(fp,"wb"); if(f){ fwrite(code,1,0x10000,f); fclose(f); }
+      snprintf(fp,sizeof fp,"captures/failed/%016llx_%s.bin",(unsigned long long)h,stage==ST_VS?"vs":"fs"); FILE* f=fopen(fp,"wb"); if(f){ fwrite(code,1,code_size,f); fclose(f); }
       sh_dump_cbs(h);
       u32* rr=g_last_r3d; if(rr){ snprintf(fp,sizeof fp,"captures/failed/%016llx_stages.txt",(unsigned long long)h); f=fopen(fp,"w");
         if(f){ for(int k=0;k<6;k++) fprintf(f,"slot %d: cfg=%08x offset=%08x\n",k,rr[0x800+k*0x10],rr[0x801+k*0x10]); fclose(f); } } } } }
   if(stage!=ST_FS) s->si.attr_sint_mask=attr_sint;
   if(s->si.unsupported) WARN("shader %016llx: %d untranslated instructions (first: %s)\n",(unsigned long long)h,s->si.unsupported,s->si.first_unsupported);
   if(s->si.unsupported && strstr(s->si.first_unsupported,"untracked")){ static int nd; if(nd<8){ nd++; char fp[200]; plat_mkdir("captures"); plat_mkdir("captures/failed");
-      snprintf(fp,sizeof fp,"captures/failed/%016llx_%s.bin",(unsigned long long)h,stage==ST_VS?"vs":"fs"); aw_write(fp,code,0x10000,0);
+      snprintf(fp,sizeof fp,"captures/failed/%016llx_%s.bin",(unsigned long long)h,stage==ST_VS?"vs":"fs"); aw_write(fp,code,code_size,0);
       LOG("shader %016llx saved to %s (send it so the missing texture can be analyzed)\n",(unsigned long long)h,fp); } }
   src=sh_post(src,stage);
   if(!src) s->failed=1;
@@ -2421,7 +2476,8 @@ static void tr_shader(u64 addr, Sh* sh, int stage){
   if(!sh) return; for(int i=0;i<g_tr_nsh;i++) if(g_tr_sh[i]==sh->hash) return; if(g_tr_nsh>=1024) return; g_tr_sh[g_tr_nsh++]=sh->hash;
   u8* b=malloc(0x8000); gmem_read(addr,b,0x8000); char p[256];
   snprintf(p,sizeof p,"%s/sh_%016llx_%s.bin",g_tr_dir,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); FILE* f=fopen(p,"wb"); if(f){ fwrite(b,1,0x8000,f); fclose(f); }
-  ShaderInfo si; memset(&si,0,sizeof si); si.attr_int_mask=sh->si.attr_int_mask; si.attr_sint_mask=sh->si.attr_sint_mask; char* g=shader_to_glsl(b,0x8000,stage,&si);
+  ShaderInfo si; memset(&si,0,sizeof si); si.attr_int_mask=sh->si.attr_int_mask; si.attr_sint_mask=sh->si.attr_sint_mask;
+  char* g=native_shader_mode()?(sh->src?strdup(sh->src):NULL):shader_to_glsl(b,0x8000,stage,&si);
   if(g){ snprintf(p,sizeof p,"%s/sh_%016llx_%s.glsl",g_tr_dir,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); f=fopen(p,"wb"); if(f){ fputs(g,f); fclose(f); } free(g); }
   free(b);
   trace_note("  shader %016llx %s: %d untranslated%s%s, failed=%d\n",(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs",sh->si.unsupported,sh->si.unsupported?" first: ":"",sh->si.first_unsupported,sh->failed); }
@@ -2431,7 +2487,18 @@ static void tr_rt_history(Tex* t);
 static void tr_shader_at(u64 addr, u64 hash, int stage){
   for(int i=0;i<g_tr_nsh;i++) if(g_tr_sh[i]==hash) return; if(g_tr_nsh>=1024) return; g_tr_sh[g_tr_nsh++]=hash;
   u8* b=malloc(0x8000); if(!b) return; gmem_read(addr,b,0x8000);
-  ShaderInfo si; memset(&si,0,sizeof si); char* gl=shader_to_glsl(b,0x8000,stage,&si); free(b);
+  ShaderInfo si; memset(&si,0,sizeof si); char* gl=NULL;
+#ifdef SWR_NS2_SHADER
+  if(native_shader_mode()){
+    SwrNs2Shader image;
+    if(swr_ns2_shader_capture(addr,0,native_shader_read,NULL,&image)){
+      gl=shader_to_glsl(image.code,image.size,stage,&si); free(image.code);
+      if(si.unsupported){ free(gl); gl=NULL; }
+    }
+  } else
+#endif
+  gl=shader_to_glsl(b,0x8000,stage,&si);
+  free(b);
   if(gl){ char p[256]; snprintf(p,sizeof p,"%s/sh_%016llx_%s.glsl",g_tr_dir,(unsigned long long)hash,stage==ST_VS?"vs":"fs"); FILE* f=fopen(p,"wb"); if(f){ fputs(gl,f); fclose(f); } free(gl); } }
 
 static void tr_textures(GpuChannel* ch, int stage, Sh* sh){
@@ -3861,16 +3928,28 @@ void gpu_gl_dispatch(GpuChannel* ch, const u32* q, u64 code){
   for(int i=0;i<8;i++) if((q[20]>>i)&1){ cba[i]=((u64)(q[30+2*i]&0xFF)<<32)|q[29+2*i]; u32 sz=(q[30+2*i]>>15)&0x1FFFF; if(!sz || sz>0x10000) sz=0x10000;
     g_cs_cbn[i]=sz; gmem_read(cba[i],g_cs_cb_[i],sz); } else g_cs_cbn[i]=0;
   static u8 buf[0x10000+80];
-  memset(buf,0,80); gmem_read(prog,buf+80,0x10000);
-  u64 key=fast_hash(buf+80,0x4000,0)^((u64)lx<<40)^((u64)ly<<48)^((u64)lz<<56)^((u64)shm<<20);
+  memset(buf,0,80); if(!native_shader_mode()) gmem_read(prog,buf+80,0x10000);
+  u64 key=(native_shader_mode()?0:fast_hash(buf+80,0x4000,0))^((u64)lx<<40)^((u64)ly<<48)^((u64)lz<<56)^((u64)shm<<20);
+  u8* shader_code=buf; u32 shader_size=sizeof buf; u8* native_code=NULL;
+#ifdef SWR_NS2_SHADER
+  if(native_shader_mode()){
+    SwrNs2Shader image;
+    if(!swr_ns2_shader_capture(prog,1,native_shader_read,NULL,&image)){
+      static int warned; if(warned++<32) WARN("native compute shader %llx rejected at +%#x: %s\n",(unsigned long long)prog,image.error_offset,image.error);
+      st_cs_fail++; return;
+    }
+    native_code=shader_code=image.code; shader_size=image.size;
+    key=fast_hash(shader_code,shader_size,0)^0x4e5332434f4d5031ULL^((u64)lx<<40)^((u64)ly<<48)^((u64)lz<<56)^((u64)shm<<20);
+  }
+#endif
   CsProg* p=g_csp[key&255]; while(p && p->key!=key) p=p->next;
   if(!p){ p=calloc(1,sizeof *p); p->key=key; p->next=g_csp[key&255]; g_csp[key&255]=p;
     memset(&p->si,0,sizeof p->si); p->si.cs_local[0]=lx; p->si.cs_local[1]=ly; p->si.cs_local[2]=lz; p->si.shared_size=(int)shm;
     int (*old)(u32,u32,u32*)=g_shader_cb_read; g_shader_cb_read=cs_cb_read;
-    char* src=shader_to_glsl(buf,sizeof buf,ST_CS,&p->si); g_shader_cb_read=old;
+    char* src=shader_to_glsl(shader_code,shader_size,ST_CS,&p->si); g_shader_cb_read=old;
     if(!src || p->si.unsupported){ p->failed=1; LOG("compute %016llx: not translated (%d instructions, first %s)\n",(unsigned long long)key,p->si.unsupported,p->si.first_unsupported);
       extern int g_opt_diag; static int nd; if(g_opt_diag && nd<16){ nd++; char fp[200]; plat_mkdir("captures"); plat_mkdir("captures/failed");
-        snprintf(fp,sizeof fp,"captures/failed/%016llx_cs.bin",(unsigned long long)key); FILE* f=fopen(fp,"wb"); if(f){ fwrite(buf+80,1,0x10000,f); fclose(f); } } }
+        snprintf(fp,sizeof fp,"captures/failed/%016llx_cs%s.bin",(unsigned long long)key,native_code?"_lowered":""); FILE* f=fopen(fp,"wb"); if(f){ fwrite(native_code?shader_code:buf+80,1,native_code?shader_size:0x10000,f); fclose(f); } } }
     else { char err[4096]; GLuint sh=compile(GL_COMPUTE_SHADER,src,err,sizeof err);
       if(!sh){ p->failed=1; LOG("compute %016llx failed to compile: %.600s\n",(unsigned long long)key,err); }
       else { GLuint pr=glCreateProgram(); glAttachShader(pr,sh); glLinkProgram(pr); GLint ok=0; glGetProgramiv(pr,GL_LINK_STATUS,&ok); glDeleteShader(sh);
@@ -3878,6 +3957,7 @@ void gpu_gl_dispatch(GpuChannel* ch, const u32* q, u64 code){
         else { p->prog=pr; static int said; if(said<12){ said++; LOG("compute %016llx ready: block %ux%ux%u, %d global buffers, %d textures\n",(unsigned long long)key,lx,ly,lz,p->si.ngbuf,p->si.ntex); } } } }
     if(src && getenv("SWR_DUMP_SHADERS")){ char pth[128]; snprintf(pth,sizeof pth,"shader_%016llx_cs.glsl",(unsigned long long)key); FILE* f=fopen(pth,"w"); if(f){ fputs(src,f); fclose(f); } }
     p->src=src; }   /* kept for F5 traces */
+  free(native_code);
   if(p->failed || !p->prog){ st_cs_fail++; trace_note("COMPUTE %016llx (not translated: %d, first %s)\n",(unsigned long long)key,p->si.unsupported,p->si.first_unsupported); return; }
   glUseProgram(p->prog); g_pipe_on=0;
   /* cbufs at binding 36+i (translator's 'other stages' range) */

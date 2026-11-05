@@ -44,25 +44,29 @@ Primary recent evidence: [SMO](games/smo.audio-timeline-smoke.log), [XC2](games/
 
 ## Validation status
 
-The full runner currently stops at service_ports: that test references system_clock_context, which is absent from the current service source. Do not claim all ten groups pass. The shader-generation and RequestUpdate groups pass with sanitizers; generated shaders pass glslangValidator. During this documentation sync, all nine remaining groups passed, including shader validation, clock, IPC, DSP, routing, RequestUpdate, fonts, heaps, and filesystem tests.
+The service/source mismatch is fixed: account existence validates the complete user ID, command 141 fills both auto-select descriptor forms within the caller's buffer, settings guard negative language indices and short device-name buffers, and renderer setup validates bounded mixer counts. CPU-time-limit state is separate from RequestUpdate's frame counter.
+
+The full runner passes 14 native groups plus the compiled NS2 frontend checks:
 
 ```sh
 python3 scripts/test_runtime_ports.py
 ```
 
-To run the currently compatible groups without changing the suite definition:
+The installed `bin/runtime_linux_x11` is rebuilt as `v197-ns2-frontend`; existing game executable copies and code modules are not replaced. The previous local runtime binary is retained in Git-local backup storage.
 
-```sh
-python3 - <<'PY'
-import scripts.test_runtime_ports as checks
-checks.CHECKS = [item for item in checks.CHECKS if item[0] != 'service_ports']
-checks.main()
-PY
-```
+The NS2 checks compile the imported Ampere frontend under C++20 with address/undefined sanitizers, exercise graphics/compute layouts, native capture and mapping faults, forward/backward relocation, and rejection of unknown/indirect instructions. Generated vertex, fragment, and compute shaders pass glslangValidator. This is synthetic coverage, not end-to-end Bananza validation.
+
+Technical architecture, all twelve supplied references, upstream provenance, testing procedure, and remaining gaps are documented in [NS2 technical integration](docs/NS2_TECHNICAL_INTEGRATION.md).
+
+## NS2 integration status
+
+Graphical runtime builds now compile the imported probe and lowering frontend through `runtime/ns2_shader.cpp`. `runtime/gpu_gl.c` accepts explicit `SWR_SHADER_ISA=ampere` selection for native graphics (0x80-byte header) and compute (headerless) shader ingestion. Capture mapping-checks each instruction; the bridge adjusts Eden's scheduling layout and direct branch displacements for the C translator. Native and Maxwell cache identities are separate. Unsupported native instructions or downstream translation failures do not produce executable placeholder shaders.
+
+NS2 `aud:u` commands 1/2 now return the existing C output and renderer manager objects, with real dispatch methods and errors for malformed/unsupported requests. Sysmix, StreamPlay and the other remaining imports are not integrated. In particular, GraphicsSupervisor/GpuWorker transport, QMD3 command execution, native memory ownership, and VI2 presentation remain incomplete. The ISA override does not implement them. No new game-rendering or full NS2 compatibility claim is supported by these tests. The earlier Bananza boot/remote-memory bypasses remain experimental. SDK 22 thread creation now writes the kernel thread ID at TLS+0x110 before publishing the thread; the SDK-owned thread pointer at +0x1f8 is left intact. System-clock context replies use the offset/steady-time/source-ID wire layout also used by clock snapshots.
 
 ## Follow-up and diagnosis constraints
 
-1. Reconcile service_ports with current clock/service source, preserving correct IPC layouts. Earlier reports describe guards that are no longer in the current kernel: default-core validation and SetThreadPriority bounds must be re-audited rather than assumed present.
+1. Implement native graphics-supervisor/GPU-worker ownership and transport before claiming NS2 startup compatibility. Earlier reports describe guards that are no longer in the current kernel: default-core validation and SetThreadPriority bounds must be re-audited rather than assumed present.
 2. Investigate FFRS's CPU startup wait; GPU/window changes cannot explain zero GPU submissions by themselves.
 3. Collect a new SMW failure log if a crash recurs. The latest examined log closed normally; nearest-symbol labels alone do not prove bad_typeid or bad_array_new_length.
 4. Extend SMO/XC2 testing to visible output, audio pacing, gameplay, and long sessions.

@@ -355,7 +355,7 @@ static int am_proxy(SvcObj* o, IpcCtx* c){        /* IApplicationProxy */
   return stub_ok(o,c); }
 
 static int am_oe(SvcObj* o, IpcCtx* c){
-  if(c->cmd==0){ out_obj(c,svcobj_new("IApplicationProxy",am_proxy,0)); return 0; }
+  if(c->cmd==0 || c->cmd==10){ out_obj(c,svcobj_new("IApplicationProxy",am_proxy,0)); return 0; }
   return stub_ok(o,c); }
 
 static SvcObj* new_appletoe(void){ return svcobj_new("appletOE",am_oe,0); }
@@ -366,8 +366,8 @@ static SvcObj* new_appletae(void){ return svcobj_new("appletAE",am_oe,0); }
 static int set_disp(SvcObj* o, IpcCtx* c){
   static const char* codes[]={"ja","en-US","fr","de","it","es","zh-CN","ko","nl","pt","ru","zh-TW","en-GB","fr-CA","es-419","zh-Hans","zh-Hant","pt-BR"};
   switch(c->cmd){
-    case 0: { u64 v=0; const char* s=codes[g_opt_lang%18]; memcpy(&v,s,strlen(s)); out64(c,v); return 0; }     /* GetLanguageCode */
-    case 1: case 5: { u64 a,s; buf_out(c,0,&a,&s); u32 n=(u32)(s/8); u32 max= c->cmd==1? 15 : 18; if(n>max) n=max;
+    case 0: { u64 v=0; const char* s=codes[g_opt_lang>=0 && g_opt_lang<18?g_opt_lang:1]; memcpy(&v,s,strlen(s)); out64(c,v); return 0; }     /* GetLanguageCode */
+    case 1: case 5: { u64 a,s; buf_out(c,0,&a,&s); u32 max= c->cmd==1? 15 : 18; u32 n=!a?0:s/8>max?max:(u32)(s/8);
       for(u32 i=0;i<n;i++){ u64 v=0; memcpy(&v,codes[i],strlen(codes[i])); gw64(a+i*8,v); } out32(c,n); return 0; }
     case 2: { u32 idx=in32(c,0); u64 v=0; if(idx<18) memcpy(&v,codes[idx],strlen(codes[idx])); out64(c,v); return 0; }   /* MakeLanguageCode */
     case 3: out32(c,15); return 0;
@@ -375,7 +375,7 @@ static int set_disp(SvcObj* o, IpcCtx* c){
     case 4: out32(c,1); return 0;                     /* GetRegionCode: usa */
     case 7: case 9: { u64 a,s; buf_out(c,0,&a,&s); memset(GP(a),0,s); return 0; }
     case 8: out32(c,0); return 0;
-    case 11: { u64 a,s; buf_out(c,0,&a,&s); memset(GP(a),0,s); strcpy((char*)GP(a),"SwitchRecomp"); return 0; }
+    case 11: { u64 a,s; buf_out(c,0,&a,&s); if(a && s){ const char name[]="SwitchRecomp"; memset(GP(a),0,s); memcpy(GP(a),name,s<sizeof name?s:sizeof name); } return 0; }
   }
   return stub_ok(o,c); }
 
@@ -397,12 +397,13 @@ static SvcObj* new_setsys(void){ return svcobj_new("set:sys",setsys_disp,0); }
 
 /* ================================================================ time */
 static KShmem* g_time_shm;
+void system_clock_context(u8* ctx);
 
 static int sysclock_disp(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 0: out64(c,(u64)plat_unix_time()); return 0;
     case 1: return 0;
-    case 2: { u8 ctx[0x20]; memset(ctx,0,sizeof ctx); i64 t=plat_unix_time(); memcpy(ctx,&t,8); outbytes(c,ctx,0x20); return 0; }
+    case 2: { u8 ctx[0x20]; system_clock_context(ctx); outbytes(c,ctx,0x20); return 0; }
     case 3: return 0;
     case 4: out_copy_h(c,ev_handle(kevent_new("clock op",0))); return 0;   /* GetOperationEventReadableHandle */
   }
@@ -550,7 +551,7 @@ static SvcObj* new_accmgr(void){ return svcobj_new("IManagerForApplication",accm
 static int acc_disp(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 0: out32(c,1); return 0;
-    case 1: out8(c,1); return 0;
+    case 1: out8(c,c->raw && c->raw_size>=sizeof g_user_id && !memcmp(c->raw,g_user_id,sizeof g_user_id)); return 0;
     case 2: case 3: { u64 a,s; buf_out(c,0,&a,&s); if(a){ memset(GP(a),0,s); if(s>=16) memcpy(GP(a),g_user_id,16); } return 0; }
     case 4: outbytes(c,g_user_id,16); return 0;
     case 5: out_obj(c,svcobj_new("IProfile",profile_disp,0)); return 0;
@@ -574,7 +575,7 @@ static int acc_disp(SvcObj* o, IpcCtx* c){
     /* ListOpenContextStoredUsers: the user the game started with and the rest of the list zeroed.
        nn::account::PopOpenUsers counts the non-zero entries and aborts if there's more than it asked for
        (bayonetta 3 at boot, it had stack garbage in the buffer) */
-    case 131: { u64 a,s; buf_out(c,0,&a,&s); if(a && s){ memset(GP(a),0,s); if(s>=16) memcpy(GP(a),g_user_id,16); } return 0; }
+    case 131: case 141: { u64 a,s; buf_out(c,0,&a,&s); if(a && s){ memset(GP(a),0,s); if(s>=16) memcpy(GP(a),g_user_id,16); } return 0; }
   }
   return stub_ok(o,c); }
 
@@ -723,7 +724,8 @@ static int audren_obj(SvcObj* o, IpcCtx* c){
     case 5: o->u[3]=0; o->u[6]=0; return 0;
     case 6: o->u[3]=1; o->u[6]=0; audren_signal_ready(0); return 0;
     case 7: out_copy_h(c,ev_handle(g_aud_ev)); return 0;
-    case 8: case 9: return 0;
+    case 8: { u32 limit=in32(c,0); if(limit>100) return RC(153,4); memcpy((u8*)o->data+0x34,&limit,4); return 0; }
+    case 9: { u32 limit; memcpy(&limit,(u8*)o->data+0x34,4); out32(c,limit); return 0; }
     case 11: out32(c,0); return 0;
   }
   return quiet_ok(o,c); }
@@ -739,10 +741,21 @@ static int auddev_disp(SvcObj* o, IpcCtx* c){ (void)o;
   }
   return 0; }
 
+/* Match the bounded C mixer rather than accepting counts it cannot render.
+   Mix buffers are the total across 64 buses, not the 24-channel per-bus limit. */
+static int audren_params_valid(IpcCtx* c){
+  return c->raw && c->raw_size>=0x34 && in32(c,8)<=64*24 &&
+    in32(c,0x10)<=4096 && in32(c,0x14)<=64 && in32(c,0x18)<64 &&
+    in32(c,0x1c)<=4096 && in32(c,0x24)<=4096 && in32(c,0x28)<=65536;
+}
+
 static int audren_disp(SvcObj* o, IpcCtx* c){
+  if((c->cmd==0 || c->cmd==1) && !audren_params_valid(c)) return RC(153,4);
   switch(c->cmd){
-    case 0: { SvcObj* r=svcobj_new("IAudioRenderer",audren_obj,0x100); r->destroy=swr_audio_destroy;
-      memcpy(r->data,c->raw,0x34<0x100?0x34:0x100);
+    case 0: { SvcObj* r=svcobj_new("IAudioRenderer",audren_obj,0x100);
+      if(!r) return RC(153,4);
+      r->destroy=swr_audio_destroy;
+      memcpy(r->data,c->raw,0x34); u32 limit=100; memcpy((u8*)r->data+0x34,&limit,4);
       r->u[0]=in32(c,0); r->u[1]=in32(c,4); r->u[2]=in32(c,8); r->u[3]=1;
       out_obj(c,r); return 0; }
     case 1: { u64 sz=0x4000; u32 voices=in32(c,0x10), sinks=in32(c,0x14), effects=in32(c,0x1C); sz+= (u64)voices*0x400 + sinks*0x200 + effects*0x800 + 0x40000; out64(c,sz); return 0; }
@@ -894,6 +907,19 @@ static int audout_disp(SvcObj* o, IpcCtx* c){
   return quiet_ok(o,c); }
 
 static SvcObj* new_audout(void){ return svcobj_new("audout:u",audout_disp,0); }
+
+/* NS2 CreateUserClientSessionByHipc reaches the existing audio managers.
+   Ported from the imported nx2_audio_user_client.h command contract; no
+   guessed renderer/output handles or blanket success for unknown commands. */
+static int ns2_auduser_disp(SvcObj* o,IpcCtx* c){
+  (void)o;
+  if(c->cmd!=1 && c->cmd!=2) return 0xf601; /* kernel ResultNotImplemented */
+  if(!c->raw || c->raw_size<4) return RC(153,4);
+  SvcObj* manager=c->cmd==1?new_audout():new_audren();
+  if(!manager) return RC(153,4);
+  out_obj(c,manager); return 0;
+}
+static SvcObj* new_ns2_auduser(void){ return svcobj_new("aud:u",ns2_auduser_disp,0); }
 
 /* hwopus, packets get decoded with libopus. sonic 1 (sega ages) spins on the same packet forever after the logos
    if it gets "0 bytes used, 0 samples". input is { u32 size (big endian), u32 final_range } and then the opus
@@ -1204,6 +1230,7 @@ void svc_core_init(void){
   svc_register("friend:u",new_friend); svc_register("friend:a",new_friend); svc_register("friend:v",new_friend);
   svc_register("ns:am2",new_ns); svc_register("ns:ec",new_ns); svc_register("ns:rid",new_ns); svc_register("ns:rt",new_ns); svc_register("ns:web",new_ns); svc_register("ns:ro",new_ns);
   svc_register("audren:u",new_audren); svc_register("audout:u",new_audout); svc_register("audin:u",new_audout); svc_register("hwopus",new_hwopus);
+  svc_register("aud:u",new_ns2_auduser);
   svc_register("bsd:u",new_bsd); svc_register("bsd:s",new_bsd); svc_register("ssl",new_ssl); svc_register("ssl:s",new_ssl);
   svc_register("prepo:u",new_prepo); svc_register("prepo:a",new_prepo); svc_register("prepo:a2",new_prepo); svc_register("psm",new_psm);
   svc_register("fatal:u",new_fatal); svc_register("csrng",new_csrng); svc_register("mm:u",new_mm);

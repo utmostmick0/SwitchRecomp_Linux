@@ -236,6 +236,21 @@ u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1){
     : "=a"(r) : "S"(a) : "rcx","rdx","memory","cc");
   return (u32)r; }
 
+u32 swr_cas128_value(u64* p, u64 e0, u64 e1, u64 n0, u64 n1, u64* old0, u64* old1){
+  u64 a[8]; u64 r;
+  a[0]=(u64)p; a[1]=e0; a[2]=e1; a[3]=n0; a[4]=n1; a[5]=a[6]=a[7]=0;
+  if(((u64)p)&15){ *old0=p[0]; *old1=p[1]; return swr_cas128(p,e0,e1,n0,n1); }
+  __asm__ __volatile__(
+    "push %%rbx\n\t" "push %%rdi\n\t"
+    "movq 8(%%rsi),%%rax\n\t" "movq 16(%%rsi),%%rdx\n\t" "movq 24(%%rsi),%%rbx\n\t" "movq 32(%%rsi),%%rcx\n\t" "movq (%%rsi),%%rdi\n\t"
+    "lock; cmpxchg16b (%%rdi)\n\t"
+    "movq %%rax,40(%%rsi)\n\t" "movq %%rdx,48(%%rsi)\n\t"
+    "sete %%bl\n\t" "movzbq %%bl,%%rax\n\t" "movq %%rax,56(%%rsi)\n\t"
+    "pop %%rdi\n\t" "pop %%rbx"
+    : "=a"(r) : "S"(a) : "rcx","rdx","memory","cc");
+  *old0=a[5]; *old1=a[6];
+  return (u32)a[7]; }
+
 #if defined(_WIN32)
 #include <windows.h>
 static volatile LONG g_fz; void swr_fence(void){ InterlockedExchange(&g_fz,0); }   /* xchg is a full barrier on x86 (no __faststorefence in tcc) */
@@ -253,13 +268,24 @@ u64 swr_cas_value(void* ptr, u32 size, u64 expected, u64 desired){
 }
 
 u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1){
-#if defined(__x86_64__) && defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16)
-  unsigned __int128 o=((unsigned __int128)o1<<64)|o0, n=((unsigned __int128)n1<<64)|n0;
-  return __sync_bool_compare_and_swap((unsigned __int128*)p,o,n);
+  u64 old0,old1;
+  return swr_cas128_value(p,o0,o1,n0,n1,&old0,&old1);
+}
+
+u32 swr_cas128_value(u64* p, u64 e0, u64 e1, u64 n0, u64 n1, u64* old0, u64* old1){
+#if defined(__x86_64__)
+  u64 prev0=e0,prev1=e1;
+  __asm__ __volatile__("lock; cmpxchg16b %0"
+    : "+m"(*(volatile unsigned __int128*)p), "+a"(prev0), "+d"(prev1)
+    : "b"(n0), "c"(n1) : "cc","memory");
+  *old0=prev0; *old1=prev1;
+  return prev0==e0 && prev1==e1;
 #else
-  /* no cmpxchg16b: CAS the low half, compare the high half */
-  if(__atomic_load_n(&p[1],__ATOMIC_SEQ_CST)!=o1) return 0;
-  if(!swr_cas64(&p[0],o0,n0)) return 0; __atomic_store_n(&p[1],n1,__ATOMIC_SEQ_CST); return 1;
+  *old0=__atomic_load_n(&p[0],__ATOMIC_SEQ_CST);
+  *old1=__atomic_load_n(&p[1],__ATOMIC_SEQ_CST);
+  u32 success=swr_cas128(p,e0,e1,n0,n1);
+  if(success){ *old0=e0; *old1=e1; }
+  return success;
 #endif
 }
 #endif

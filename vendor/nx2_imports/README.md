@@ -1,6 +1,6 @@
 # NX2 Core Imports & Subsystem Architecture
 
-This directory (`vendor/nx2_imports/`) preserves imported C++ architectural components, services, and shader translation layers for the 2nd-generation Nintendo Switch ("NX2") platform. These are reference sources, not compiled or linked into the SwitchRecomp C runtime. Their dependencies and integration adapters are not included as a complete buildable subsystem; importing them does not establish full NX2 game support.
+This directory (`vendor/nx2_imports/`) preserves imported C++ architectural components, services, and shader translation layers for the 2nd-generation Nintendo Switch ("NX2") platform. The standalone Ampere probe and lowering frontend are compiled into graphical runtime builds through `runtime/ns2_shader.cpp`. The other imported subsystems remain reference sources and are not linked into the C runtime. Their dependencies and integration adapters are not included as a complete buildable subsystem; this is not full NX2 game support.
 
 ---
 
@@ -56,11 +56,11 @@ Sparse mappings allow binding small (4KB/64KB) or large (2MB) guest memory pages
 
 The SwitchRecomp static recompiler translates guest AArch64 executable binaries (`.nro` or `exefs/`) into native C code. Its runtime remains a separate implementation:
 
-- `runtime/svc_core.c` implements C HLE service dispatch. The imported branch adds `system_clock_context`, which serializes the host clock offset, steady time, and clock identifier. It does not connect the imported C++ services.
+- `runtime/svc_core.c` implements C HLE service dispatch. NS2 `aud:u` commands 1/2 return the existing output/renderer manager implementations; malformed or unknown requests fail. The imported branch adds `system_clock_context`, which serializes the host clock offset, steady time, and clock identifier. It does not connect the imported C++ services.
 - `runtime/nvdrv.c` implements C NVDRV ioctl dispatch; it does not invoke these imported `nvhost_as_gpu` or `nvhost_gpu` classes.
-- `runtime/shader.c` retains the existing C shader translator and Ampere support. It does not call the imported C++ `LowerToMaxwell()` implementation.
+- `runtime/gpu_gl.c` can explicitly select Ampere shader loading with `SWR_SHADER_ISA=ampere`. Both graphics and compute shader ingestion then call the compiled imported probe/lowering frontend through `runtime/ns2_shader.cpp` before passing a repacked image to `runtime/shader.c`. Native graphics uses a 0x80-byte header; native compute is headerless. Instruction reads are mapping-checked and bounded to 4096 native instructions. Direct branches are relocated to the C translator's distinct scheduling layout. Unsupported opcodes, unreviewed fields, missing terminators, indirect branches, and instructions the downstream C translator cannot handle fail instead of being treated as executable GLSL.
 
-Connecting the reference sources requires explicit adapters, their upstream dependencies, build integration, and behavioral tests. Existing runtime improvements, regression tests, and binaries from `beta_nx2` are retained during the merge instead of replacing them with the older release baseline.
+Connecting the remaining reference sources requires explicit adapters, their upstream dependencies, build integration, and behavioral tests. Native graphics-supervisor/GPU-worker services, QMD3 command submission, native memory ownership, and VI2 presentation remain incomplete. The shader ISA override changes shader decoding only; it does not implement those services or reinterpret native launch descriptors as Maxwell descriptors. Existing runtime improvements, regression tests, and binaries from `beta_nx2` are retained during the merge instead of replacing them with the older release baseline.
 
 ---
 
@@ -72,7 +72,7 @@ Build the existing C runtime with the normal project command:
 python3 switchrecomp.py --build-runtime --target linux --backend x11 --cc gcc
 ```
 
-This command does not compile `vendor/nx2_imports/`. C++17/C++20 requirements in the imported source apply to future integration of those components, not to the current C runtime build.
+Graphical runtime builds require a compiler with a C++20 frontend. The build compiles only `probe.cpp`, `lower_bridge.cpp`, and the runtime bridge as C++20 objects, then links them with the existing C runtime and C++ standard library. It does not compile the full imported Eden kernel or renderer. Headless runtime builds retain the C-only path.
 
 Run the existing runtime regression checks with:
 
@@ -80,4 +80,20 @@ Run the existing runtime regression checks with:
 python3 scripts/test_runtime_ports.py
 ```
 
-Passing these checks validates the covered C runtime behavior, not the completeness or buildability of the imported C++ subsystems.
+The runner also compiles the imported Ampere frontend with sanitizers and checks native graphics/compute layouts, forward/backward branch relocation, control-flow-complete capture, unmapped reads, invalid input rejection, and generated vertex/fragment/compute GLSL with `glslangValidator` when installed. Passing these checks does not establish game compatibility or completeness of the remaining imported C++ subsystems.
+
+## Upstream follow-up references
+
+The imported files are a historical snapshot. The current upstream documents
+separate source/host validation from game-rendering evidence:
+
+- [NS2 bootstrap and audio routing](https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/NS2_HLE_BOOTSTRAP_2026-11-01.md)
+- [GSV memory ownership and rollback](https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/NS2_GSV_NATIVE_MEMORY_REVIEW_2026-11-01.md)
+- [QMD3 atomic buffer bounds](https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/NS2_ATOMIC_SPAN_QMD3_2026-11-05.md)
+- [Current unified roadmap](https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/ROADMAP_NS1_NS2_UNIFIED.md)
+- [Source reconciliation](https://git.eden-emu.dev/niakw/ProsperoEden-Encore/src/branch/main/docs/NS1_NS2_HOST_SOURCE_RECONCILIATION_2026-11-04.md)
+
+The November 4 reconciliation retires the prototype graphics-scaling
+application-proxy files because they supplied fabricated scale values. Their
+historical copies remain in this import for provenance and are not built or
+adapted into runtime services. Do not treat their responses as a supported ABI.

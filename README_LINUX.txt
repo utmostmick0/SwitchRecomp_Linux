@@ -24,6 +24,16 @@ COMO SE USA
 
   Sin interfaz, desde la terminal:
     python3 SwitchRecomp/switchrecomp.py /ruta/al/dump --target linux --outdir SwitchRecomp/games --cc gcc
+  Para diagnosticar Bananza con el arranque grafico de memoria remota omitido (experimental; puede impedir que los graficos funcionen):
+    python3 SwitchRecomp/switchrecomp.py /ruta/al/dump --target linux --outdir SwitchRecomp/games --cc gcc --skip-switch2-remote-memory
+  Si se detiene durante Initialize de syncpoints, se puede omitir esa inicializacion con (experimental):
+    python3 SwitchRecomp/switchrecomp.py /ruta/al/dump --target linux --outdir SwitchRecomp/games --cc gcc --skip-switch2-remote-memory --skip-switch2-syncpoint-init
+  Si se detiene durante BootNativeMemoryManagement, tambien se puede omitir esa inicializacion (experimental):
+    python3 SwitchRecomp/switchrecomp.py /ruta/al/dump --target linux --outdir SwitchRecomp/games --cc gcc --skip-switch2-remote-memory --skip-switch2-syncpoint-init --skip-switch2-native-memory-init
+  Si se detiene durante BootGraphicsFrameManagement, se puede omitir esa inicializacion con (experimental):
+    python3 SwitchRecomp/switchrecomp.py /ruta/al/dump --target linux --outdir SwitchRecomp/games --cc gcc --skip-switch2-remote-memory --skip-switch2-syncpoint-init --skip-switch2-native-memory-init --skip-switch2-frame-management-init
+  Si se detiene durante TryQueryDonatedTransferMemoryUsage, se puede indicar que la memoria donada no esta disponible (experimental):
+    python3 SwitchRecomp/switchrecomp.py /ruta/al/dump --target linux --outdir SwitchRecomp/games --cc gcc --skip-switch2-remote-memory --skip-switch2-syncpoint-init --skip-switch2-native-memory-init --skip-switch2-frame-management-init --skip-switch2-donated-transfer-memory-query
 
 CON EL APPIMAGE (un solo archivo)
   chmod +x SwitchRecomp-v190-x86_64.AppImage && ./SwitchRecomp-v190-x86_64.AppImage
@@ -57,3 +67,19 @@ SI LA INTERFAZ NO ABRE
 LICENCIA
   GNU AGPL v3 (LICENSE.txt) con los terminos adicionales de NOTICE.txt: las copias y forks tienen que mantener
   la pantalla de inicio de SwitchRECOMP (logo y aviso de copyright), el credito a MZ Labs y publicar su codigo.
+
+EXPERIMENTAL NS2 SHADER FRONTEND
+  Graphical runtime builds now compile the imported Eden Ampere lowering frontend
+  using C++20. To explicitly select native Ampere shader decoding for a test run:
+    SWR_SHADER_ISA=ampere ./games/<name>
+  Graphics shaders use a 0x80-byte native header; compute shaders are headerless.
+  Unsupported instructions and unmapped shader reads are rejected. Maxwell remains
+  the default. This override changes shader decoding only: native GPU services,
+  QMD3 launch commands, memory ownership and VI2 presentation are still incomplete.
+  It does not establish full NS2 support or confirmed Bananza rendering.
+  Validation: python3 scripts/test_runtime_ports.py
+
+TECHNICAL DOCUMENTATION
+  Architecture, reference mapping, integration status and test reporting:
+    docs/NS2_TECHNICAL_INTEGRATION.md
+  Input document fingerprints: docs/REFERENCE_SOURCE_MANIFEST.json

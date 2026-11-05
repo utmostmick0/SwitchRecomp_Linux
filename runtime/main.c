@@ -7,7 +7,7 @@
 /* the runtime version goes in every log, so you can tell a crash report from an old or third party build by the
    first line */
 #ifndef SWR_RUNTIME_VERSION
-#define SWR_RUNTIME_VERSION "v195-audio-completion"
+#define SWR_RUNTIME_VERSION "v197-ns2-frontend"
 #endif
 const char* g_runtime_version=SWR_RUNTIME_VERSION;
 #include "rt.h"
@@ -50,6 +50,14 @@ static void rt_undef(CPU* c, u64 pc, u32 w){
   save_hints(); fatal("Unsupported instruction %08x at %llx",w,(unsigned long long)pc); }
 
 static void rt_brk(CPU* c, u64 pc, u32 imm){ WARN("\nBRK #%u at %llx\n",imm,(unsigned long long)pc); c->pc=pc; kernel_dump_regs(c); save_hints(); fatal("The game executed BRK at %llx",(unsigned long long)pc); }
+
+static volatile u32 g_trace_dispatch_count;
+static void rt_trace_dispatch(CPU* c, u64 pc, GuestFn fn){
+  if(__atomic_fetch_add(&g_trace_dispatch_count,1,__ATOMIC_RELAXED)>=64) return;
+  LOG("dispatch-trace: pc=%llx lr=%llx fn=%p interp=%d thread=%p\n",
+      (unsigned long long)pc,(unsigned long long)c->x[30],(void*)(uintptr_t)fn,
+      fn==swr_interp_entry,c->thread);
+}
 
 static u64 g_t0;
 
@@ -122,7 +130,7 @@ static void rt_sev(void){}
 
 static void rt_wfe(CPU* c){ (void)c; plat_yield(); }
 
-const RtAPI g_rtapi={swr_svc,rt_undef,rt_note_hint,rt_ticks,rt_brk,rt_fpcr,rt_sev,rt_wfe};
+const RtAPI g_rtapi={swr_svc,rt_undef,rt_note_hint,rt_ticks,rt_brk,rt_fpcr,rt_sev,rt_wfe,rt_trace_dispatch};
 
 /* ============================================================ system errors */
 void crash_report(void* host_pc, void* fault, int sig){
@@ -365,7 +373,13 @@ const SwrModule* swr_module_static(void) __attribute__((weak));
 int g_code_tcc;
 
 static int load_code(void){
-  if(swr_module_static){ g_mod=swr_module_static(); return g_mod? 0 : -1; }
+  if(swr_module_static){
+    g_mod=swr_module_static();
+    if(!g_mod) return -1;
+    LOG("code: using statically linked module (%u entries, guest range %010llx-%010llx)\n",
+        g_mod->nentries,(unsigned long long)g_mod->code_lo,(unsigned long long)g_mod->code_hi);
+    return 0;
+  }
   char p[1200];
 #if defined(_WIN32)
   snprintf(p,sizeof p,"%s%s_code.dll",g_exedir,g_exename);
@@ -386,7 +400,11 @@ static int load_code(void){
     if(g_code_tcc) LOG("code: %s_code.dll was compiled with TCC. It runs several times slower than with GCC: recompile with GCC (SwitchRecomp, compiler GCC) for much better performance\n",g_exename);
     else LOG("code: %s_code.dll compiled with GCC (linker %u.%u)\n",g_exename,mj,mn); }
 #endif
-  g_mod=f(); return 0; }
+  g_mod=f();
+  if(!g_mod) return -1;
+  LOG("code: loaded %s (%u entries, guest range %010llx-%010llx)\n",
+      p,g_mod->nentries,(unsigned long long)g_mod->code_lo,(unsigned long long)g_mod->code_hi);
+  return 0; }
 
 static void build_dispatch(void){
   g_code_lo=g_mod->code_lo; g_code_hi=g_mod->code_hi;

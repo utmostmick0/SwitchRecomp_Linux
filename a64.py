@@ -1,9 +1,10 @@
 # SwitchRecomp - Copyright 2026 MZ Labs
 # Licensed under the GNU Affero General Public License v3.0, see LICENSE.txt and NOTICE.txt.
 # Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen.
-"""a64: AArch64 (ARMv8.0, A57) instruction templates. each instruction is one python function that
-emits its C, used two ways: static, where fields are constants (recompiled code), and dynamic,
-where fields get decoded at runtime (fallback interpreter). so both paths share the same code.
+"""a64: AArch64 instruction templates (ARMv8.0 plus selected ARMv8.1-8.5 extensions).
+Each instruction is one Python function that emits its C, used two ways: static, where fields are
+constants (recompiled code), and dynamic, where fields get decoded at runtime (fallback interpreter).
+Both paths share the same code.
 the less common AdvSIMD ops call swr_simd() (hand written C, tested against unicorn like
 everything else), the common ones are inlined"""
 
@@ -19,7 +20,9 @@ FIELDS = {
     'V': (26, 1), 'L': (22, 1), 'mode': (23, 2), 'imode': (10, 2), 'op31': (21, 3), 'o2': (23, 1),
     'dpop': (10, 6), 'fop1': (15, 6), 'fop2': (12, 4), 'fcmpop': (3, 2), 'Q': (30, 1), 'lsop1': (21, 1),
     'op0_1': (21, 3), 'CRn': (12, 4), 'op1': (16, 3), 'b24': (24, 1), 'b21': (21, 1), 'b10': (10, 1), 'b11': (11, 1),
-    'lseop': (12, 4),
+    'lseop': (12, 4), 'auth_s': (22, 1), 'auth_w': (11, 1), 'stg_opc': (22, 2), 'stg_mode': (10, 2),
+    'stgp_mode': (23, 2), 'casp_sz': (30, 1), 'casp_o0': (15, 1), 'pac_z': (13, 1), 'pac_op': (10, 3),
+    'tag_imm6': (16, 6), 'xpac_d': (10, 1),
 }
 
 
@@ -393,8 +396,19 @@ def _(g):
     return 'if(%s==3&&%s==7&&%s==4&&%s==1) dc_zva(M,%s);' % (g.f('op1'), g.f('CRn'), g.f('CRm'), g.f('op2'), g.X('rt'))
 
 
-@ins('XPACI', '1101 1010 1100 0001 0100 0011 111x xxxx')
+@ins('PACAUT_REG', '110110101100000100x xxx xxxxx xxxxx', spec=('pac_z', 'rn'))
+def _(g):
+    if g.v('pac_z') and g.v('rn') != 31: return None
+    return ''
+
+
+@ins('XPAC_1', '110110101100000101000x11111xxxxx')
 def _(g): return ''
+
+
+@ins('PACGA', '10011010110xxxxx001100xxxxxxxxxx')
+def _(g):
+    return g.setX('rd', '(%s ^ %s) & 0xFFFFFFFF00000000ull' % (g.X('rn'), g.XS('rm')))
 
 
 SR_TPIDR = (1 << 14) | (3 << 11) | (13 << 7) | (0 << 3) | 2
@@ -451,19 +465,81 @@ def ls_scale(size, V, opc):
 
 
 def ldr_auth(g, writeback):
-    off = lit(g.v('imm9') * 8) if g.static else '((u64)(i64)%s*8)' % g.f('imm9')
+    if g.static:
+        raw = (g.v('auth_s') << 9) | (g.v('imm9') & 0x1FF)
+        off = lit(((raw ^ 0x200) - 0x200) * 8)
+    else:
+        raw = '((%s<<9)|((u32)%s&0x1FF))' % (g.f('auth_s'), g.f('imm9'))
+        off = '((u64)(((i64)(%s^512)-512)*8))' % raw
     addr = '(%s+%s)' % (g.XS('rn'), off)
     if writeback:
-        return '{ u64 a_=%s; %s %s }' % (addr, g.setX('rt', 'RD64(a_)'), g.setXS('rn', 'a_'))
+        return '{ u64 a_=%s; %s %s }' % (addr, g.setXS('rn', 'a_'), g.setX('rt', 'RD64(a_)'))
     return g.setX('rt', 'RD64(%s)' % addr)
 
 
-@ins('LDRAA_LDRAB_OFF', '1111 1000 x01x xxxx xxxx 01xx xxxx xxxx')
-def _(g): return ldr_auth(g, False)
+@ins('LDRA', '11111000xx1xxxxxxxxx x1 xxxxx xxxxx', spec=('auth_s', 'auth_w'))
+def _(g): return ldr_auth(g, bool(g.v('auth_w')))
 
 
-@ins('LDRAA_LDRAB_PRE', '1111 1000 x11x xxxx xxxx 11xx xxxx xxxx')
-def _(g): return ldr_auth(g, True)
+@ins('STG_FAMILY', '11011001xx1xxxxxxxxx xx xxxxx xxxxx', spec=('stg_opc', 'stg_mode'))
+def _(g):
+    opc, mode = g.v('stg_opc'), g.v('stg_mode')
+    if mode == 0:
+        return '' if opc == 1 else None
+    if g.static:
+        offset = lit(g.v('imm9') * 16)
+    else:
+        offset = '((u64)(i64)%s*16)' % g.f('imm9')
+    base = g.XS('rn')
+    offaddr = '(%s+%s)' % (base, offset)
+    addr = base if mode == 1 else offaddr
+    stores = ''
+    if opc & 1:
+        stores = ' '.join('WR64(%s,0);' % ('(%s+%d)' % (addr, i * 8) if i else addr)
+                          for i in range((2 if opc & 2 else 1) * 2))
+    writeback = g.setXS('rn', offaddr) if mode != 2 else ''
+    return '{ u64 a_=%s; %s %s }' % (addr, stores, writeback)
+
+
+@ins('STGP', '0110100xx0xxxxxxx xxxxx xxxxx xxxxx', spec=('stgp_mode',))
+def _(g):
+    mode = g.v('stgp_mode')
+    if mode == 0: return None
+    if g.static:
+        offset = lit(g.v('imm7') * 16)
+    else:
+        offset = '((u64)(i64)%s*16)' % g.f('imm7')
+    base = g.XS('rn')
+    offaddr = '(%s+%s)' % (base, offset)
+    addr = base if mode == 1 else offaddr
+    writeback = g.setXS('rn', offaddr) if mode != 2 else ''
+    return '{ u64 a_=%s; WR64(a_,%s); WR64(a_+8,%s); %s }' % (
+        addr, g.X('rt'), g.X('rt2'), writeback)
+
+
+@ins('IRG', '10011010110xxxxx000100xxxxxxxxxx')
+def _(g):
+    return g.setXS('rd', g.XS('rn'))
+
+
+@ins('GMI', '10011010110xxxxx000101xxxxxxxxxx')
+def _(g):
+    return g.setX('rd', '(%s|1ull)' % g.X('rm'))
+
+
+def tagged_address(g, subtract):
+    delta = '((u64)%s<<4)' % g.f('tag_imm6')
+    if g.static: delta = lit(g.v('tag_imm6') << 4)
+    op = '-' if subtract else '+'
+    return g.setXS('rd', '(%s%s%s)' % (g.XS('rn'), op, delta))
+
+
+@ins('ADDG', '1001000110xxxxxx00xxxxxxxxxxxxxx', spec=('tag_imm6',))
+def _(g): return tagged_address(g, False)
+
+
+@ins('SUBG', '1101000110xxxxxx00xxxxxxxxxxxxxx', spec=('tag_imm6',))
+def _(g): return tagged_address(g, True)
 
 
 @ins('LDST_UIMM', 'xx 111 x 01 xx xxxxxxxxxxxx xxxxx xxxxx', spec=('size', 'V', 'lopc'))
@@ -564,6 +640,46 @@ def _(g):
     desired = g.X('rt') if size == 3 else g.W('rt')
     old = 'swr_cas_value(MP(%s),%d,%s,%s)' % (g.XS('rn'), 1 << size, expected, desired)
     return g.setX('rs', old) if size == 3 else g.setW('rs', old)
+
+
+def pair_reg(g, n, offset):
+    if g.static:
+        r = g.v(n) + offset
+        return '0' if r == 31 else 'c->x[%d]' % r
+    return 'RX((%s+%d)&31)' % (g.f(n), offset)
+
+
+def pair_set(g, n, offset, expr, word=False):
+    if g.static:
+        r = g.v(n) + offset
+        if r == 31: return '(void)(%s);' % expr
+        val = '(u32)(%s)' % expr if word else '(u64)(%s)' % expr
+        return 'c->x[%d]=%s;' % (r, val)
+    idx = '(%s+%d)&31' % (g.f(n), offset)
+    val = '(u32)(%s)' % expr if word else '(u64)(%s)' % expr
+    return 'SETX(%s,%s);' % (idx, val)
+
+
+@ins('CASP', '0x0010000x1xxxxx x 11111 xxxxx xxxxx', spec=('casp_sz', 'L', 'casp_o0'))
+def _(g):
+    if g.static and ((g.v('rs') | g.v('rt')) & 1): return None
+    addr = g.XS('rn')
+    if not g.v('casp_sz'):
+        expected = '((u64)(u32)%s|((u64)(u32)%s<<32))' % (g.W('rs'), pair_reg(g, 'rs', 1))
+        desired = '((u64)(u32)%s|((u64)(u32)%s<<32))' % (g.W('rt'), pair_reg(g, 'rt', 1))
+        old = 'swr_cas_value(MP(%s),8,%s,%s)' % (addr, expected, desired)
+        body = '{ u64 old_=%s; %s %s }' % (
+            old,
+            g.setW('rs', 'old_'),
+            pair_set(g, 'rs', 1, 'old_>>32', True))
+    else:
+        expected0, expected1 = g.X('rs'), pair_reg(g, 'rs', 1)
+        desired0, desired1 = g.X('rt'), pair_reg(g, 'rt', 1)
+        body = '{ u64 old0_,old1_; swr_cas128_value((u64*)MP(%s),%s,%s,%s,%s,&old0_,&old1_); %s %s }' % (
+            addr, expected0, expected1, desired0, desired1,
+            g.setX('rs', 'old0_'), pair_set(g, 'rs', 1, 'old1_'))
+    if g.static: return body
+    return 'if((%s&1)||(%s&1)) UNDEF(); %s' % (g.f('rs'), g.f('rt'), body)
 
 
 @ins('LDAPR', 'xx 111000 10 111111 110000 xxxxx xxxxx', spec=('size',))

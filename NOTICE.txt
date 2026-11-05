@@ -34,3 +34,9 @@ Background music decoders: dr_wav/dr_mp3 by David Reid and stb_vorbis by
 Sean Barrett and contributors. Their licenses are retained in tool/audio_decode/.
 Windows tool build libraries: SDL2, SDL2_image, SDL2_ttf (including FreeType and
 HarfBuzz); copyright/license notices are retained under tool/deps/.
+
+The compiled NS2 Ampere shader frontend is derived from the Eden Emulator
+Project under GPL-3.0-or-later, with encoding references to Mesa NAK under MIT
+(Copyright 2022 Collabora, Ltd.). Source copyright and SPDX notices are retained
+in vendor/nx2_imports/ampere/. The C ABI and scheduling adapter are in
+runtime/ns2_shader.cpp. Other imported NX2 components retain their own notices.

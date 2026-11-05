@@ -21,7 +21,7 @@ Output (next to the executable):
 
 LEGAL: does not include or download games, keys or firmware. Use your own copy.
 """
-import argparse, os, sys, shutil, subprocess, time, hashlib, filecmp, re, struct, threading
+import argparse, os, sys, shutil, subprocess, time, hashlib, filecmp, re, struct, threading, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -94,7 +94,10 @@ def write_if_changed(p, text):
     return True
 
 
-def gen_module(prog, mods, npdm, outdir, title, chunk_instrs, say):
+def gen_module(prog, mods, npdm, outdir, title, chunk_instrs, say,
+               skip_switch2_remote_memory=False, skip_switch2_syncpoint_init=False,
+               skip_switch2_native_memory_init=False, skip_switch2_frame_management_init=False,
+               skip_switch2_donated_transfer_memory_query=False):
     funcs = prog.funcs
     order = sorted(funcs)
     # split by instruction count
@@ -106,7 +109,11 @@ def gen_module(prog, mods, npdm, outdir, title, chunk_instrs, say):
     files = []
     t0 = time.time()
     for ci, ch in enumerate(chunks):
-        text = '\n'.join(codegen.emit_function(prog, f, funcs) for f in ch)
+        text = '\n'.join(codegen.emit_function(prog, f, funcs, skip_switch2_remote_memory,
+                                               skip_switch2_syncpoint_init,
+                                               skip_switch2_native_memory_init,
+                                               skip_switch2_frame_management_init,
+                                               skip_switch2_donated_transfer_memory_query) for f in ch)
         # only prototype what this chunk references
         refs = set(re.findall(r'\bF_[0-9A-F]+\b', text))
         protos = ''.join('void %s(CPU* RESTRICT c, u64 e);\n' % r for r in sorted(refs))
@@ -259,6 +266,28 @@ def runtime_path(target_win, backend):
 
 
 def build_runtime(cc, out, target_win, backend, say, opt='2'):
+    if backend == 'headless' or is_tcc(cc):
+        return _build_runtime(cc, out, target_win, backend, say, opt)
+    # Compile the standalone frontend as C++20, without changing the C dialect
+    # or treating unrelated runtime sources as C++. No generated objects persist.
+    frontend = os.path.join(HERE, 'vendor', 'nx2_imports', 'ampere')
+    with tempfile.TemporaryDirectory(prefix='swr-ns2-build-') as directory:
+        objects = []
+        sources = [os.path.join(RT, 'ns2_shader.cpp')] + [
+            os.path.join(frontend, 'shader_recompiler', 'frontend', 'ampere', name)
+            for name in ('probe.cpp', 'lower_bridge.cpp')]
+        for index, source in enumerate(sources):
+            obj = os.path.join(directory, '%d.o' % index)
+            command = [cc, '-x', 'c++', '-std=c++20', '-O' + opt, '-I', RT,
+                       '-I', os.path.join(RT, 'ns2_compat'), '-I', frontend,
+                       '-c', source, '-o', obj]
+            error = run_cc(command, cc)
+            if error: raise SystemExit('NS2 frontend build failed:\n' + error[-4000:])
+            objects.append(obj)
+        return _build_runtime(cc, out, target_win, backend, say, opt, objects)
+
+
+def _build_runtime(cc, out, target_win, backend, say, opt='2', ns2_objects=()):
     if is_tcc(cc):
         # bcn, SPIRV-Cross and OpenH264 are C++
         raise SystemExit('TCC cannot build the runtime: build it once with GCC (--build-runtime --cc gcc), '
@@ -291,6 +320,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     op = os.path.join(RT, 'opus', 'win' if target_win else 'lin')
     opus = os.path.isfile(os.path.join(op, 'libopus.a')) and backend in ('win32', 'x11', 'headless')
     cmd = [cc] + ([] if target_win else ['-std=gnu17']) + ['-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S', '-I', RT, '-I', os.path.join(RT, 'bcn'), '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'opus', 'include'), '-I', os.path.join(RT, 'vp9', 'include')] + srcs + ['-o', out]
+    if ns2_objects: cmd += list(ns2_objects) + ['-DSWR_NS2_SHADER']
     if target_win and backend == 'win32': cmd += ['-DSWR_RECORD_AUDIO']
     if not h264: cmd += ['-DSWR_NO_H264']
     if vp9: cmd += ['-DSWR_HAVE_VP9']
@@ -299,7 +329,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     if h264: cmd += h264_libs
     if vp9: cmd += [os.path.join(vp, 'libvpx.a')]
     if opus: cmd += [os.path.join(op, 'libopus.a')]
-    if spvc or h264:
+    if spvc or h264 or ns2_objects:
         # static on Linux too, so the runtime doesn't depend on the libstdc++ version of the distro
         cmd += ['-lstdc++'] if target_win else ['-Wl,-Bstatic', '-lstdc++', '-Wl,-Bdynamic', '-static-libgcc']
     if target_win:
@@ -416,6 +446,16 @@ def main():
     ap.add_argument('--no-build', action='store_true', help='only generate the C code and copy the game data')
     ap.add_argument('--keep-c', action='store_true', help=argparse.SUPPRESS)   # the C is always kept, for rebuilds
     ap.add_argument('--interp-only', action='store_true', help='(diagnostics) no recompilation, everything interpreted')
+    ap.add_argument('--skip-switch2-remote-memory', action='store_true',
+                    help='(experimental) skip Bananza Switch 2 SDK remote-memory boot')
+    ap.add_argument('--skip-switch2-syncpoint-init', action='store_true',
+                    help='(experimental) skip Bananza Switch 2 SDK syncpoint initialization')
+    ap.add_argument('--skip-switch2-native-memory-init', action='store_true',
+                    help='(experimental) bypass Bananza Switch 2 SDK native-memory initialization')
+    ap.add_argument('--skip-switch2-frame-management-init', action='store_true',
+                    help='(experimental) skip Bananza Switch 2 SDK graphics frame-management initialization')
+    ap.add_argument('--skip-switch2-donated-transfer-memory-query', action='store_true',
+                    help='(experimental) treat Bananza donated transfer memory as unavailable')
     ap.add_argument('--runtime', help='use an already built runtime (.exe) instead of building it')
     ap.add_argument('--build-runtime', action='store_true', help='build bin/runtime_<target>_<backend> with GCC and exit')
     ap.add_argument('-q', '--quiet', action='store_true')
@@ -476,7 +516,20 @@ def main():
     build = base + '_build'
     os.makedirs(build, exist_ok=True)
     say('Translating ARM64 to C...')
-    files = gen_module(prog, mods, npdm, build, title, a.chunk, say)
+    if a.skip_switch2_remote_memory:
+        say('Experimental: skipping Switch 2 remote-memory boot functions in the SDK module')
+    if a.skip_switch2_syncpoint_init:
+        say('Experimental: skipping nn::syncpt::sdk::Initialize in the SDK module')
+    if a.skip_switch2_native_memory_init:
+        say('Experimental: bypassing nn::gs::sdk::BootNativeMemoryManagement in the SDK module')
+    if a.skip_switch2_frame_management_init:
+        say('Experimental: skipping nn::gs::sdk::BootGraphicsFrameManagement in the SDK module')
+    if a.skip_switch2_donated_transfer_memory_query:
+        say('Experimental: treating nn::gpu::sdk::TryQueryDonatedTransferMemoryUsage as unavailable')
+    files = gen_module(prog, mods, npdm, build, title, a.chunk, say,
+                       a.skip_switch2_remote_memory, a.skip_switch2_syncpoint_init,
+                       a.skip_switch2_native_memory_init, a.skip_switch2_frame_management_init,
+                       a.skip_switch2_donated_transfer_memory_query)
     datadir = base + '_data'
     copy_data(mods, npdm, romfs, a.input, datadir, say)
     if not os.path.exists(base + '.ini'):

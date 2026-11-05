@@ -57,6 +57,7 @@ typedef struct RtAPI {
   void (*fpcr_changed)(struct CPU* c);
   void (*sev)(void);
   void (*wfe)(struct CPU* c);
+  void (*trace_dispatch)(struct CPU* c, u64 pc, GuestFn fn);
 } RtAPI;
 
 typedef struct CPU {
@@ -100,7 +101,14 @@ SWR_INLINE GuestFn swr_lookup(CPU* c, u64 pc);
 extern GuestFn swr_interp_entry;
 SWR_INLINE GuestFn swr_lookup(CPU* c, u64 pc){
   u64 o = pc - c->code_lo;
-  if (LIKELY(o < c->code_hi - c->code_lo && !(pc&3))) { GuestFn f = c->disp[o>>2]; if (LIKELY(f!=0)) return f; }
+  if (LIKELY(o < c->code_hi - c->code_lo && !(pc&3))) {
+    GuestFn f = c->disp[o>>2];
+    if (LIKELY(f!=0)) {
+      if (UNLIKELY(pc==c->user[7] && c->rt && c->rt->trace_dispatch)) c->rt->trace_dispatch(c,pc,f);
+      return f;
+    }
+  }
+  if (UNLIKELY(pc==c->user[7] && c->rt && c->rt->trace_dispatch)) c->rt->trace_dispatch(c,pc,swr_interp_entry);
   return swr_interp_entry;
 }
 
@@ -278,6 +286,7 @@ SWR_INLINE void dc_zva(u8* M, u64 a){ memset(MP(a&~63ull),0,64); }
 u32 swr_cas64(u64* p, u64 o, u64 n); u32 swr_cas32(u32* p, u32 o, u32 n);
 u32 swr_cas16(u16* p, u16 o, u16 n); u32 swr_cas8(u8* p, u8 o, u8 n);
 u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1);
+u32 swr_cas128_value(u64* p, u64 e0, u64 e1, u64 n0, u64 n1, u64* old0, u64* old1);
 u64 swr_cas_value(void* p, u32 size, u64 expected, u64 desired);
 u64 swr_lse_op(void* p, u32 size, u32 op, u64 operand);
 #define SWR_FENCE() swr_fence()
@@ -292,6 +301,7 @@ SWR_INLINE u32 swr_cas16(u16* p, u16 o, u16 n){ return __atomic_compare_exchange
 SWR_INLINE u32 swr_cas8(u8* p, u8 o, u8 n){ return __atomic_compare_exchange_n(p,&o,n,0,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST); }
 
 u32 swr_cas128(u64* p, u64 o0, u64 o1, u64 n0, u64 n1);
+u32 swr_cas128_value(u64* p, u64 e0, u64 e1, u64 n0, u64 n1, u64* old0, u64* old1);
 u64 swr_cas_value(void* p, u32 size, u64 expected, u64 desired);
 u64 swr_lse_op(void* p, u32 size, u32 op, u64 operand);
 #define SWR_FENCE() __atomic_thread_fence(__ATOMIC_SEQ_CST)
