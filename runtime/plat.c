@@ -5,6 +5,7 @@
 
 /* platform glue: threads, timers, VM, files. win32 + posix */
 #include "rt.h"
+#include <math.h>
 #include <time.h>
 
 __thread void* tls_thread;

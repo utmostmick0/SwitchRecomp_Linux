@@ -223,12 +223,33 @@ static GlFmt rt_format(u32 f){
 typedef struct Tex {
   u64 gva; u32 w, h, d, levels, target; u32 fkey; GlFmt f; float scale;
   u32 bl, bh, bd, pitch; u64 size;
-  GLuint id; u64 hash; int is_rt, gpu_written; u32 frame_checked, last_used; GLint swz[4]; u64 tr_last; u32 stable, next_check; GLuint view; GLenum view_target; GLint vswz[4]; u32 wgen, crop_gen; u64 wfs; u32 wframe; struct Tex* crop; struct Tex* lay; struct Tex* vol; int skipclr, zero3d; u64 alias; u64 shash; u32 tfull;
+  GLuint id; u64 hash; int is_rt, gpu_written; u32 frame_checked, last_used; GLint swz[4]; u64 tr_last; u32 stable, next_check; GLuint view; GLenum view_target; GLint* vswz; struct { GLuint id; GLint swz[4]; } views[4]; u32 wgen, crop_gen; u64 wfs; u32 wframe; struct Tex* crop; struct Tex* lay; struct Tex* vol; int skipclr, zero3d; u64 alias; u64 shash; u32 tfull;
   GLuint zc; u64 zc_hash; u32 zc_wgen, zc_ok;   /* depth copy for shadow samplers (zc_ok: 1 made, 2 failed) */
   u64* seen; u32 nseen;   /* assembled textures: which RT (and write count) each layer/level was copied from */
   struct RtHist* hist; u32 nhist;   /* last draws into this RT (small RTs only), for F5 traces */
   struct Tex* next;
 } Tex;
+
+/* Keep every target view alive until the parent storage is retired. A single
+   draw can bind the same array as 2D and cube through different sampler slots. */
+static void tex_views_drop(Tex* t){
+  for(int i=0;i<4;i++) if(t->views[i].id){ glDeleteTextures(1,&t->views[i].id); t->views[i].id=0; }
+  t->view=0; t->view_target=0; t->vswz=NULL;
+}
+
+/* Actual host storage, including mip levels. Compressed bpp is bytes per
+   block, while CPU-decoded formats occupy pixels in host storage. */
+static u64 tex_storage_bytes(u32 w,u32 h,u32 d,u32 levels,int volume,const GlFmt* f){
+  u64 total=0;
+  for(u32 l=0;l<levels;l++){
+    u64 x=w>>l, y=h>>l, z=volume? d>>l : d;
+    if(!x) x=1; if(!y) y=1; if(!z) z=1;
+    if(f->dec==20) total+=x*y*z*8;
+    else if(f->astc || f->dec) total+=x*y*z*4;
+    else total+=((x+f->bw-1)/f->bw)*((y+f->bh-1)/f->bh)*z*f->bpp;
+  }
+  return total;
+}
 
 /* the real scale is per texture, not for the whole GPU */
 static float TS(const Tex* t){ return t->is_rt? t->scale : 1.0f; }
@@ -477,7 +498,7 @@ static PFNGLCOPYIMAGESUBDATAPROC p_cis; static u64 st_rt_crop;
 static Tex* rt_crop(Tex* rt, u32 w, u32 h){
   if(!p_cis || getenv("SWR_NO_RTCROP")) return rt;
   Tex* c=rt->crop;
-  if(c && (c->w!=w || c->h!=h)){ glDeleteTextures(1,&c->id); if(c->view) glDeleteTextures(1,&c->view); free(c); c=rt->crop=NULL; }
+  if(c && (c->w!=w || c->h!=h)){ glDeleteTextures(1,&c->id); tex_views_drop(c); free(c); c=rt->crop=NULL; }
   if(!c){ g_tmap_gen++; c=calloc(1,sizeof *c); c->gva=rt->gva; c->w=w; c->h=h; c->d=1; c->levels=1; c->target=GL_TEXTURE_2D; c->f=rt->f; c->fkey=rt->fkey; c->is_rt=1; c->scale=TS(rt); c->bl=rt->bl; c->bh=rt->bh;
     c->swz[0]=GL_RED; c->swz[1]=GL_GREEN; c->swz[2]=GL_BLUE; c->swz[3]=GL_ALPHA;
     glGenTextures(1,&c->id); glBindTexture(GL_TEXTURE_2D,c->id); glTexStorage2D(GL_TEXTURE_2D,1,rt->f.ifmt,TD(rt,w),TD(rt,h));
@@ -557,7 +578,7 @@ static Tex* vol_from_slices(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, GlFmt f, u32
     sl[z]=r; sig=(sig^(r->wgen+z*31))*16777619u; sig=(sig^(u32)(uintptr_t)r)*16777619u; }
   Tex* c=rt0->lay;
   if(c && (c->w!=w || c->h!=h || c->d!=d || c->target!=GL_TEXTURE_3D || c->fkey!=rt0->fkey || c->pitch!=TD(rt0,w))){
-    glDeleteTextures(1,&c->id); if(c->view) glDeleteTextures(1,&c->view); free(c); c=rt0->lay=NULL; g_fb_sig_ok=0; g_tmap_gen++; }
+    glDeleteTextures(1,&c->id); tex_views_drop(c); free(c); c=rt0->lay=NULL; g_fb_sig_ok=0; g_tmap_gen++; }
   if(!c){ g_tmap_gen++; c=calloc(1,sizeof *c); c->gva=gva; c->w=w; c->h=h; c->d=d; c->levels=1; c->target=GL_TEXTURE_3D; c->f=rt0->f; c->fkey=rt0->fkey; c->is_rt=1; c->scale=TS(rt0); c->bl=1; c->bh=bh; c->pitch=TD(rt0,w);
     c->swz[0]=GL_RED; c->swz[1]=GL_GREEN; c->swz[2]=GL_BLUE; c->swz[3]=GL_ALPHA;
     glGenTextures(1,&c->id); glBindTexture(GL_TEXTURE_3D,c->id); glTexStorage3D(GL_TEXTURE_3D,1,rt0->f.ifmt,TD(rt0,w),TD(rt0,h),d);
@@ -581,7 +602,7 @@ static Tex* layered_from_rts(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, u32 levels,
   if(d>1){ u64 al=512ull<<bh; lsz=(lsz+al-1)/al*al; }
   Tex* c=rt0->lay;
   if(c && (c->w!=w || c->h!=h || c->d!=d || c->levels!=levels || c->target!=target || c->fkey!=rt0->fkey)){
-    glDeleteTextures(1,&c->id); if(c->view) glDeleteTextures(1,&c->view); free(c->seen); free(c); c=rt0->lay=NULL; g_fb_sig_ok=0; g_tmap_gen++; }
+    glDeleteTextures(1,&c->id); tex_views_drop(c); free(c->seen); free(c); c=rt0->lay=NULL; g_fb_sig_ok=0; g_tmap_gen++; }
   u32 W0=TD(rt0,w), H0=TD(rt0,h);
   if(!c){ g_tmap_gen++; c=calloc(1,sizeof *c); c->gva=gva; c->w=w; c->h=h; c->d=d; c->levels=levels; c->target=target; c->f=rt0->f; c->fkey=rt0->fkey; c->is_rt=1; c->scale=TS(rt0); c->bl=1; c->bh=bh;
     c->swz[0]=GL_RED; c->swz[1]=GL_GREEN; c->swz[2]=GL_BLUE; c->swz[3]=GL_ALPHA;
@@ -784,7 +805,7 @@ static Tex* tex_from_tic_(u32* tic){
   /* a pitch shorter than a row (header version 0 texture buffers keep the high half of the width there) would make
      the upload copy rows past what it read */
   if(!bl){ u32 rowb=((w+f.bw-1)/f.bw)*f.bpp; if(pitch<rowb) pitch=rowb; }
-  { u64 est=(u64)w*h*(type==2? d : (d>0? d : 1))*(f.compressed? 1 : f.bpp); if(est>(512ull<<20)) return NULL; }
+  if(tex_storage_bytes(w,h,d,levels,type==2,&f)>(512ull<<20)) return NULL;
   u32 fkey=(tic[0]&0x7FFFF)|(srgb<<31);
   /* there's an RT at that address, use it */
   Tex* rt=tex_find_rt(gva);
@@ -814,7 +835,6 @@ static Tex* tex_from_tic_(u32* tic){
   if(target==GL_TEXTURE_3D && f.ifmt==GL_R11F_G11F_B10F && !f.compressed && !f.dec && !getenv_cached_nolut16()){
     f.ifmt=GL_RGBA16F; f.fmt=GL_RGBA; f.type=GL_HALF_FLOAT; f.dec=20; }
   if(target==GL_TEXTURE_CUBE_MAP && d!=6) target=GL_TEXTURE_2D_ARRAY;
-  if(f.astc && levels>1) levels=1;
   for(Tex* t=texh[hkey(gva)];t;t=t->next){
     if(t->gva==gva && t->w==w && t->h==h && t->d==d && t->fkey==fkey && t->target==target && !t->is_rt){
       t->last_used=g_frame;
@@ -1472,7 +1492,7 @@ static u64 st_rt_vol, st_waited; int g_draw_layered;
 
 static Tex* rt_vol(Tex* t, u32 dep, int is3d){
   GLenum tg= is3d? GL_TEXTURE_3D : GL_TEXTURE_2D_ARRAY; Tex* v=t->vol; u32 sw=TW(t), sh=TH(t);
-  if(v && (v->d!=dep || v->target!=tg || v->pitch!=sw || v->size!=sh)){ glDeleteTextures(1,&v->id); if(v->view) glDeleteTextures(1,&v->view); free(v); v=t->vol=NULL; g_fb_sig_ok=0; g_tmap_gen++; mb_reset(); }
+  if(v && (v->d!=dep || v->target!=tg || v->pitch!=sw || v->size!=sh)){ glDeleteTextures(1,&v->id); tex_views_drop(v); free(v); v=t->vol=NULL; g_fb_sig_ok=0; g_tmap_gen++; mb_reset(); }
   if(!v){ v=calloc(1,sizeof *v); v->gva=t->gva; v->w=t->w; v->h=t->h; v->d=dep; v->levels=1; v->target=tg; v->f=t->f; v->fkey=t->fkey; v->is_rt=1; v->scale=TS(t); v->gpu_written=1;
     v->bl=t->bl; v->bh=t->bh; v->pitch=sw; v->size=sh; v->swz[0]=GL_RED; v->swz[1]=GL_GREEN; v->swz[2]=GL_BLUE; v->swz[3]=GL_ALPHA;
     glGenTextures(1,&v->id); glBindTexture(tg,v->id); glTexStorage3D(tg,1,t->f.ifmt,sw,sh,dep);
@@ -2066,7 +2086,9 @@ static PFNGLTEXTUREVIEWPROC p_tview; static u64 st_tex_view;
 
 static GLuint tex_view(Tex* t, GLenum want){
   if(!p_tview || !t) return 0;
-  if(t->view && t->view_target==want) return t->view;
+  int slot=want==GL_TEXTURE_2D?0 : want==GL_TEXTURE_2D_ARRAY?1 : want==GL_TEXTURE_CUBE_MAP?2 : want==GL_TEXTURE_CUBE_MAP_ARRAY?3 : -1;
+  if(slot<0) return 0;
+  if(t->views[slot].id){ t->view=t->views[slot].id; t->view_target=want; t->vswz=t->views[slot].swz; return t->view; }
   GLenum a=t->target; u32 layers= a==GL_TEXTURE_2D? 1 : a==GL_TEXTURE_CUBE_MAP? 6 : t->d; u32 nl;
   int ok2d= a==GL_TEXTURE_2D||a==GL_TEXTURE_2D_ARRAY||a==GL_TEXTURE_CUBE_MAP||a==GL_TEXTURE_CUBE_MAP_ARRAY;
   if(!ok2d) return 0;
@@ -2075,10 +2097,9 @@ static GLuint tex_view(Tex* t, GLenum want){
   else if(want==GL_TEXTURE_CUBE_MAP_ARRAY){ if(layers<6) return 0; nl=layers/6*6; }
   else return 0;
   if(t->f.fmt==0 && !t->f.compressed) return 0;
-  if(t->view){ glDeleteTextures(1,&t->view); t->view=0; g_fb_sig_ok=0; }
   GLuint v=0; glGenTextures(1,&v); p_tview(v,want,t->id,t->f.ifmt,0,t->levels,0,nl);
   if(glGetError()!=GL_NO_ERROR){ glDeleteTextures(1,&v); return 0; }
-  t->view=v; t->view_target=want; st_tex_view++;
+  t->views[slot].id=v; t->view=v; t->view_target=want; t->vswz=t->views[slot].swz; st_tex_view++;
   t->vswz[0]=GL_RED; t->vswz[1]=GL_GREEN; t->vswz[2]=GL_BLUE; t->vswz[3]=GL_ALPHA;
   return v; }
 
@@ -3235,10 +3256,10 @@ static void present_cpu(u32* px, int w, int h){
 static u64 st_tex_evict, st_vb_evict;
 
 static void tex_free(Tex* t){
-  glDeleteTextures(1,&t->id); if(t->view) glDeleteTextures(1,&t->view); if(t->zc){ glDeleteTextures(1,&t->zc); t->zc=0; }
-  if(t->crop){ glDeleteTextures(1,&t->crop->id); if(t->crop->view) glDeleteTextures(1,&t->crop->view); free(t->crop); }
-  if(t->vol){ glDeleteTextures(1,&t->vol->id); if(t->vol->view) glDeleteTextures(1,&t->vol->view); free(t->vol); }
-  if(t->lay){ glDeleteTextures(1,&t->lay->id); if(t->lay->view) glDeleteTextures(1,&t->lay->view); free(t->lay->seen); free(t->lay); }
+  glDeleteTextures(1,&t->id); tex_views_drop(t); if(t->zc){ glDeleteTextures(1,&t->zc); t->zc=0; }
+  if(t->crop){ glDeleteTextures(1,&t->crop->id); tex_views_drop(t->crop); free(t->crop); }
+  if(t->vol){ glDeleteTextures(1,&t->vol->id); tex_views_drop(t->vol); free(t->vol); }
+  if(t->lay){ glDeleteTextures(1,&t->lay->id); tex_views_drop(t->lay); free(t->lay->seen); free(t->lay); }
   free(t); }
 
 static void gpu_evict_step(void){
@@ -3459,10 +3480,10 @@ static void rt_rescale(float ns){
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER,att,GL_TEXTURE_2D,0,0); glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,att,GL_TEXTURE_2D,0,0);
     if(g_last_present_tex==t->id) g_last_present_tex=nt;
     glDeleteTextures(1,&t->id); t->id=nt; t->scale=ns; t->wgen++; if(t->zc){ glDeleteTextures(1,&t->zc); t->zc=0; t->zc_ok=0; }
-    if(t->crop){ glDeleteTextures(1,&t->crop->id); if(t->crop->view) glDeleteTextures(1,&t->crop->view); free(t->crop); t->crop=NULL; }
+    if(t->crop){ glDeleteTextures(1,&t->crop->id); tex_views_drop(t->crop); free(t->crop); t->crop=NULL; }
     /* built cubemaps/arrays/mip chains have scaled storage too, rebuild them at the new size */
-    if(t->lay){ glDeleteTextures(1,&t->lay->id); if(t->lay->view) glDeleteTextures(1,&t->lay->view); free(t->lay->seen); free(t->lay); t->lay=NULL; }
-    if(t->view){ glDeleteTextures(1,&t->view); t->view=0; }
+    if(t->lay){ glDeleteTextures(1,&t->lay->id); tex_views_drop(t->lay); free(t->lay->seen); free(t->lay); t->lay=NULL; }
+    tex_views_drop(t);
     n++; }
   { GLenum c0=GL_COLOR_ATTACHMENT0; glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glReadBuffer(GL_COLOR_ATTACHMENT0); glBindFramebuffer(GL_DRAW_FRAMEBUFFER,g_dfbo); glDrawBuffers(1,&c0); }
   while(glGetError()!=GL_NO_ERROR){}
