@@ -1,0 +1,8 @@
+v190 graphics fixes
+
+Color masks initialized at channel creation (GBA loading UI).
+Indexed constant buffer uploads zero-fill unused data and track valid size.
+Both source code and graphical runtimes updated.
+Regression checks passed and both platform builds completed.
+Visual results in the actual games remain unverified.
+Use Update all games to apply the runtime changes to existing games.

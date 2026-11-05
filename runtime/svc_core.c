@@ -440,6 +440,14 @@ static void calendar_of(i64 t, u8* cal, u8* add){
 
 static void to_calendar(i64 t, IpcCtx* c){ u8 cal[8], add[0x18]; calendar_of(t,cal,add); outbytes(c,cal,8); outbytes(c,add,0x18); }
 
+void system_clock_context(u8* ctx){
+  i64 steady=(i64)(plat_ns()/1000000000ull), now=plat_unix_time();
+  i64 off=now-steady;
+  memcpy(ctx,&off,8);
+  memcpy(ctx+8,&steady,8);
+  memcpy(ctx+16,g_clock_id,16);
+}
+
 /* nn::time::ClockSnapshot (0xD0): user and network SystemClockContext {i64 offset; i64 time_point; u8 id[16]}, their
    posix times, calendar times and extra info (local), the steady time point, location name, the automatic correction
    flag and the type. without it the game gets a zeroed date */
