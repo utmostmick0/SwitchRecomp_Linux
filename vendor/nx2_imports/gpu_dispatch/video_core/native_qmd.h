@@ -70,7 +70,10 @@ public:
                         if (qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff))
                             return "native shader dispatch required";
                     }
-                    state.dependencies = std::int32_t((qmd[4] >> 14) & 0xffff) + state.deferred;
+                    const auto initial = std::int64_t((qmd[4] >> 14) & 0xffff) + state.deferred;
+                    if (initial > std::numeric_limits<std::int32_t>::max() || initial < std::numeric_limits<std::int32_t>::min())
+                        return "QMD dependency counter overflow";
+                    state.dependencies = static_cast<std::int32_t>(initial);
                     if (trace) trace("base", request.address, std::int32_t((qmd[4] >> 14) & 0xffff));
                     if (trace) trace("load", request.address, state.dependencies);
                     state.deferred = 0;
@@ -84,11 +87,17 @@ public:
             } else if (request.action == 7 || request.action == 12) {
                 const auto delta = request.action == 7 ? -std::int32_t(request.count) : std::int32_t(request.count);
                 if (!state.loaded || state.completed) {
-                    state.deferred += delta;
+                    const auto next = std::int64_t(state.deferred) + delta;
+                    if (next > std::numeric_limits<std::int32_t>::max() || next < std::numeric_limits<std::int32_t>::min())
+                        return "QMD deferred counter overflow";
+                    state.deferred = static_cast<std::int32_t>(next);
                     if (trace) trace("defer", request.address, state.deferred);
                     continue;
                 }
-                state.dependencies += delta;
+                const auto next = std::int64_t(state.dependencies) + delta;
+                if (next > std::numeric_limits<std::int32_t>::max() || next < std::numeric_limits<std::int32_t>::min())
+                    return "QMD dependency counter overflow";
+                state.dependencies = static_cast<std::int32_t>(next);
                 if (trace) trace("count", request.address, state.dependencies);
             } else if (request.action == 0 || request.action == 1) {
                 continue;
@@ -159,6 +168,7 @@ public:
                 state.released_slots |= Word{1} << slot;
             }
             state.completed = true;
+            if (trace) trace("complete", request.address, 1);
             if (has_dependent) {
                 pending[count++] = {Address{qmd[15]} << 8,
                                     dependent_action == 4 ? 7U : dependent_action == 3 ? 3U : 2U, 1};

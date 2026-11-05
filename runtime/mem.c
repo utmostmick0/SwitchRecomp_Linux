@@ -57,9 +57,41 @@ int mem_map(u64 a, u64 s, u32 state, u32 perm){
   MemBlock b={a,s,state,perm,0,0,0}; ins_at(i,b); merge();
   pm_unlock(&g_memlock); return 0; }
 
+static int device_overlap(u64 a,u64 s){
+  for(int i=0;i<nblk;i++) if(blk[i].dev && blk[i].addr<a+s && a<blk[i].addr+blk[i].size) return 1;
+  return 0;
+}
+
+/* The memory lock covers validation and pin publication. GPU owners keep a
+   pin until every mapping, submission and present lease has been retired. */
+static int device_pin_change(u64 a,u64 s,int acquire){
+  if(!s || (a|s)&0xfff || a>=AS_SIZE || s>AS_SIZE-a) return -1;
+  pm_lock(&g_memlock);
+  u64 cursor=a;
+  for(int i=0;i<nblk && cursor<a+s;i++){
+    MemBlock* b=&blk[i]; if(b->addr+b->size<=cursor) continue;
+    if(b->addr>cursor || (b->perm&PERM_RW)!=PERM_RW ||
+       b->state!=MS_NORMAL || (b->attr&1) ||
+       (acquire?b->dev==UINT32_MAX:b->dev==0)){
+      pm_unlock(&g_memlock); return -1;
+    }
+    cursor=b->addr+b->size; if(cursor>a+s) cursor=a+s;
+  }
+  if(cursor!=a+s){ pm_unlock(&g_memlock); return -1; }
+  split_at(a); split_at(a+s);
+  for(int i=0;i<nblk;i++) if(blk[i].addr>=a && blk[i].addr+blk[i].size<=a+s){
+    if(acquire) blk[i].dev++; else blk[i].dev--;
+  }
+  merge(); pm_unlock(&g_memlock); return 0;
+}
+int mem_device_pin(u64 a,u64 s){ return device_pin_change(a,s,1); }
+int mem_device_unpin(u64 a,u64 s){ return device_pin_change(a,s,0); }
+
 int mem_unmap(u64 a, u64 s){
+  if(a>=AS_SIZE || s>AS_SIZE-a || s>UINT64_MAX-0xfff) return -1;
   a&=~0xFFFull; s=(s+0xFFF)&~0xFFFull;
   pm_lock(&g_memlock);
+  if(a>=AS_SIZE || s>AS_SIZE-a || device_overlap(a,s)){ pm_unlock(&g_memlock); return -1; }
   split_at(a); split_at(a+s);
   for(int i=0;i<nblk;){ MemBlock* b=&blk[i]; if(b->addr>=a && b->addr+b->size<=a+s) del_at(i); else i++; }
   plat_vm_decommit(GP(a),s);
@@ -67,13 +99,18 @@ int mem_unmap(u64 a, u64 s){
   pm_unlock(&g_memlock); return 0; }
 
 int mem_set_state(u64 a, u64 s, u32 state, u32 perm){
+  if(a>=AS_SIZE || s>AS_SIZE-a || s>UINT64_MAX-0xfff) return -1;
   a&=~0xFFFull; s=(s+0xFFF)&~0xFFFull;
-  pm_lock(&g_memlock); split_at(a); split_at(a+s);
+  pm_lock(&g_memlock);
+  if(a>=AS_SIZE || s>AS_SIZE-a || device_overlap(a,s)){ pm_unlock(&g_memlock); return -1; }
+  split_at(a); split_at(a+s);
   for(int i=0;i<nblk;i++){ MemBlock* b=&blk[i]; if(b->addr>=a && b->addr+b->size<=a+s){ if(state!=0xFFFFFFFFu) b->state=state; if(perm!=0xFFFFFFFFu) b->perm=perm; } }
   merge(); pm_unlock(&g_memlock); return 0; }
 
 int mem_set_attr(u64 a, u64 s, u32 mask, u32 attr){
-  pm_lock(&g_memlock); split_at(a); split_at(a+s);
+  pm_lock(&g_memlock);
+  if(a>=AS_SIZE || s>AS_SIZE-a || device_overlap(a,s)){ pm_unlock(&g_memlock); return -1; }
+  split_at(a); split_at(a+s);
   for(int i=0;i<nblk;i++){ MemBlock* b=&blk[i]; if(b->addr>=a && b->addr+b->size<=a+s) b->attr=(b->attr&~mask)|(attr&mask); }
   merge(); pm_unlock(&g_memlock); return 0; }
 
@@ -129,14 +166,14 @@ u64 mem_heap_set(u64 size){
     int ok=!plat_vm_commit(GP(HEAP_BASE+g_heap_size),add);
     if(ok){
       int found=0;
-      for(int i=0;i<nblk;i++) if(blk[i].addr+blk[i].size==HEAP_BASE+g_heap_size && blk[i].state==MS_NORMAL && g_heap_size){ blk[i].size+=add; found=1; break; }
+      for(int i=0;i<nblk;i++) if(blk[i].addr+blk[i].size==HEAP_BASE+g_heap_size && blk[i].state==MS_NORMAL && !blk[i].dev && g_heap_size){ blk[i].size+=add; found=1; break; }
       if(!found){ int i=0; while(i<nblk && blk[i].addr<HEAP_BASE+g_heap_size) i++; MemBlock b={HEAP_BASE+g_heap_size,add,MS_NORMAL,PERM_RW,0,0,0}; ins_at(i,b); }
       merge();
     }
     pm_unlock(&g_memlock);
     if(!ok) return 0;
   } else if(size<g_heap_size){
-    mem_unmap(HEAP_BASE+size,g_heap_size-size);
+    if(mem_unmap(HEAP_BASE+size,g_heap_size-size)) return 0;
   }
   g_heap_size=size;
   return HEAP_BASE;

@@ -15,6 +15,8 @@
 #ifdef SWR_NS2_SHADER
 #include "ns2_shader.h"
 #endif
+#include "native_qmd.h"
+#include "native_gpu.h"
 
 int g_gl=0;                     /* active renderer */
 static int g_gl_ready;
@@ -48,9 +50,9 @@ static float fabsf_(float x){ return x<0? -x : x; }
 u32 fmt_bpp_2d(u32 f);
 
 /* ============================================================ work queue */
-enum { WK_SUBMIT, WK_PRESENT_CPU, WK_PRESENT_ADDR, WK_SHOT, WK_SYNC, WK_DUMP };
+enum { WK_SUBMIT, WK_PRESENT_CPU, WK_PRESENT_ADDR, WK_SHOT, WK_SYNC, WK_DUMP, WK_NATIVE_QMD, WK_NATIVE_RGBA };
 
-typedef struct { int kind; u64* ent; u32 n, syncpt, incs, wait_id, wait_val; u32* px; int w,h; u64 addr; u32 fmt; PCond* done_cv; volatile int* done; char path[256]; u64 result; u64 sub_ns; } Work;
+typedef struct { int kind; u64* ent; u32 n, syncpt, incs, wait_id, wait_val; u32* px; int w,h; u64 addr; u32 fmt; PCond* done_cv; volatile int* done; char path[256]; u64 result; u64 sub_ns; NativeGpuWorker* native_worker; GpuChannel* native_channel; void (*native_done)(void*,int); void* native_context; } Work;
 
 #define QN 1024
 static Work q[QN]; static int qh, qt; static PMutex g_ql; static PCond g_qcv, g_qspace;
@@ -3292,7 +3294,7 @@ static int present_addr(u64 cpu_addr, int w, int h){
   return 0; }
 
 /* ============================================================ GPU thread */
-extern void gpu_submit_now(u64* e, u32 n, u32 channel);
+extern int gpu_submit_now(u64* e, u32 n, u32 channel);
 static u64 g_last_shot_hash; static u32 g_shot_done;   /* sequence number of the last screenshot taken */
 static void do_screenshot(const char* path){
   int w=g_last_w? g_last_w : 1280, h=g_last_h? g_last_h : 720; if(g_last_is_rt){ w=(int)SC((u32)w); h=(int)SC((u32)h); }
@@ -3655,7 +3657,18 @@ static void gpu_thread(void* arg){ t_gpu_thread=1;
       case WK_SUBMIT: g_submit_epoch++; ww_poll(); { extern volatile u64 g_gpu_sub_ns; static u32 fr=~0u; if(fr!=g_frame || !g_gpu_sub_ns){ fr=g_frame; g_gpu_sub_ns=w.sub_ns; } }   /* stamp the whole frame with the time of its first submit */
         if(w.wait_id!=~0u){ extern int syncpt_wait(u32,u32,i64); extern void gpu_gl_before_syncwait(void); gpu_gl_before_syncwait();
           if(!syncpt_wait(w.wait_id,w.wait_val,2000000000)){ static int nl; if(nl<6){ nl++; LOG("gpu: submit fence %u >= %u never came (2 s), running it anyway\n",w.wait_id,w.wait_val); } } }
-        gpu_submit_now(w.ent,w.n,w.syncpt); cs_kick_async(); free(w.ent); cs_submit_done(w.syncpt,w.incs); break;
+        { int accepted=gpu_submit_now(w.ent,w.n,w.syncpt); cs_kick_async(); free(w.ent); if(accepted) cs_submit_done(w.syncpt,w.incs); } break;
+#ifdef SWR_NS2_SHADER
+      case WK_NATIVE_QMD:
+        native_worker_execute(w.native_worker,w.native_channel,w.addr,w.n,w.syncpt); break;
+      case WK_NATIVE_RGBA: {
+        int ok=glGetError()==GL_NO_ERROR;
+        if(ok){ present_cpu(w.px,w.w,w.h); glFinish(); ok=glGetError()==GL_NO_ERROR; }
+        free(w.px);
+        if(ok){ g_frame++; gmem_ptr_frame_advance(); frame_stats(); trace_frame(); }
+        w.native_done(w.native_context,ok); break;
+      }
+#endif
       case WK_PRESENT_CPU: if(g_skip_frame){ free(w.px); g_frame++; gmem_ptr_frame_advance(); g_skip_frame= g_frame%(frame_skip_count()+1); break; }
         g_present_guest_ns=w.sub_ns; trace_note("PRESENT CPU image %dx%d\n",w.w,w.h); present_cpu(w.px,w.w,w.h); free(w.px); g_frame++; gmem_ptr_frame_advance(); g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); gpu_evict_step(); frame_stats(); trace_frame(); break;
       case WK_PRESENT_ADDR: if(g_skip_frame){ g_frame++; gmem_ptr_frame_advance(); g_skip_frame= frame_skip_count() && g_frame%(frame_skip_count()+1); break; }
@@ -3674,6 +3687,26 @@ void gpu_gl_start(void){
   if(plat_thread(gpu_thread,NULL,64u<<20)) fatal("could not create the GPU thread");
   while(!g_gl_ready) plat_sleep_ns(1000000);
 }
+
+#ifdef SWR_NS2_SHADER
+int gpu_native_queue_qmd(NativeGpuWorker* worker,GpuChannel* channel,u64 address,u32 action,u32 lease){
+  if(!g_gl || !g_gl_ready || g_quit || !worker || !channel) return 0;
+  Work job={0}; job.kind=WK_NATIVE_QMD; job.native_worker=worker; job.native_channel=channel;
+  job.addr=address; job.n=action; job.syncpt=lease; q_push(&job); return 1;
+}
+int gpu_native_queue_rgba(u64 cpu,u32 width,u32 height,u32 pitch,void (*done)(void*,int),void* context){
+  if(!g_gl || !g_gl_ready || g_quit || !done || !width || !height || width>4096 || height>4096 || pitch<(u64)width*4) return 0;
+  u64 span=(u64)(height-1)*pitch+(u64)width*4;
+  if(cpu>=AS_SIZE || span>AS_SIZE-cpu) return 0;
+  Work job={0}; job.kind=WK_NATIVE_RGBA; job.w=(int)width; job.h=(int)height;
+  job.native_done=done; job.native_context=context;
+  job.px=malloc((size_t)width*height*4); if(!job.px) return 0;
+  /* The VI owner retains the source lease through the callback. Snapshot
+     CPU pixels now; queued presentation owns its independent copy. */
+  for(u32 y=0;y<height;y++) memcpy(job.px+(size_t)y*width,GP(cpu+(u64)y*pitch),(size_t)width*4);
+  q_push(&job); return 1;
+}
+#endif
 
 /* requests from other threads */
 int gpu_async_submit(u64* e, u32 n, u32 syncpt, u32 incs, u32 wait_id, u32 wait_val){
@@ -3917,26 +3950,49 @@ static u8 g_cs_cb_[8][0x10000]; static u32 g_cs_cbn[8];
 
 static int cs_cb_read(u32 idx, u32 off, u32* out){ if(idx<8 && off+4<=g_cs_cbn[idx]){ memcpy(out,g_cs_cb_[idx]+off,4); return 1; } return 0; }
 
-void gpu_gl_dispatch(GpuChannel* ch, const u32* q, u64 code){
-  if(getenv("SWR_NO_COMPUTE")) return;
+static int gpu_gl_dispatch_impl(GpuChannel* ch, const u32* q, u64 code,
+    const SwrNativeLaunch* native,SwrNativeRead read,void* read_context){
+  if(getenv("SWR_NO_COMPUTE")) return 0;
   extern void r3d_pending_flush(void); r3d_pending_flush();
-  u32* rc=ch->rcomp; u64 prog=code+q[8];
+  u32* rc=ch->rcomp; u64 prog=native?native->program:code+q[8];
   u32 gx=q[12]&0x7FFFFFFF, gy=q[13]&0xFFFF, gz=q[13]>>16, lx=q[18]>>16, ly=q[19]&0xFFFF, lz=q[19]>>16, shm=q[17]&0x3FFFF;
-  if(!gx || !gy || !gz || !lx || !ly || !lz) return;
+  if(native){
+    gx=native->grid[0]; gy=native->grid[1]; gz=native->grid[2];
+    lx=native->block[0]; ly=native->block[1]; lz=native->block[2]; shm=native->shared_bytes;
+    /* Conservative GL 4.3 guaranteed limits for the first synchronous path. */
+    if(!read || native->local_pos_bytes || native->local_crs_bytes || native->linked_tsc ||
+       gx>65535 || gy>65535 || gz>65535 || lx>1024 || ly>1024 || lz>64 ||
+       (u64)lx*ly*lz>1024 || shm>32768) return 0;
+  }
+  if(!gx || !gy || !gz || !lx || !ly || !lz) return 0;
+  int native_shader=native || native_shader_mode();
   /* cbufs from the QMD */
   u64 cba[8]={0};
-  for(int i=0;i<8;i++) if((q[20]>>i)&1){ cba[i]=((u64)(q[30+2*i]&0xFF)<<32)|q[29+2*i]; u32 sz=(q[30+2*i]>>15)&0x1FFFF; if(!sz || sz>0x10000) sz=0x10000;
-    g_cs_cbn[i]=sz; gmem_read(cba[i],g_cs_cb_[i],sz); } else g_cs_cbn[i]=0;
+  for(int i=0;i<8;i++){
+    if(native){
+      g_cs_cbn[i]=0;
+      if(native->cbuf[i].enabled){
+        u32 size=native->cbuf[i].size; if(!size || size>0x10000) return 0;
+        cba[i]=native->cbuf[i].address;
+        if(!read(read_context,cba[i],g_cs_cb_[i],size)) return 0;
+        g_cs_cbn[i]=size;
+      }
+    } else if((q[20]>>i)&1){
+      cba[i]=((u64)(q[30+2*i]&0xFF)<<32)|q[29+2*i]; u32 sz=(q[30+2*i]>>15)&0x1FFFF;
+      if(!sz || sz>0x10000) sz=0x10000;
+      g_cs_cbn[i]=sz; gmem_read(cba[i],g_cs_cb_[i],sz);
+    } else g_cs_cbn[i]=0;
+  }
   static u8 buf[0x10000+80];
-  memset(buf,0,80); if(!native_shader_mode()) gmem_read(prog,buf+80,0x10000);
-  u64 key=(native_shader_mode()?0:fast_hash(buf+80,0x4000,0))^((u64)lx<<40)^((u64)ly<<48)^((u64)lz<<56)^((u64)shm<<20);
+  memset(buf,0,80); if(!native_shader) gmem_read(prog,buf+80,0x10000);
+  u64 key=(native_shader?0:fast_hash(buf+80,0x4000,0))^((u64)lx<<40)^((u64)ly<<48)^((u64)lz<<56)^((u64)shm<<20);
   u8* shader_code=buf; u32 shader_size=sizeof buf; u8* native_code=NULL;
 #ifdef SWR_NS2_SHADER
-  if(native_shader_mode()){
+  if(native_shader){
     SwrNs2Shader image;
-    if(!swr_ns2_shader_capture(prog,1,native_shader_read,NULL,&image)){
+    if(!swr_ns2_shader_capture(prog,1,native?read:native_shader_read,native?read_context:NULL,&image)){
       static int warned; if(warned++<32) WARN("native compute shader %llx rejected at +%#x: %s\n",(unsigned long long)prog,image.error_offset,image.error);
-      st_cs_fail++; return;
+      st_cs_fail++; return 0;
     }
     native_code=shader_code=image.code; shader_size=image.size;
     key=fast_hash(shader_code,shader_size,0)^0x4e5332434f4d5031ULL^((u64)lx<<40)^((u64)ly<<48)^((u64)lz<<56)^((u64)shm<<20);
@@ -3958,7 +4014,16 @@ void gpu_gl_dispatch(GpuChannel* ch, const u32* q, u64 code){
     if(src && getenv("SWR_DUMP_SHADERS")){ char pth[128]; snprintf(pth,sizeof pth,"shader_%016llx_cs.glsl",(unsigned long long)key); FILE* f=fopen(pth,"w"); if(f){ fputs(src,f); fclose(f); } }
     p->src=src; }   /* kept for F5 traces */
   free(native_code);
-  if(p->failed || !p->prog){ st_cs_fail++; trace_note("COMPUTE %016llx (not translated: %d, first %s)\n",(unsigned long long)key,p->si.unsupported,p->si.first_unsupported); return; }
+  if(p->failed || !p->prog){ st_cs_fail++; trace_note("COMPUTE %016llx (not translated: %d, first %s)\n",(unsigned long long)key,p->si.unsupported,p->si.first_unsupported); return 0; }
+  if(native){
+    /* Storage/images need a native descriptor/resource plan and bounds. Until
+       then only shared/local ALU and bounded constants are executable here. */
+    if(p->si.ngbuf || p->si.ntex || p->si.nimg || p->si.uses_global || p->si.uses_local ||
+       p->si.cbuf_indirect_mask || p->si.gbuf_wmask ||
+       (p->si.cbuf_mask&~255u)) return 0;
+    for(int i=0;i<8;i++) if((p->si.cbuf_mask&(1u<<i)) &&
+        (!native->cbuf[i].enabled || p->si.cbuf_max[i]>native->cbuf[i].size)) return 0;
+  }
   glUseProgram(p->prog); g_pipe_on=0;
   /* cbufs at binding 36+i (translator's 'other stages' range) */
   static GLuint ub[8]; for(int i=0;i<8;i++) if(p->si.cbuf_mask&(1u<<i)){ if(!ub[i]) glGenBuffers(1,&ub[i]);
@@ -4012,6 +4077,7 @@ void gpu_gl_dispatch(GpuChannel* ch, const u32* q, u64 code){
     if(!wmb) glGenBuffers(1,&wmb);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER,wmb); glBufferData(GL_SHADER_STORAGE_BUFFER,nw*4,wm,GL_DYNAMIC_COPY); glBindBufferBase(GL_SHADER_STORAGE_BUFFER,p->si.ngbuf,wmb); }
   if(g_gp_cs.on){ u64 mbs=0; for(int i=0;i<p->si.ngbuf && i<16;i++) mbs+=ss[i]; g_gp_p[g_gp_n-1].mb=(u32)((mbs+(1u<<19))>>20); }
+  if(native && glGetError()!=GL_NO_ERROR){ gp_compute_end(); glUseProgram(0); state_dirty(); return 0; }
   glDispatchCompute(gx,gy,gz); st_cs_run++;
   if(nimg_ok) glMemoryBarrier(0x20|0x08|0x100|0x400|0x80);   /* images -> textures, copies, fbos */
   trace_note("COMPUTE %016llx grid %ux%ux%u block %ux%ux%u buffers %d (writes %x)\n",(unsigned long long)key,gx,gy,gz,lx,ly,lz,p->si.ngbuf,p->si.gbuf_wmask);
@@ -4022,4 +4088,23 @@ void gpu_gl_dispatch(GpuChannel* ch, const u32* q, u64 code){
     /* fresh SSBOs for the next dispatch so it doesn't wait on these */
     for(int i=0;i<p->si.ngbuf && i<16;i++) if((p->si.gbuf_wmask>>i)&1){ glDeleteBuffers(1,&sb[i]); sb[i]=0; } }
   gp_compute_end();
-  glUseProgram(0); state_dirty(); }
+  glUseProgram(0); state_dirty();
+  if(native){
+    /* Releases are CPU writes below the QMD scheduler; wait for genuine
+       execution here instead of feeding native jobs to timeout-forced fences. */
+    glMemoryBarrier(0xffffffffu); glFinish();
+    if(glGetError()!=GL_NO_ERROR) return 0;
+  }
+  return 1;
+}
+
+void gpu_gl_dispatch(GpuChannel* ch,const u32* q,u64 code){
+  gpu_gl_dispatch_impl(ch,q,code,NULL,NULL,NULL);
+}
+#ifdef SWR_NS2_SHADER
+int gpu_gl_dispatch_native(GpuChannel* ch,const SwrNativeLaunch* launch,SwrNativeRead read,void* context){
+  if(!g_gl || !ch || !launch) return 0;
+  const u32 unused[64]={0};
+  return gpu_gl_dispatch_impl(ch,unused,0,launch,read,context);
+}
+#endif

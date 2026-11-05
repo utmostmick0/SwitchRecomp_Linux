@@ -474,16 +474,17 @@ static u32 svc_map_memory(u64 dst, u64 src, u64 size){
   /* mem_map checks that the range is free under the memory lock */
   { int r=mem_map(dst,size,in_stack? MS_STACK : MS_NORMAL,PERM_RW); if(r) return r==-1? R_BADMEMSTATE : R_OUTOFMEM; }
   memcpy(GP(dst),GP(src),size);
-  mem_set_attr(src,size,1,1);         /* locked */
-  mem_set_state(src,size,0xFFFFFFFFu,PERM_NONE);
+  if(mem_set_attr(src,size,1,1)){ mem_unmap(dst,size); return R_BADMEMSTATE; }
+  if(mem_set_state(src,size,0xFFFFFFFFu,PERM_NONE)){
+    mem_set_attr(src,size,1,0); mem_unmap(dst,size); return R_BADMEMSTATE;
+  }
   return 0; }
 
 static u32 svc_unmap_memory(u64 dst, u64 src, u64 size){
   if((dst|src|size)&0xFFF || !size) return R_BADADDR;
   memcpy(GP(src),GP(dst),size);
-  mem_unmap(dst,size);
-  mem_set_attr(src,size,1,0);
-  mem_set_state(src,size,0xFFFFFFFFu,PERM_RW);
+  if(mem_unmap(dst,size)) return R_BADMEMSTATE;
+  if(mem_set_attr(src,size,1,0) || mem_set_state(src,size,0xFFFFFFFFu,PERM_RW)) return R_BADMEMSTATE;
   return 0; }
 
 static void shm_destroy(KObj* o){ KShmem* s=(KShmem*)o; if(!s->gaddr) free(s->host); free(o->waiters); free(s); }
@@ -506,7 +507,7 @@ static u32 svc_map_shm(u32 h, u64 addr, u64 size, u32 perm){
 static u32 svc_unmap_shm(u32 h, u64 addr, u64 size){
   KShmem* s=(KShmem*)h_get_type(h,KO_SHMEM); if(!s) return R_BADHANDLE;
   if(s->gaddr==addr){ memcpy(s->host,GP(addr),s->size); s->gaddr=0; }
-  mem_unmap(addr,size); return 0; }
+  return mem_unmap(addr,size)?R_BADMEMSTATE:0; }
 
 static void tmem_destroy(KObj* o){ KTmem* t=(KTmem*)o; mem_set_state(t->addr,t->size,0xFFFFFFFFu,PERM_RW); free(o->waiters); free(o); }
 
@@ -784,8 +785,8 @@ static void swr_svc_(CPU* c, u32 imm){
   u64* x=c->x;
   switch(imm){
   case 0x01: { u64 a=mem_heap_set(x[1]); if(!a && x[1]){ x[0]=R_OUTOFMEM; return; } x[0]=0; x[1]=HEAP_BASE; return; }
-  case 0x02: mem_set_state(x[0],x[1],0xFFFFFFFFu,(u32)x[2]); x[0]=0; return;
-  case 0x03: mem_set_attr(x[0],x[1],(u32)x[2],(u32)x[3]); x[0]=0; return;
+  case 0x02: x[0]=mem_set_state(x[0],x[1],0xFFFFFFFFu,(u32)x[2])?R_BADMEMSTATE:0; return;
+  case 0x03: x[0]=mem_set_attr(x[0],x[1],(u32)x[2],(u32)x[3])?R_BADMEMSTATE:0; return;
   case 0x04: x[0]=svc_map_memory(x[0],x[1],x[2]); return;
   case 0x05: x[0]=svc_unmap_memory(x[0],x[1],x[2]); return;
   case 0x06: x[0]=svc_query(x[0],x[2]); x[1]=0; return;
@@ -883,9 +884,11 @@ static void swr_svc_(CPU* c, u32 imm){
       if(b.state==MS_FREE){ if(mem_map(p,e-p,MS_NORMAL,PERM_RW)){ x[0]=R_OUTOFMEM; return; } g_phys_mapped+=e-p; } p=e; }
     x[0]=0; return; }
   case 0x2D: { u64 a=x[0], s=x[1];
+    u64 removed=0;
     for(u64 p=a;p<a+s;){ MemBlock b; mem_query(p,&b); u64 e=b.addr+b.size; if(e>a+s) e=a+s; if(e<=p) break;
-      if(b.state==MS_NORMAL){ u64 n=e-p; g_phys_mapped= g_phys_mapped>n? g_phys_mapped-n : 0; } p=e; }
-    mem_unmap(a,s); x[0]=0; return; }
+      if(b.state==MS_NORMAL) removed+=e-p; p=e; }
+    if(mem_unmap(a,s)){ x[0]=R_BADMEMSTATE; return; }
+    g_phys_mapped=g_phys_mapped>removed?g_phys_mapped-removed:0; x[0]=0; return; }
   case 0x2E: x[0]=R_NOTFOUND; return;
   case 0x2F: x[0]=R_NOTFOUND; return;
   case 0x30: case 0x37: { u32 which=(u32)x[2]; x[0]=0; x[1]= which==0? mem_total() : which==1? 800 : which==2? 800 : which==3? 256 : 64; return; }

@@ -3,42 +3,241 @@
    Forks and derived works have to keep the credit to SwitchRecomp by MZ Labs and the startup screen. */
 /* nvdrv: nvmap, nvhost-as-gpu, nvhost-ctrl, nvhost-ctrl-gpu, nvhost-gpu. enough for NVN and deko3d */
 #include "rt.h"
+#include "native_gpu.h"
 
 /* ============================================================ nvmap */
-typedef struct { u32 size, align, heap, flags; u8 kind; u64 addr; u32 id; int alive; } NvMapH;
+typedef struct { u64 size; u32 align, heap, flags; u8 kind; u64 addr; u32 id; int alive; u64 native_owner; u32 native_refs,native_map_refs; } NvMapH;
 
 static NvMapH nvh[8192]; static u32 nvh_next=1; static PMutex g_nvlock;
+typedef struct { u64 owner,address,size; u32 memory,uses; } NativeMap;
+typedef struct { u64 owner; u32 id,map; } NativeLease;
+static NativeMap native_maps[4096];
+static NativeLease native_leases[4096];
+static u64 native_owners[128],native_owner_next;
+static u32 native_owner_refs[128];
+static u32 native_id_next=0x80000000u,native_lease_next;
+static u32 nvmap_slot(void){
+  if(nvh_next<8192) return nvh_next++;
+  for(u32 i=1;i<8192;i++) if(!nvh[i].alive) return i;
+  return 0;
+}
+static int native_overlap(u64 address,u64 size){
+  for(unsigned i=0;i<4096;i++) if(native_maps[i].owner &&
+      address<native_maps[i].address+native_maps[i].size && native_maps[i].address<address+size) return 1;
+  return 0;
+}
 
-u64 nvmap_addr(u32 h){ if(h>=8192) return 0; return nvh[h].addr; }
+u64 nvmap_addr(u32 h){ if(h>=8192 || nvh[h].native_owner) return 0; return nvh[h].addr; }
 
-u32 nvmap_size(u32 h){ if(h>=8192) return 0; return nvh[h].size; }
+u32 nvmap_size(u32 h){ if(h>=8192 || nvh[h].native_owner) return 0; return (u32)nvh[h].size; }
 
 static u32 nvmap_from_id(u32 id){ for(u32 i=1;i<nvh_next;i++) if(nvh[i].alive && nvh[i].id==id) return i; return 0; }
 
 u64 nvmap_addr_by_id(u32 id){ u32 h=nvmap_from_id(id); if(!h) h=id<8192? id : 0; return nvmap_addr(h); }
 
-/* ============================================================ GPU VA space (40 bit) */
+/* ============================================================ GPU VA space (49 bit) */
 
 /* two level table, gva -> guest address, 4K granularity */
 #define GPAGE_BITS 12
 #define GL1 (1u<<16)     /* 40-12 = 28 bits, split 16 + 12 */
-static u64** gmmu; /* gmmu[i] -> 4096 entries of (guest addr | 1) */
+static u64** gmmu; /* low 40-bit bank, retained for the existing NS1 layout */
+static u64** gmmu_high[511]; /* remaining nine address bits; allocated sparsely */
 static u32 gmmu_gen;
 u32 gmmu_generation(void){ return __atomic_load_n(&gmmu_gen,__ATOMIC_ACQUIRE); }
+static u64** gmmu_bank(u64 address,int create){
+  if(address>=(1ull<<49)) return NULL;
+  u32 bank=(u32)(address>>40);
+  u64*** slot=bank?&gmmu_high[bank-1]:&gmmu;
+  u64** table=__atomic_load_n(slot,__ATOMIC_ACQUIRE);
+  if(!table && create){
+    u64** fresh=calloc(GL1,sizeof *fresh); if(!fresh) return NULL;
+    if(!__atomic_compare_exchange_n(slot,&table,fresh,0,__ATOMIC_RELEASE,__ATOMIC_ACQUIRE)) free(fresh);
+    else table=fresh;
+  }
+  return table;
+}
 u64 gmmu_translate(u64 gva){
+  u64** bank=gmmu_bank(gva,0); if(!bank) return 0;
   u64 p=gva>>GPAGE_BITS; u32 i=(u32)(p>>12)&(GL1-1), j=(u32)p&0xFFF;
-  u64* t=gmmu[i]; if(!t) return 0; u64 e=t[j]; if(!(e&1)) return 0; return (e&~1ull)+(gva&0xFFF); }
+  u64* t=__atomic_load_n(&bank[i],__ATOMIC_ACQUIRE); if(!t) return 0;
+  u64 e=__atomic_load_n(&t[j],__ATOMIC_ACQUIRE); if(!(e&1)) return 0; return (e&~1ull)+(gva&0xFFF); }
 
-static void gmmu_map(u64 gva, u64 cpu, u64 size){
+static int gmmu_map_impl(u64 gva, u64 cpu, u64 size){
+  if(gva>=(1ull<<49) || size>(1ull<<49)-gva || cpu>=AS_SIZE || size>AS_SIZE-cpu) return 0;
+  /* Allocate every page-table node before publishing any mapping. A failed
+     allocation must not leave half of a native memory transaction installed. */
+  for(u64 o=0;o<size;o+=0x1000){
+    u64** bank=gmmu_bank(gva+o,1); if(!bank) return 0;
+    u32 i=(u32)((gva+o)>>24)&(GL1-1);
+    if(!__atomic_load_n(&bank[i],__ATOMIC_ACQUIRE)){
+      u64* fresh=calloc(4096,sizeof *fresh); if(!fresh) return 0; u64* expected=NULL;
+      if(!__atomic_compare_exchange_n(&bank[i],&expected,fresh,0,__ATOMIC_RELEASE,__ATOMIC_ACQUIRE)) free(fresh);
+    }
+  }
   if(size) __atomic_add_fetch(&gmmu_gen,1,__ATOMIC_ACQ_REL); /* odd: a mapping update is in progress */
   for(u64 o=0;o<size;o+=0x1000){ u64 p=(gva+o)>>GPAGE_BITS; u32 i=(u32)(p>>12)&(GL1-1), j=(u32)p&0xFFF;
-    if(!gmmu[i]) gmmu[i]=calloc(4096,8); gmmu[i][j]=(cpu+o)|1; }
-  if(size) __atomic_add_fetch(&gmmu_gen,1,__ATOMIC_RELEASE); /* even: mapping is stable */ }
+    u64** bank=gmmu_bank(gva+o,0); __atomic_store_n(&bank[i][j],(cpu+o)|1,__ATOMIC_RELEASE); }
+  if(size) __atomic_add_fetch(&gmmu_gen,1,__ATOMIC_RELEASE); /* even: mapping is stable */
+  return 1; }
 
-static void gmmu_unmap(u64 gva, u64 size){
+static void gmmu_unmap_impl(u64 gva, u64 size){
+  if(gva>=(1ull<<49) || size>(1ull<<49)-gva) return;
   if(size) __atomic_add_fetch(&gmmu_gen,1,__ATOMIC_ACQ_REL);
-  for(u64 o=0;o<size;o+=0x1000){ u64 p=(gva+o)>>GPAGE_BITS; u32 i=(u32)(p>>12)&(GL1-1), j=(u32)p&0xFFF; if(gmmu[i]) gmmu[i][j]=0; }
+  for(u64 o=0;o<size;o+=0x1000){ u64 p=(gva+o)>>GPAGE_BITS; u32 i=(u32)(p>>12)&(GL1-1), j=(u32)p&0xFFF;
+    u64** bank=gmmu_bank(gva+o,0); u64* table=bank?__atomic_load_n(&bank[i],__ATOMIC_ACQUIRE):NULL;
+    if(table) __atomic_store_n(&table[j],0,__ATOMIC_RELEASE); }
   if(size) __atomic_add_fetch(&gmmu_gen,1,__ATOMIC_RELEASE); }
+
+/* Serialize writers so the generation's odd/even contract remains meaningful.
+   Legacy NVDRV calls cannot overwrite or unmap a native owner's allocation. */
+static int gmmu_map(u64 gva,u64 cpu,u64 size){
+  if(gva>=(1ull<<49) || size>(1ull<<49)-gva) return 0;
+  pm_lock(&g_nvlock); int ok=!native_overlap(gva,size) && gmmu_map_impl(gva,cpu,size);
+  pm_unlock(&g_nvlock); return ok;
+}
+static int gmmu_unmap(u64 gva,u64 size){
+  if(gva>=(1ull<<49) || size>(1ull<<49)-gva) return 0;
+  pm_lock(&g_nvlock); int ok=!native_overlap(gva,size);
+  if(ok) gmmu_unmap_impl(gva,size); pm_unlock(&g_nvlock); return ok;
+}
+
+static int native_owner_valid(u64 owner){
+  if(!owner) return 0;
+  for(unsigned i=0;i<128;i++) if(native_owners[i]==owner) return 1;
+  return 0;
+}
+static u32 native_memory(u64 owner,u32 id){
+  if(!native_owner_valid(owner)) return 0;
+  u32 h=nvmap_from_id(id);
+  return h && nvh[h].native_owner==owner && nvh[h].native_refs?h:0;
+}
+u64 nv_native_owner_open(void){
+  pm_lock(&g_nvlock); u64 owner=0;
+  if(native_owner_next!=UINT64_MAX) for(unsigned i=0;i<128;i++) if(!native_owners[i]){
+    owner=native_owners[i]=++native_owner_next; native_owner_refs[i]=1; break;
+  }
+  pm_unlock(&g_nvlock); return owner;
+}
+int nv_native_owner_close(u64 owner){
+  pm_lock(&g_nvlock);
+  if(!native_owner_valid(owner)){ pm_unlock(&g_nvlock); return NG_NOT_FOUND; }
+  for(unsigned i=0;i<128;i++) if(native_owners[i]==owner && native_owner_refs[i]!=1){ pm_unlock(&g_nvlock); return NG_BUSY; }
+  for(u32 h=1;h<nvh_next;h++) if(nvh[h].alive && nvh[h].native_owner==owner){ pm_unlock(&g_nvlock); return NG_BUSY; }
+  for(unsigned i=0;i<128;i++) if(native_owners[i]==owner) native_owners[i]=0;
+  pm_unlock(&g_nvlock); return NG_OK;
+}
+int nv_native_owner_retain(u64 owner){
+  pm_lock(&g_nvlock); int result=NG_NOT_FOUND;
+  for(unsigned i=0;owner && i<128;i++) if(native_owners[i]==owner){
+    result=NG_LIMIT; if(native_owner_refs[i]!=UINT32_MAX){ native_owner_refs[i]++; result=NG_OK; } break;
+  }
+  pm_unlock(&g_nvlock); return result;
+}
+int nv_native_owner_drop(u64 owner){
+  pm_lock(&g_nvlock); int result=NG_NOT_FOUND;
+  for(unsigned i=0;owner && i<128;i++) if(native_owners[i]==owner){
+    result=NG_INVALID; if(native_owner_refs[i]>1){ native_owner_refs[i]--; result=NG_OK; } break;
+  }
+  pm_unlock(&g_nvlock); return result;
+}
+int nv_native_memory_register(u64 owner,u64 address,u64 size,u32* out){
+  if(!out || !address || !size || (address|size)&0xfff || size>(12ull<<30) || address>=AS_SIZE || size>AS_SIZE-address) return NG_INVALID;
+  pm_lock(&g_nvlock);
+  if(!native_owner_valid(owner)){ pm_unlock(&g_nvlock); return NG_NOT_FOUND; }
+  if(native_id_next==UINT32_MAX){ pm_unlock(&g_nvlock); return NG_LIMIT; }
+  if(mem_device_pin(address,size)){ pm_unlock(&g_nvlock); return NG_UNMAPPED; }
+  u32 h=nvmap_slot();
+  if(!h){ mem_device_unpin(address,size); pm_unlock(&g_nvlock); return NG_LIMIT; }
+  NvMapH* memory=&nvh[h]; memset(memory,0,sizeof *memory);
+  memory->size=size; memory->addr=address; memory->align=0x1000;
+  memory->id=++native_id_next; memory->alive=1; memory->native_owner=owner; memory->native_refs=1;
+  *out=memory->id; pm_unlock(&g_nvlock); return NG_OK;
+}
+int nv_native_memory_info(u64 owner,u32 id,u64* address,u64* size){
+  if(!address || !size) return NG_INVALID;
+  pm_lock(&g_nvlock); u32 h=native_memory(owner,id);
+  if(h){ *address=nvh[h].addr; *size=nvh[h].size; }
+  pm_unlock(&g_nvlock); return h?NG_OK:NG_NOT_FOUND;
+}
+int nv_native_memory_retain(u64 owner,u32 id){
+  pm_lock(&g_nvlock); u32 h=native_memory(owner,id); int result=NG_NOT_FOUND;
+  if(h){ result=NG_LIMIT; if(nvh[h].native_refs!=UINT32_MAX){ nvh[h].native_refs++; result=NG_OK; } }
+  pm_unlock(&g_nvlock); return result;
+}
+int nv_native_memory_release(u64 owner,u32 id){
+  pm_lock(&g_nvlock); u32 h=native_memory(owner,id); int result=NG_NOT_FOUND;
+  if(h){
+    result=NG_OK;
+    if(nvh[h].native_refs==1 && !nvh[h].native_map_refs && mem_device_unpin(nvh[h].addr,nvh[h].size)) result=NG_BUSY;
+    else if(!--nvh[h].native_refs && !nvh[h].native_map_refs) memset(&nvh[h],0,sizeof nvh[h]);
+  }
+  pm_unlock(&g_nvlock); return result;
+}
+int nv_native_map(u64 owner,u32 id,u64 gpu,u64 offset,u64 size){
+  if(!size || (gpu|offset|size)&0xfff || gpu>=(1ull<<49) || size>(1ull<<49)-gpu) return NG_INVALID;
+  pm_lock(&g_nvlock); u32 h=native_memory(owner,id);
+  if(!h){ pm_unlock(&g_nvlock); return NG_NOT_FOUND; }
+  if(offset>nvh[h].size || size>nvh[h].size-offset){ pm_unlock(&g_nvlock); return NG_INVALID; }
+  int slot=-1;
+  for(unsigned i=0;i<4096;i++) if(!native_maps[i].owner){ slot=(int)i; break; }
+  if(slot<0 || nvh[h].native_map_refs==UINT32_MAX){ pm_unlock(&g_nvlock); return NG_LIMIT; }
+  for(u64 off=0;off<size;off+=0x1000) if(gmmu_translate(gpu+off)){ pm_unlock(&g_nvlock); return NG_BUSY; }
+  if(!gmmu_map_impl(gpu,nvh[h].addr+offset,size)){ pm_unlock(&g_nvlock); return NG_LIMIT; }
+  nvh[h].native_map_refs++;
+  native_maps[slot]=(NativeMap){owner,gpu,size,h,0};
+  pm_unlock(&g_nvlock); return NG_OK;
+}
+int nv_native_unmap(u64 owner,u64 gpu,u64 size){
+  pm_lock(&g_nvlock); int result=NG_NOT_FOUND;
+  if(native_owner_valid(owner)) for(unsigned i=0;i<4096;i++){
+    NativeMap* map=&native_maps[i];
+    if(map->owner==owner && map->address==gpu && map->size==size){
+      if(map->uses){ result=NG_BUSY; break; }
+      NvMapH* memory=&nvh[map->memory];
+      /* The mapping owns the final physical pin if its guest handle is gone. */
+      if(!memory->native_refs && memory->native_map_refs==1 && mem_device_unpin(memory->addr,memory->size)){ result=NG_BUSY; break; }
+      gmmu_unmap_impl(gpu,size);
+      if(!--memory->native_map_refs && !memory->native_refs) memset(memory,0,sizeof *memory);
+      memset(map,0,sizeof *map); result=NG_OK; break;
+    }
+  }
+  pm_unlock(&g_nvlock); return result;
+}
+int nv_native_range_acquire(u64 owner,u64 gpu,u64 size,u32* out){
+  if(!out || !size || gpu>=(1ull<<49) || size>(1ull<<49)-gpu) return NG_INVALID;
+  pm_lock(&g_nvlock); int result=NG_NOT_FOUND;
+  if(native_owner_valid(owner)) for(unsigned i=0;i<4096;i++){
+    NativeMap* map=&native_maps[i];
+    if(map->owner!=owner || gpu<map->address || gpu-map->address>map->size || size>map->size-(gpu-map->address)) continue;
+    result=NG_LIMIT;
+    if(native_lease_next!=UINT32_MAX && map->uses!=UINT32_MAX) for(unsigned j=0;j<4096;j++) if(!native_leases[j].owner){
+      native_leases[j]=(NativeLease){owner,++native_lease_next,i}; map->uses++;
+      *out=native_leases[j].id; result=NG_OK; break;
+    }
+    break;
+  }
+  pm_unlock(&g_nvlock); return result;
+}
+int nv_native_range_release(u64 owner,u32 lease){
+  pm_lock(&g_nvlock); int result=NG_NOT_FOUND;
+  if(native_owner_valid(owner)) for(unsigned i=0;i<4096;i++) if(native_leases[i].owner==owner && native_leases[i].id==lease){
+    native_maps[native_leases[i].map].uses--; memset(&native_leases[i],0,sizeof native_leases[i]); result=NG_OK; break;
+  }
+  pm_unlock(&g_nvlock); return result;
+}
+int nv_native_range_address(u64 owner,u64 gpu,u64 size,u64* out){
+  if(!out || !size || gpu>=(1ull<<49) || size>(1ull<<49)-gpu) return NG_INVALID;
+  pm_lock(&g_nvlock); int result=NG_NOT_FOUND;
+  if(native_owner_valid(owner)) for(unsigned i=0;i<4096;i++){
+    NativeMap* map=&native_maps[i];
+    if(map->owner==owner && gpu>=map->address && gpu-map->address<=map->size && size<=map->size-(gpu-map->address)){
+      /* Range readers must hold a lease so the returned backing cannot retire. */
+      if(!map->uses){ result=NG_BUSY; break; }
+      *out=gmmu_translate(gpu); result=NG_OK; break;
+    }
+  }
+  pm_unlock(&g_nvlock); return result;
+}
 
 typedef struct { u64 gva, size; u32 h; u64 off; } GMap;
 
@@ -47,9 +246,14 @@ static GMap gmaps[16384]; static int ngmaps;
 /* a mapping stops at the end of its nvmap handle. games map small buffers with a bigger size (12 KB as a 64 KB big
    page) and unmap the guest page right after the buffer as a guard. on the console the rest of the page is other
    memory, here it would point the GPU at that hole and crash the GPU thread */
-static void gmmu_map_handle(u64 gva, u32 h, u64 off, u64 size){
+static int gmmu_map_handle(u64 gva, u32 h, u64 off, u64 size){
+  if(gva>=(1ull<<49) || size>(1ull<<49)-gva) return 0;
+  pm_lock(&g_nvlock);
+  if(native_overlap(gva,size)){ pm_unlock(&g_nvlock); return 0; }
   u64 hs=((u64)nvh[h].size+0xFFF)&~0xFFFull, n= off<hs? hs-off : 0; if(n>size) n=size;
-  gmmu_map(gva,nvh[h].addr+off,n); if(n<size) gmmu_unmap(gva+n,size-n); }
+  int ok=gmmu_map_impl(gva,nvh[h].addr+off,n);
+  if(ok && n<size) gmmu_unmap_impl(gva+n,size-n);
+  pm_unlock(&g_nvlock); return ok; }
 
 static u64 g_va_next=0x0400000000ull;       /* dumb bump allocator for gva */
 static u64 va_alloc(u64 size, u64 align){ if(align<0x10000) align=0x10000; u64 a=(g_va_next+align-1)&~(align-1); g_va_next=a+((size+0xFFFF)&~0xFFFFull); return a; }
@@ -110,18 +314,19 @@ static u32 ioctl_nvmap(u32 cmd, u8* d, u32 n){
   switch(cmd&0xFF){
     case 0x01: { u32 size; memcpy(&size,d,4); pm_lock(&g_nvlock);
       /* reuse freed handles once the table is full instead of writing past it */
-      u32 h=0; if(nvh_next<8192) h=nvh_next++; else for(u32 i=1;i<8192;i++) if(!nvh[i].alive){ h=i; break; }
+      u32 h=nvmap_slot();
       if(!h){ pm_unlock(&g_nvlock); return 1; }
       memset(&nvh[h],0,sizeof nvh[h]); nvh[h].size=size; nvh[h].id=h; nvh[h].alive=1; pm_unlock(&g_nvlock); memcpy(d+4,&h,4); return 0; }
-    case 0x03: { u32 id; memcpy(&id,d,4); u32 h=nvmap_from_id(id); if(!h) return 1; memcpy(d+4,&h,4); return 0; }
-    case 0x04: { u32 h; memcpy(&h,d,4); if(!h||h>=8192) return 1; NvMapH* m=&nvh[h];
+    case 0x03: { u32 id; memcpy(&id,d,4); u32 h=nvmap_from_id(id); if(!h || nvh[h].native_owner) return 1; memcpy(d+4,&h,4); return 0; }
+    case 0x04: { u32 h; memcpy(&h,d,4); if(!h||h>=8192 || nvh[h].native_owner) return 1; NvMapH* m=&nvh[h];
       memcpy(&m->heap,d+4,4); memcpy(&m->flags,d+8,4); memcpy(&m->align,d+12,4); m->kind=d[16]; memcpy(&m->addr,d+24,8);
       LOGV("nvmap alloc h=%u size=%x addr=%llx\n",h,m->size,(unsigned long long)m->addr); return 0; }
-    case 0x05: { u32 h; memcpy(&h,d,4); if(h&&h<8192){ u64 a=nvh[h].addr; u32 s=nvh[h].size, f=nvh[h].flags; memcpy(d+8,&a,8); memcpy(d+16,&s,4); memcpy(d+20,&f,4); nvh[h].alive=0; } return 0; }
+    case 0x05: { u32 h; memcpy(&h,d,4); if(h<8192 && nvh[h].native_owner) return 1; if(h&&h<8192){ u64 a=nvh[h].addr; u32 s=nvh[h].size, f=nvh[h].flags; memcpy(d+8,&a,8); memcpy(d+16,&s,4); memcpy(d+20,&f,4); nvh[h].alive=0; } return 0; }
     case 0x09: { u32 h, p, r=0; memcpy(&h,d,4); memcpy(&p,d+4,4); if(h>=8192) return 1; NvMapH* m=&nvh[h];
+      if(m->native_owner) return 1;
       switch(p){ case 1: r=m->size; break; case 2: r=m->align?m->align:0x1000; break; case 3: r=0; break; case 4: r=0x40000000; break; case 5: r=m->kind; break; case 6: r=0; break; }
       memcpy(d+8,&r,4); return 0; }
-    case 0x0E: { u32 h; memcpy(&h,d+4,4); u32 id= h<8192? nvh[h].id : 0; memcpy(d,&id,4); return 0; }
+    case 0x0E: { u32 h; memcpy(&h,d+4,4); if(h<8192 && nvh[h].native_owner) return 1; u32 id= h<8192? nvh[h].id : 0; memcpy(d,&id,4); return 0; }
   }
   WARN("nvmap ioctl %x\n",cmd); return 0; }
 
@@ -134,17 +339,17 @@ static u32 ioctl_as(u32 cmd, u8* d, u32 n, u8* extra, u32 nextra){
     case 0x02: { u32 pages, psz, flags; u64 off; memcpy(&pages,d,4); memcpy(&psz,d+4,4); memcpy(&flags,d+8,4); memcpy(&off,d+16,8);
       u64 size=(u64)pages*psz; u64 a= (flags&1)? off : va_alloc(size,off>psz? off : psz); memcpy(d+16,&a,8);
       LOGV("as alloc_space %llx size %llx\n",(unsigned long long)a,(unsigned long long)size); return 0; }
-    case 0x03: { u64 off; u32 pages, psz; memcpy(&off,d,8); memcpy(&pages,d+8,4); memcpy(&psz,d+12,4); gmmu_unmap(off,(u64)pages*psz); return 0; }
-    case 0x05: { u64 off; memcpy(&off,d,8); for(int i=0;i<ngmaps;i++) if(gmaps[i].gva==off){ gmmu_unmap(off,gmaps[i].size); gmaps[i]=gmaps[--ngmaps]; break; } return 0; }
+    case 0x03: { u64 off; u32 pages, psz; memcpy(&off,d,8); memcpy(&pages,d+8,4); memcpy(&psz,d+12,4); return !gmmu_unmap(off,(u64)pages*psz); }
+    case 0x05: { u64 off; memcpy(&off,d,8); for(int i=0;i<ngmaps;i++) if(gmaps[i].gva==off){ if(!gmmu_unmap(off,gmaps[i].size)) return 1; gmaps[i]=gmaps[--ngmaps]; break; } return 0; }
     case 0x06: { u32 flags, kind, h, psz; i64 boff; u64 msize, off; memcpy(&flags,d,4); memcpy(&kind,d+4,4); memcpy(&h,d+8,4); memcpy(&psz,d+12,4);
       memcpy(&boff,d+16,8); memcpy(&msize,d+24,8); memcpy(&off,d+32,8);
       if((flags&0x100) && h==0) return 0;   /* just updates kind on an existing map */
-      if(h>=8192 || !nvh[h].alive){ WARN("as map: invalid nvmap handle %u flags=%x kind=%x psz=%x boff=%llx msize=%llx off=%llx n=%u\n",h,flags,kind,psz,(unsigned long long)boff,(unsigned long long)msize,(unsigned long long)off,n); return 1; }
+      if(h>=8192 || !nvh[h].alive || nvh[h].native_owner){ WARN("as map: invalid nvmap handle %u flags=%x kind=%x psz=%x boff=%llx msize=%llx off=%llx n=%u\n",h,flags,kind,psz,(unsigned long long)boff,(unsigned long long)msize,(unsigned long long)off,n); return 1; }
       if(flags&0x100){ /* modify: remap inside an existing mapping */
-        gmmu_map_handle(off,h,(u64)boff,msize?msize:nvh[h].size); return 0; }
+        return !gmmu_map_handle(off,h,(u64)boff,msize?msize:nvh[h].size); }
       u64 size= msize? msize : nvh[h].size;
       u64 gva= (flags&1)? off : va_alloc(size,psz?psz:0x10000);
-      gmmu_map_handle(gva,h,(u64)boff,size);
+      if(!gmmu_map_handle(gva,h,(u64)boff,size)) return 1;
       if(ngmaps<16384){ gmaps[ngmaps].gva=gva; gmaps[ngmaps].size=size; gmaps[ngmaps].h=h; gmaps[ngmaps].off=(u64)boff; ngmaps++; }
       memcpy(d+32,&gva,8);
       LOGV("as map h=%u cpu=%llx gva=%llx size=%llx\n",h,(unsigned long long)(nvh[h].addr+boff),(unsigned long long)gva,(unsigned long long)size);
@@ -163,7 +368,7 @@ static u32 ioctl_as(u32 cmd, u8* d, u32 n, u8* extra, u32 nextra){
       u32 cnt=n/20; for(u32 i=0;i<cnt;i++){ u8* e=d+i*20; u32 h, moff, goff, pages; memcpy(&h,e+4,4); memcpy(&moff,e+8,4); memcpy(&goff,e+12,4); memcpy(&pages,e+16,4);
         /* big page size comes from ALLOC_AS_EX */
         u64 gva=(u64)goff<<g_big_page_bits, size=(u64)pages<<g_big_page_bits;
-        if(!h) gmmu_unmap(gva,size); else if(h<8192) gmmu_map_handle(gva,h,(u64)moff<<g_big_page_bits,size);
+        if(!h) gmmu_unmap(gva,size); else if(h<8192 && !nvh[h].native_owner) gmmu_map_handle(gva,h,(u64)moff<<g_big_page_bits,size);
         { static int said; if(said<4){ said++; LOG("nvdrv: remap handle %u: %llx bytes at gpu %llx (big page %u KB)\n",h,(unsigned long long)size,(unsigned long long)gva,(1u<<g_big_page_bits)>>10); } } }
       return 0; }
   }

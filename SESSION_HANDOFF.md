@@ -77,3 +77,9 @@ Do not fabricate ioctl capability words, force syncpoints to completed threshold
 ## Workspace hygiene
 
 [.gitignore](.gitignore) excludes Python caches, local launcher settings, generated game content, and atomic staging scratch names. Ignored files remain on disk. Source changes remain uncommitted. No remote Git sync or sibling-repository mirroring was performed.
+
+## Native GPU backend follow-up (source only)
+
+See [Native GPU backend progress](docs/NATIVE_GPU_BACKEND_PROGRESS.md). New source adds 49-bit GMMU isolation, real memory-manager pins and native NVMap ownership, queued worker/QMD3 scheduling with retained leases, restricted synchronous OpenGL execution, and a typed linear-RGBA presentation owner. Native classes reaching the legacy executor now reject without false batch completion.
+
+The updated runner covers 17 C groups plus Ampere and QMD3 checks. Worker execution/presentation tests use controlled backend callbacks; actual OpenGL paths are build-checked, not game-validated. GSV/worker/VI2 guest IPC bindings remain unwired. Logical native owners are not yet authenticated guest KProcess identities. Existing testing runtime and game executables are not replaced by this follow-up.

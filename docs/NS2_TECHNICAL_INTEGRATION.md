@@ -2,6 +2,8 @@
 
 Updated 2026-11-05. Branch: `beta_nx2`. Runtime marker: `v197-ns2-frontend`.
 
+Follow-up source work is tracked in [Native GPU backend progress](NATIVE_GPU_BACKEND_PROGRESS.md). It adds ownership/queue backends without changing the deployed testing binary or completing guest IPC integration. The evidence table below records the initial synced testing baseline.
+
 ## Status and evidence
 
 The runtime is ready for controlled Switch 1 regression tests and NS2 startup

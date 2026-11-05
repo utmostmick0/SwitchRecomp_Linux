@@ -158,6 +158,7 @@ void i2m_data(GpuChannel* ch, u32 v){
 extern void r3d_pending_flush(void); extern int r3d_pending_on(void);
 
 static void call_method(GpuChannel* ch, u32 sub, u32 m, u32 v, int last){
+  if(ch->submission_failed) return;
   if(m<0x40){ if(r3d_pending_on()) r3d_pending_flush(); puller_method(ch,m,v); if(m==0){ ch->sub_class[sub]=v&0xFFFF; } return; }
   u32 cls=ch->sub_class[sub];
   if(r3d_pending_on() && !(cls==0xB197 || (sub==0 && cls!=0xB1C0 && cls!=0xA140 && cls!=0x902D && cls!=0xB0B5))) r3d_pending_flush();   /* switching engines: flush pending draws */
@@ -167,6 +168,11 @@ static void call_method(GpuChannel* ch, u32 sub, u32 m, u32 v, int last){
     case 0xA140: kepler_i2m_method(ch,m,v); break;
     case 0x902D: fermi2d_method(ch,m,v); break;
     case 0xB0B5: dma_method(ch,m,v); break;
+    case 0xC797: case 0xC7C0: case 0xC7B5:
+      /* Native class semantics are not Maxwell register layouts. Worker
+         QMD3 execution uses its separate owned submission entry point. */
+      WARN("native GPU class %x method %x requires an authenticated native engine path\n",cls,m);
+      ch->submission_failed=1; break;
     default:
       if(sub==0) maxwell3d_method(ch,m,v,last);
       else if(sub==1) compute_method(ch,m,v,last);
@@ -217,9 +223,10 @@ static GpuChannel* chan_get(u32 id){
   c->r3d[0x4E]=1; c->r3d[0x556]=1; /* render-enable reset: true */
   g_gpu.chan[g_gpu.nchan++]=c; return c; }
 
-void gpu_submit_now(u64* e, u32 n, u32 channel){
+int gpu_submit_now(u64* e, u32 n, u32 channel){
   pm_lock(&g_gpulock);
   GpuChannel* ch=chan_get(channel);
+  ch->submission_failed=0;
   for(u32 k=0;k<n;k++){
     u64 ent=e[k]; u64 va=ent&0xFFFFFFFFFCull; u32 words=(u32)((ent>>42)&0x1FFFFF);
     if(!words) continue;
@@ -229,7 +236,9 @@ void gpu_submit_now(u64* e, u32 n, u32 channel){
   }
   r3d_pending_flush();
   gpu_flush(ch);
+  int ok=!ch->submission_failed;
   pm_unlock(&g_gpulock);
+  return ok;
 }
 
 void gpu_init(void){ pm_init(&g_gpulock); gpu3d_init(); }
@@ -241,8 +250,7 @@ void gpu_submit(u64* e, u32 n, u32 channel, u32 incs, u32 wait_id, u32 wait_val)
   extern int gpu_async_submit(u64* e, u32 n, u32 syncpt, u32 incs, u32 wait_id, u32 wait_val);
   if(gpu_async_submit(e,n,channel,incs,wait_id,wait_val)) return;
   if(wait_id!=~0u) syncpt_wait(wait_id,wait_val,2000000000);
-  gpu_submit_now(e,n,channel);
-  for(u32 i=0;i<incs;i++) syncpt_incr(channel);
+  if(gpu_submit_now(e,n,channel)) for(u32 i=0;i<incs;i++) syncpt_incr(channel);
 }
 
 /* semaphore reductions, the GPFIFO encoding: MIN MAX XOR AND OR ADD INC DEC (INC wraps to 0 past the payload,

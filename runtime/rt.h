@@ -130,6 +130,8 @@ int  mem_is_free(u64 addr, u64 size);
 void mem_query(u64 addr, MemBlock* out);
 int  mem_set_state(u64 addr, u64 size, u32 state, u32 perm);
 int  mem_set_attr(u64 addr, u64 size, u32 mask, u32 attr);
+int  mem_device_pin(u64 addr,u64 size);   /* page-aligned, mapped RW; 0 success */
+int  mem_device_unpin(u64 addr,u64 size);
 u64  mem_find_free(u64 lo, u64 hi, u64 size, u64 align);
 u64  kmem_alloc(u64 size, u32 state, u32 perm);                   /* reserved for the kernel */
 u64  mem_heap_set(u64 size);

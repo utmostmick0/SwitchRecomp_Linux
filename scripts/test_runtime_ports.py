@@ -16,6 +16,9 @@ CHECKS = [
     ("service_ports", ["runtime/ipc.c", "runtime/audio.c", "runtime/audio_effects.c"], False),
     ("ipc_sessions", ["runtime/ipc.c", "runtime/kernel.c"], True),
     ("thread_tls", ["runtime/kernel.c"], True),
+    ("native_gpu_memory", [], True),
+    ("native_gpu_submission", [], True),
+    ("native_vi2", [], True),
     ("audio_effects", ["runtime/audio_effects.c"], True),
     ("audio_routing", ["runtime/audio_effects.c"], True),
     ("audren_update", ["runtime/audio.c", "runtime/audio_effects.c", "runtime/ipc.c"], True),
@@ -44,7 +47,8 @@ def main():
                     for shader in Path(directory).glob("*.frag"):
                         subprocess.run([validator, "-S", "frag", str(shader)], check=True)
     subprocess.run([sys.executable, "scripts/test_ns2_shader.py"], cwd=ROOT, check=True)
-    print(f"All {len(CHECKS)} native runtime check groups and the NS2 frontend checks passed.")
+    subprocess.run([sys.executable, "scripts/test_native_qmd.py"], cwd=ROOT, check=True)
+    print(f"All {len(CHECKS)} native runtime check groups, NS2 frontend and QMD3 checks passed.")
 
 
 if __name__ == "__main__":

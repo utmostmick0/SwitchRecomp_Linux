@@ -7,6 +7,7 @@
 #include "rt.h"
 typedef struct GpuChannel {
   u32 id;
+  int submission_failed; /* native rejection must suppress this batch's fence */
   u32 sub_class[8];
   u32 puller[0x40];
   u32 r3d[0x1000];          /* 3D engine regs, 0xE00+ are MME macro calls */

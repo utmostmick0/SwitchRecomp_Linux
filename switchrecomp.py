@@ -273,13 +273,14 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     frontend = os.path.join(HERE, 'vendor', 'nx2_imports', 'ampere')
     with tempfile.TemporaryDirectory(prefix='swr-ns2-build-') as directory:
         objects = []
-        sources = [os.path.join(RT, 'ns2_shader.cpp')] + [
+        sources = [os.path.join(RT, 'ns2_shader.cpp'), os.path.join(RT, 'native_qmd.cpp')] + [
             os.path.join(frontend, 'shader_recompiler', 'frontend', 'ampere', name)
             for name in ('probe.cpp', 'lower_bridge.cpp')]
         for index, source in enumerate(sources):
             obj = os.path.join(directory, '%d.o' % index)
             command = [cc, '-x', 'c++', '-std=c++20', '-O' + opt, '-I', RT,
                        '-I', os.path.join(RT, 'ns2_compat'), '-I', frontend,
+                       '-I', os.path.join(HERE, 'vendor', 'nx2_imports', 'gpu_dispatch'),
                        '-c', source, '-o', obj]
             error = run_cc(command, cc)
             if error: raise SystemExit('NS2 frontend build failed:\n' + error[-4000:])
@@ -295,6 +296,7 @@ def _build_runtime(cc, out, target_win, backend, say, opt='2', ns2_objects=()):
     gl = backend != 'headless'
     extra = ['gpu_gl', 'gl_load', 'shader', 'shader_proc', 'astc', 'glq', 'glq_gen'] if gl else ['gpu_nogl', 'shader_proc']
     srcs = [os.path.join(RT, s + '.c') for s in RUNTIME_SRC + extra] + [os.path.join(RT, 'backend_%s.c' % backend), os.path.join(RT, 'entry.c')]
+    if ns2_objects: srcs += [os.path.join(RT, 'native_worker.c'), os.path.join(RT, 'native_vi2.c')]
     if backend == 'x11': srcs += [os.path.join(RT, 'vk_output_x11.c'), os.path.join(RT, 'trace_zip.c')]
     if gl: srcs += [os.path.join(RT, 'bcn', 'bcn.cpp'), os.path.join(RT, 'bcn', 'bcdec.cpp')]
     # LSFG (uses the user's Lossless.dll), desktop GL only
