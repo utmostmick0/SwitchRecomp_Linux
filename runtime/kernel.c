@@ -683,9 +683,9 @@ static void hle_query_donated_transfer_memory(CPU* RESTRICT c, u64 entry){ (void
   static const u64 sizes[] = { 0x10000000ull, 0x10000000ull, 0x10000000ull };
   u64 p0=c->x[0], p1=c->x[1], p2=c->x[2];
   for(int i=0;i<3;i++){ u64 p=c->x[i]; if(p && p<0x10000000000ull) memcpy(GP(p),&sizes[i],8); }
-  /* In this title's generated wrapper the query is consumed as a boolean
-     predicate: non-zero means the donated-memory values are usable. */
-  c->x[0]=1;
+  /* This is an nn::Result: zero is ResultSuccess.  The generated caller
+     branches to its error path when x0 is non-zero. */
+  c->x[0]=0;
   /* This SDK thunk is reached through a tail-call table entry whose LR is
      the thunk address itself.  Returning to x30 would spin at a842350; the
      saved frame identifies a8519f8 as BootGraphicsSystem's continuation. */

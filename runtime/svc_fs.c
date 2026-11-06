@@ -326,7 +326,10 @@ static int fs_disp(SvcObj* o, IpcCtx* c){
   if(c->cmd<=6 || c->cmd==13) __atomic_add_fetch(&fs_path_epoch,1,__ATOMIC_RELEASE);
   switch(c->cmd){
     case 0: { read_path(c,0,p,sizeof p); host_path(fs,p,hp,sizeof hp); u64 sz=in64(c,8);
-      FILE* t=fopen(hp,"rb"); if(t){ fclose(t); return FS_EXISTS; }
+      /* Bananza retries this bootstrap create after another worker has made
+         the file.  Treat an existing file as success so the caller can
+         continue to graphics/frame setup instead of spinning on 0x402. */
+      FILE* t=fopen(hp,"rb"); if(t){ fclose(t); return 0; }
       t=fopen(hp,"wb"); if(!t) return FS_NOTFOUND; if(sz){ fseek(t,(long)sz-1,SEEK_SET); fputc(0,t); } fclose(t); return 0; }
     case 1: read_path(c,0,p,sizeof p); host_path(fs,p,hp,sizeof hp); return remove(hp)? FS_NOTFOUND : 0;
     case 2: read_path(c,0,p,sizeof p); host_path(fs,p,hp,sizeof hp); if(plat_is_dir(hp)) return FS_EXISTS; return plat_mkdir(hp)? FS_NOTFOUND : 0;

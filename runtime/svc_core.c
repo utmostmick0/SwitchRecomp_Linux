@@ -101,6 +101,7 @@ static u64 g_user_id[2]={0x0123456789ABCDEFull,0xFEDCBA9876543210ull};
    nx2:gpu (GSV 497) and nx2:vi2 (GSV 305).  Keep the session objects real so
    the SDK does not mistake an empty IPC reply for an unavailable display. */
 static KEvent* g_nx2_vi2_events[8];
+static KEvent* g_nx2_vi2_vsync;
 
 static KEvent* nx2_vi2_event(IpcCtx* c){
   u32 index=in32(c,0)&7u;
@@ -116,7 +117,13 @@ static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 1: case 3: out32(c,1); return 0;
     case 5: out32(c,7); return 0;
-    case 11: out_copy_h(c,ev_handle(kevent_new("nx2 vi2",0))); return 0;
+    case 11:
+      /* NVN2 waits on this event before it starts submitting the first frame.
+         The native compositor is not present in the host runtime yet, so a
+         permanently signalled event is the correct bootstrap behavior; an
+         unsignalled one leaves the title in its startup polling loop forever. */
+      if(!g_nx2_vi2_vsync){ g_nx2_vi2_vsync=kevent_new("nx2 vi2 vsync",0); g_nx2_vi2_vsync->signaled=1; }
+      out_copy_h(c,ev_handle(g_nx2_vi2_vsync)); return 0;
     case 31: case 32: out_copy_h(c,ev_handle(nx2_vi2_event(c))); return 0;
     case 212:
       /* GetLayerBufferBits: all compositor slots are immediately available
