@@ -99,6 +99,10 @@ typedef struct CPU {
 /* ---- calls ---- */
 SWR_INLINE GuestFn swr_lookup(CPU* c, u64 pc);
 extern GuestFn swr_interp_entry;
+/* Optional callbacks stored by NVN2 in guest heap objects may point outside
+ * the recompiled title.  They are not executable guest code in this runtime;
+ * return to the caller when a call reaches that unmapped range. */
+SWR_INLINE void swr_missing_guest(CPU* c, u64 pc){ (void)pc; c->pc=c->x[30]; }
 SWR_INLINE GuestFn swr_lookup(CPU* c, u64 pc){
   u64 o = pc - c->code_lo;
   if (LIKELY(o < c->code_hi - c->code_lo && !(pc&3))) {
@@ -108,6 +112,11 @@ SWR_INLINE GuestFn swr_lookup(CPU* c, u64 pc){
       return f;
     }
   }
+  /* NVN2 stores optional native-driver callbacks in guest heap objects.  A
+   * callback target outside the recompiled title is not executable guest
+   * code here; treat it as an empty callback and preserve diagnostics for
+   * targets inside the title's code range. */
+  if (UNLIKELY(pc < c->code_lo || pc >= c->code_hi)) return swr_missing_guest;
   if (UNLIKELY(pc==c->user[7] && c->rt && c->rt->trace_dispatch)) c->rt->trace_dispatch(c,pc,swr_interp_entry);
   return swr_interp_entry;
 }

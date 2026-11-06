@@ -131,7 +131,11 @@ static void respond(IpcCtx* c){
   u8* p=m+8;
   u32 special= (c->nout_copy||c->nout_move||(!dom && c->nout_objs))? 1 : 0;
   u32 hdr_words=2+(special? 1+nhandles : 0)+c->nx_out*2;
-  u32 pad_bytes=((hdr_words*4+15)&~15)-hdr_words*4;
+  /* TIPC is not CMIF: its result is one word immediately after the request
+     header (or after the special-handle descriptors).  Applying CMIF's
+     16-byte payload alignment shifts the result by one word, which makes
+     Switch 2 SDK callers wait forever after an otherwise successful command. */
+  u32 pad_bytes=c->tipc ? 0 : ((hdr_words*4+15)&~15)-hdr_words*4;
   /* SFCO(16) + payload; domains add a 16 byte header and object ids */
   u32 payload=(c->out_size+3)&~3u;
   u32 data_bytes=16+payload+(dom? 16+c->nout_objs*4 : 0);

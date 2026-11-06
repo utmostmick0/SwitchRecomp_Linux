@@ -54,7 +54,11 @@ def test_donated_transfer_memory_query_returns_unavailable_only_when_requested()
     mod = SimpleNamespace(name='sdk', base=0x1000, syms={0x20: DONATED_TRANSFER_MEMORY_QUERY_SYMBOL})
     func = SimpleNamespace(name='F_1020', start=0x1020, mod=mod)
     stub = codegen.emit_function(None, func, {}, skip_switch2_donated_transfer_memory_query=True)
-    assert stub == 'void F_1020(CPU* RESTRICT c, u64 e){ (void)e; c->x[0]=0; c->pc=c->x[30]; }'
+    assert stub == ('void F_1020(CPU* RESTRICT c, u64 e){ u8* const M=c->mem; (void)e; '
+                    'if(c->x[0] && c->x[0]<0x10000000000ull) WR64(c->x[0],0x10000000ull); '
+                    'if(c->x[1] && c->x[1]<0x10000000000ull) WR64(c->x[1],0x10000000ull); '
+                    'if(c->x[2] && c->x[2]<0x10000000000ull) WR64(c->x[2],0x10000000ull); '
+                    'c->x[0]=1; c->pc=c->x[30]; }')
     assert codegen.switch2_graphics_boot_stub(func, True, True, True, True, False) is None
 
 

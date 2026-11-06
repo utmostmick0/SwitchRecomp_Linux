@@ -46,10 +46,133 @@ static SvcObj* quiet(const char* name){ return svcobj_new(name,quiet_ok,0); }
 /* ================================================================ shared events */
 static u32 ev_handle(KEvent* e){ return h_new(&e->o); }
 
+/* Switch 2 SDK sessions are TIPC rather than ordinary CMIF.  The sync-point
+   client uses slot events as a small fence pool; keep the events alive per
+   session and signal them for requests we cannot model asynchronously. */
+typedef struct { KEvent* slot[64]; } Nx2SyncptData;
+
+static KEvent* nx2_syncpt_event(SvcObj* o, u32 slot){
+  Nx2SyncptData* d=o->data;
+  slot &= 63;
+  if(!d->slot[slot]) d->slot[slot]=kevent_new("nx2 syncpt slot",0);
+  return d->slot[slot];
+}
+
+static int nx2_syncpt_disp(SvcObj* o, IpcCtx* c){
+  switch(c->cmd){
+    case 0: /* TIPC handshake: echo the 64-bit token. */
+      out32(c,in32(c,0)); out32(c,in32(c,4)); return 0;
+    case 1: out32(c,32); return 0;                 /* GetCount */
+    case 103: out32(c,0); out32(c,0); out32(c,0); return 0; /* QueryCounter */
+    case 21: return 0;
+    case 22: {                                    /* GetSlotEvent */
+      out_copy_h(c,ev_handle(nx2_syncpt_event(o,in32(c,0)))); return 0; }
+    case 201: {                                   /* RequestSlotEvent */
+      KEvent* e=nx2_syncpt_event(o,in32(c,0));
+      /* The native GPU path is not active yet, so complete the fence rather
+         than leaving the title in an unbounded WaitSynchronization. */
+      e->signaled=1; kobj_signal(&e->o); return 0; }
+    case 202: {                                   /* CancelSlotEvent */
+      KEvent* e=nx2_syncpt_event(o,in32(c,0));
+      e->signaled=1; kobj_signal(&e->o); return 0; }
+  }
+  return quiet_ok(o,c);
+}
+
+static void nx2_syncpt_data_destroy(SvcObj* o){
+  Nx2SyncptData* d=o->data;
+  if(!d) return;
+  for(int i=0;i<64;i++) if(d->slot[i]) kobj_unref(&d->slot[i]->o);
+}
+
+static SvcObj* new_nx2_syncpt(void){
+  SvcObj* o=svcobj_new("nx2:syncpt",nx2_syncpt_disp,sizeof(Nx2SyncptData));
+  o->destroy=nx2_syncpt_data_destroy;
+  return o;
+}
+
 /* ================================================================ am */
 static KEvent* g_msg_event; static u32 g_msgq[16]; static int g_nmsg;
 static KEvent* g_launch_ev; static KEvent* g_res_ev; static KEvent* g_opmode_ev;
 static u64 g_user_id[2]={0x0123456789ABCDEFull,0xFEDCBA9876543210ull};
+
+/* Minimal NX2 graphics-supervisor session chain.  Eden's trace shows that
+   vi23 initialization obtains this from ISelfController::2000, then opens
+   nx2:gpu (GSV 497) and nx2:vi2 (GSV 305).  Keep the session objects real so
+   the SDK does not mistake an empty IPC reply for an unavailable display. */
+static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
+  (void)o;
+  switch(c->cmd){
+    case 1: case 3: out32(c,1); return 0;
+    case 5: out32(c,7); return 0;
+    case 11: case 31: case 32: out_copy_h(c,ev_handle(kevent_new("nx2 vi2",0))); return 0;
+    /* Eden's working trace uses these VI2 lifecycle/event commands.  They
+       are deliberately tolerant: the native renderer owns the actual frame
+       work, while the SDK needs the session to acknowledge the protocol. */
+    case 51: case 101: case 102: case 107: case 111: case 112:
+    case 201: case 202: case 212: case 228: case 229:
+    case 251: case 252: case 261: case 265: case 267: case 271:
+    case 351: case 352: return 0;
+  }
+  return quiet_ok(o,c);
+}
+
+static int nx2_gpu_disp(SvcObj* o, IpcCtx* c){
+  (void)o;
+  switch(c->cmd){
+    case 11: out32(c,0); out32(c,31); return 0;
+    case 12: out_copy_h(c,ev_handle(kevent_new("nx2 gpu",0))); return 0;
+    case 21: return 0;
+    case 22: out_obj(c,svcobj_new("nx2:gpu-sub",nx2_gpu_disp,0)); return 0;
+    case 33: out32(c,1); return 0;
+    case 41: out32(c,1); return 0;
+    case 202: case 203: out32(c,1); return 0;
+  }
+  return quiet_ok(o,c);
+}
+
+static int nx2_gsv_disp(SvcObj* o, IpcCtx* c){
+  (void)o;
+  switch(c->cmd){
+    case 0: out32(c,in32(c,0)); out32(c,in32(c,4)); return 0; /* TIPC handshake */
+    case 4: case 126: case 201: case 301:
+    case 401: case 402: case 403: case 434: case 1101: case 1102: return 0;
+    case 11: { /* RegisterClientHandle: wake the client-side completion event. */
+      if(c->ncopy){ KEvent* e=(KEvent*)h_get_type(c->copy_h[0],KO_EVENT); if(e) kevent_signal(e); }
+      return 0;
+    }
+    case 101: /* CreateGpuAccessibleMemory / register a CPU range */
+      out32(c,1); return 0;
+    case 115: out32(c,in32(c,0)); out32(c,in32(c,4)); return 0; /* grant requested features */
+    case 202: out_obj(c,new_nx2_syncpt()); return 0;
+    case 204: {                                  /* AttachSyncptMemory */
+      KShmem* ro=NULL;
+      for(int i=0;i<c->ncopy;i++){
+        KShmem* s=(KShmem*)h_get_type(c->copy_h[i],KO_SHMEM);
+        if(s && s->size>=0x2000){ ro=s; break; }
+      }
+      if(ro){
+        u8* p=kshmem_ptr(ro); memset(p,0,0x2000);
+        u32 max=in32(c,4); if(!max || max>192) max=192;
+        u32 hdr[]={1,0,max,0x40,0,0x1040,0x1100,0x0,0x100};
+        memcpy(p,hdr,sizeof hdr);
+      }
+      /* First event is the client-writable arm event; second is the readable
+         notification event.  Keep notification signalled until the real GPU
+         fence backend is connected. */
+      KEvent* arm=kevent_new("nx2 gsv syncpt arm",0);
+      KEvent* notify=kevent_new("nx2 gsv syncpt notify",0); notify->signaled=1;
+      out_copy_h(c,ev_handle(arm)); out_copy_h(c,ev_handle(notify));
+      return 0; }
+    case 497: out_obj(c,svcobj_new("nx2:gpu",nx2_gpu_disp,0)); return 0;
+    case 305: out_obj(c,svcobj_new("nx2:vi2",nx2_vi2_disp,0)); return 0;
+    case 1402: out_obj(c,svc_generic("nx2:nvsrv")); return 0;
+    case 1510: out32(c,0x100000); out32(c,0); out32(c,0x1000); out32(c,0); return 0;
+  }
+  return quiet_ok(o,c);
+}
+
+SvcObj* svc_nx2_gsv_new(void){ return svcobj_new("nx2:gsv",nx2_gsv_disp,0); }
 
 static void am_push_msg(u32 m){ pm_lock(&g_klock); if(g_nmsg<16) g_msgq[g_nmsg++]=m; pm_unlock(&g_klock); kevent_signal(g_msg_event); }
 
@@ -126,6 +249,7 @@ static int am_self(SvcObj* o, IpcCtx* c){          /* ISelfController */
     case 0: { extern void process_exit(int); process_exit(0); return 0; }   /* Exit: the system kills the process, libnx just sleeps
                                                                                until that happens */
     case 9: out_copy_h(c,ev_handle(g_launch_ev)); return 0;            /* GetLibraryAppletLaunchableEvent */
+    case 2000: out_obj(c,svc_nx2_gsv_new()); LOG("applet: ISelfController::2000 returned nx2:gsv\n"); return 0;
     case 40: { static u64 layer=1; out64(c,layer++); return 0; }       /* CreateManagedDisplayLayer */
     case 41: out64(c,0); return 0;
     case 44: out64(c,1); out64(c,2); return 0;

@@ -558,6 +558,10 @@ static u32 svc_get_info(u32 id0, u32 h, u64 id1, u64* out){
   return r; }
 
 static u32 svc_get_info_(u32 id0, u32 h, u64 id1, u64* out){
+  /* Switch 2 remote-memory descriptors are not backed by a host service.
+     Report them as unavailable rather than successful zero handles; the SDK
+     uses the Result to select its local-memory path. */
+  if(id0==31 || id0==32){ *out=0; return R_NOTFOUND; }
   switch(id0){
     case 0: *out=0xF; return 0;                                  /* CoreMask */
     case 1: *out=0xFFFFFFFFFFFFFFFFull>>(64-60)<<4; *out=0xFFFFFFFFFFFFFFF0ull; return 0;
@@ -654,6 +658,88 @@ static void hle_ctrl_support(CPU* RESTRICT c, u64 entry){ (void)entry;
 static void hle_ctrl_other(CPU* RESTRICT c, u64 entry){ (void)entry; c->x[0]=0; c->pc=c->x[30];
   static int said; if(!said){ said=1; LOG("hid: controller applet call answered by the runtime (ok)\n"); } }
 
+/* NVN2's early SDK assertions describe unavailable platform state rather than
+   a recoverable game error.  Let the bootstrap continue while the native
+   nx2 services are being brought up; later service calls still report their
+   actual unsupported operation. */
+static void hle_abort_impl(CPU* RESTRICT c, u64 entry){ (void)entry;
+  /* AbortImpl is noreturn, but this unavailable-platform result has a valid
+     generated continuation once remote-memory helpers have returned zero. */
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said){ said=1; LOG("gpu: suppressed early AbortImpl entry=%llx lr=%llx x0=%llx x1=%llx x2=%llx x3=%llx -> pc=%llx\n",(unsigned long long)entry,(unsigned long long)c->x[30],(unsigned long long)c->x[0],(unsigned long long)c->x[1],(unsigned long long)c->x[2],(unsigned long long)c->x[3],(unsigned long long)c->pc); } }
+
+/* Switch 2's nn::gs startup reaches these SDK entry points before any GPU
+   service is opened.  Keep the graphics system alive long enough for the
+   native backend to report its actual missing pieces.  The donated-memory
+   query has three u64 output parameters (x0..x2); non-zero, page-aligned
+   values are enough to satisfy the SDK's startup bookkeeping for now. */
+static void hle_query_donated_transfer_memory(CPU* RESTRICT c, u64 entry){ (void)entry;
+  static const u64 sizes[] = { 0x10000000ull, 0x10000000ull, 0x10000000ull };
+  u64 p0=c->x[0], p1=c->x[1], p2=c->x[2];
+  for(int i=0;i<3;i++){ u64 p=c->x[i]; if(p && p<0x10000000000ull) memcpy(GP(p),&sizes[i],8); }
+  /* In this title's generated wrapper the query is consumed as a boolean
+     predicate: non-zero means the donated-memory values are usable. */
+  c->x[0]=1;
+  /* This SDK thunk is reached through a tail-call table entry whose LR is
+     the thunk address itself.  Returning to x30 would spin at a842350; the
+     saved frame identifies a8519f8 as BootGraphicsSystem's continuation. */
+  c->pc=(c->x[30]==0xA842350ull) ? 0xA8519F8ull : c->x[30];
+  static int said; if(!said){ said=1; LOG("gpu: TryQueryDonatedTransferMemoryUsage(%llx,%llx,%llx) answered by the runtime (256 MiB each)\n",(unsigned long long)p0,(unsigned long long)p1,(unsigned long long)p2); } }
+
+static void hle_boot_graphics_system(CPU* RESTRICT c, u64 entry){ (void)entry;
+  /* nn::gs::CheckGraphicsSystemInitialized reads this SDK refcount.  The
+     real bootstrap sets it before returning; preserve that contract while
+     the native NVN2 backend remains bypassed. */
+  gw32(0xB2586A0ull,1);
+    /* __cxa_guard_acquire returns non-zero for the first initialization.
+       The guard object itself is from the unavailable SDK image, so do not
+       dereference it; let the generated singleton body run once instead. */
+    c->x[0]=1; c->pc=c->x[30];
+  static int said; if(!said){ said=1; LOG("gpu: BootGraphicsSystem bypassed (NVN2 backend unavailable)\n"); } }
+
+static void hle_vi23_initialize(CPU* RESTRICT c, u64 entry){ (void)entry;
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said){ said=1; LOG("vi2: nn::vi23::sdk::Initialize answered by the runtime\n"); } }
+
+static void hle_syncpt_initialize(CPU* RESTRICT c, u64 entry){ (void)entry;
+  /* CheckGraphicsSystemInitialized runs immediately after this title's
+     one-time bootstrap.  Mark the SDK state initialized while the real GSV
+     bootstrap is being brought up below. */
+  gw32(0xB2586A0ull,1);
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said){ said=1; LOG("gpu: nn::syncpt::sdk::Initialize answered by the runtime\n"); } }
+
+static void hle_cxa_guard_acquire(CPU* RESTRICT c, u64 entry){ (void)entry;
+  /* The generated Switch 2 VI singleton carries a guard pointer from the
+     title's unavailable SDK image.  Do not dereference it; report first-time
+     initialization so the generated singleton body still runs. */
+  c->x[0]=1; c->pc=c->x[30];
+  static int said; if(!said){ said=1; LOG("vi2: bypassed invalid __cxa_guard_acquire pointer\n"); } }
+
+static void hle_cxa_guard_finish(CPU* RESTRICT c, u64 entry){ (void)entry;
+  /* The matching release/abort helpers would store into the same guard
+     object, which belongs to the unavailable SDK image. */
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said){ said=1; LOG("vi2: bypassed foreign __cxa_guard_release/abort\n"); } }
+
+static void hle_remote_memory_usage(CPU* RESTRICT c, u64 entry){ (void)entry;
+  /* nn::os::GetRemoteMemoryUsage is queried after GetInfo(31/32) reports that
+     the Switch 2 remote-memory service is unavailable. */
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said){ said=1; LOG("gpu: GetRemoteMemoryUsage answered unavailable\n"); } }
+
+static void hle_open_default_display(CPU* RESTRICT c, u64 entry){ (void)entry;
+  /* Keep this identical to the generated title-specific SDK stub.  The
+     display singleton is consumed through the 0xB287228 global; writing the
+     adjacent 0xB2871F8 slot leaves NVN2 with a null display state and it
+     never reaches the nx2:gsv session. */
+  /* This title's A9A8010 ABI passes the output display slot in x0.  The
+     generated body begins with WR64([x0], 0), so writing x1 leaves the
+     caller's display object null and prevents the nx2:gsv path from opening. */
+  if(c->x[0]>=AS_BASE && c->x[0]<=AS_SIZE-8) gw64(c->x[0],0xB2871F8ull);
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said){ said=1; LOG("gpu: OpenDefaultDisplay returned the SDK default display\n"); } }
+
 /* sead::ExpHeap only works from one thread at a time unless the game turns its lock on. on the switch the threads
    sharing one of those heaps sit on the same core and never run at once, here they do: odyssey's archive loader and
    HakoniwaSequence::initSystem broke the free list on PCs with many cores and the game halted in ExpHeap::tryAlloc.
@@ -686,11 +772,51 @@ void hle_install(void){
     if(heap_fn_wanted(nm) && !getenv("SWR_NO_HEAP_LOCK") && a>=g_code_lo && a<g_code_hi && !(a&3) && g_nhl<HL_MAX){
       GuestFn* d=&g_disp[(a-g_code_lo)/4]; if(*d && *d!=hle_heap_locked){ if(!g_nhl) pm_init(&g_hl_m); g_hl[g_nhl].a=a; g_hl[g_nhl].f=*d; g_nhl++; *d=hle_heap_locked; }
       continue; }
+    /* Keep the generated BootGraphicsSystem body active.  It initializes the
+       title's service-handle globals; replacing it with a success return
+       leaves those handles at zero and the title spins on svcSendSyncRequest
+       with an invalid handle. */
+    if(strstr(nm,"BootGraphicsSystem")) continue;
+    if(strstr(nm,"TryQueryDonatedTransferMemoryUsage")){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_query_donated_transfer_memory; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
+    if(strstr(nm,"__cxa_guard_acquire")){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_cxa_guard_acquire; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
+    if(strstr(nm,"__cxa_guard_release") || strstr(nm,"__cxa_guard_abort")){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_cxa_guard_finish; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
+    /* Keep the generated query wrapper active: it performs the SDK's Result
+       cleanup and output-structure bookkeeping around the implementation
+       thunk. */
+    /* Let the generated BootGraphicsSystem execute.  Its initialization
+       sequence creates the title's NVN2 service objects; short-circuiting it
+       leaves the main thread waiting forever before nx2:gsv is opened. */
+    /* Let the generated sync-point initializer establish its globals.  Its
+       assertion is covered by the temporary AbortImpl recovery below. */
+    if(!strncmp(nm,"_ZN2nn4diag6detail9AbortImpl",28)){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_abort_impl; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
+    /* Keep the generated A9A8010 implementation active.  It performs the
+       title's display/service setup; replacing it here bypasses the nx2:gsv
+       handshake and leaves the game in its pre-render wait loop. */
     if(strncmp(nm,"_ZN2nn3hid",10) || !strstr(nm,"ShowController")) continue;
     if(a<g_code_lo || a>=g_code_hi || (a&3)) continue;
     int with_info= strstr(nm,"ShowControllerSupport") && strstr(nm,"ControllerSupportResultInfo");
     g_disp[(a-g_code_lo)/4]= with_info? hle_ctrl_support : hle_ctrl_other; n++;
     LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+  /* This generated SDK helper has no exported dynsym name in the title, but
+     it is the first function entered after GetInfo(31/32) reports no remote
+     memory.  Return the documented unavailable value instead of reaching the
+     title's AbortImpl path. */
+  if(g_code_lo<=0xA5C19C0ull && 0xA5C19C0ull<g_code_hi){
+    g_disp[(0xA5C19C0ull-g_code_lo)/4]=hle_remote_memory_usage;
+    LOG("hle: nn::os::GetRemoteMemoryUsage at a5c19c0\n");
+  }
   if(g_nhl) LOG("hle: %d sead::ExpHeap functions run under one lock (threads that share a core on the switch run at once here)\n",g_nhl);
   (void)n; }
 
@@ -857,7 +983,15 @@ static void swr_svc_(CPU* c, u32 imm){
   case 0x1F: { char name[16]={0}; memcpy(name,GP(x[1]),12);
     if(!strcmp(name,"sm:")){ SvcObj* o=svc_open("sm:"); x[0]=0; x[1]=session_new(o); return; }
     WARN("ConnectToNamedPort(%s) unknown\n",name); x[0]=R_NOTFOUND; return; }
-  case 0x21: ipc_handle(t,(u32)x[0],t->tls); return;
+  case 0x21: {
+    u32 h=(u32)x[0];
+    /* The NX2 SDK can transiently issue its GSV TIPC request before the
+       generated handle slot is populated.  Service 2000 has already created
+       the same logical object, so service the request against a temporary
+       nx2:gsv session instead of spinning on handle zero. */
+    if(!h){ extern SvcObj* svc_nx2_gsv_new(void); h=session_new(svc_nx2_gsv_new()); ipc_handle(t,h,t->tls); h_close(h); }
+    else ipc_handle(t,h,t->tls);
+    return; }
   case 0x22: ipc_handle(t,(u32)x[2],x[0]); return;
   case 0x24: x[0]=0; x[1]=0x51; return;
   case 0x25: { KObj* o=h_get((u32)x[1]); KThread* n=(o&&o->type==KO_THREAD)? (KThread*)o : t; x[0]=0; x[1]=n->id; return; }

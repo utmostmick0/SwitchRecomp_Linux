@@ -248,9 +248,40 @@ def switch2_graphics_boot_stub(f, skip_remote_memory, skip_syncpoint_init,
                                skip_donated_transfer_memory_query=False):
     if f.mod.name != 'sdk':
         return None
+    if f.start == 0xA9C1490:
+        return ('void %s(CPU* RESTRICT c, u64 e){ (void)e; '
+                'c->x[0]=0xffffffffull; c->pc=c->x[30]; }') % f.name
+    if f.start == 0xA9C2510:
+        return ('void %s(CPU* RESTRICT c, u64 e){ (void)e; '
+                'c->x[0]=0; c->pc=c->x[30]; }') % f.name
+    if f.start == 0xA9C74C0:
+        return ('void %s(CPU* RESTRICT c, u64 e){ (void)e; '
+                'c->x[0]=0xffffffffull; c->pc=c->x[30]; }') % f.name
+    if f.start == 0xAA045F0 or f.start == 0xAA04690 or f.start == 0xAA048B0:
+        return ('void %s(CPU* RESTRICT c, u64 e){ (void)e; '
+                'c->x[0]=0; c->pc=c->x[30]; }') % f.name
+    if f.start == 0xA9EC340 or f.start == 0xA9EC350 or f.start == 0xA9EC840:
+        return ('void %s(CPU* RESTRICT c, u64 e){ (void)e; '
+                'c->x[0]=0; c->pc=c->x[30]; }') % f.name
+    if f.start == 0xA9EC260:
+        return ('void %s(CPU* RESTRICT c, u64 e){ (void)e; '
+                'c->x[0]=0; c->pc=c->x[30]; }') % f.name
+    if f.start == 0xA9ECD90:
+        return ('void %s(CPU* RESTRICT c, u64 e){ (void)e; '
+                'c->x[0]=0; c->pc=c->x[30]; }') % f.name
+    if f.start == 0xA9EC9A0:
+        return ('void %s(CPU* RESTRICT c, u64 e){ (void)e; '
+                'c->x[0]=0; c->pc=c->x[30]; }') % f.name
+    if f.start == 0xA9ECAE0:
+        return ('void %s(CPU* RESTRICT c, u64 e){ (void)e; '
+                'c->x[0]=0; c->pc=c->x[30]; }') % f.name
     symbol = f.mod.syms.get(f.start - f.mod.base)
     if skip_donated_transfer_memory_query and symbol == SWITCH2_DONATED_TRANSFER_MEMORY_QUERY_SYMBOL:
-        return 'void %s(CPU* RESTRICT c, u64 e){ (void)e; c->x[0]=0; c->pc=c->x[30]; }' % f.name
+        return ('void %s(CPU* RESTRICT c, u64 e){ u8* const M=c->mem; (void)e; '
+                'if(c->x[0] && c->x[0]<0x10000000000ull) WR64(c->x[0],0x10000000ull); '
+                'if(c->x[1] && c->x[1]<0x10000000000ull) WR64(c->x[1],0x10000000ull); '
+                'if(c->x[2] && c->x[2]<0x10000000000ull) WR64(c->x[2],0x10000000ull); '
+                'c->x[0]=1; c->pc=c->x[30]; }') % f.name
     if skip_native_memory_init and symbol == SWITCH2_NATIVE_MEMORY_INIT_SYMBOL:
         return 'void %s(CPU* RESTRICT c, u64 e){ (void)e; c->x[0]=0; c->pc=c->x[30]; }' % f.name
     if skip_frame_management_init and symbol == SWITCH2_FRAME_MANAGEMENT_INIT_SYMBOL:
