@@ -105,7 +105,13 @@ static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 1: case 3: out32(c,1); return 0;
     case 5: out32(c,7); return 0;
-    case 11: case 31: case 32: out_copy_h(c,ev_handle(kevent_new("nx2 vi2",0))); return 0;
+    case 11: case 31: case 32: {
+      /* VI2 lifecycle notifications are completion events in the title's
+         startup path.  There is no native NVN2 producer yet, so signal them
+         immediately instead of leaving the main thread parked forever. */
+      KEvent* e=kevent_new("nx2 vi2",0); e->signaled=1;
+      out_copy_h(c,ev_handle(e)); return 0;
+    }
     /* Eden's working trace uses these VI2 lifecycle/event commands.  They
        are deliberately tolerant: the native renderer owns the actual frame
        work, while the SDK needs the session to acknowledge the protocol. */
@@ -117,12 +123,20 @@ static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
   return quiet_ok(o,c);
 }
 
+static KEvent* g_nx2_gpu_event;
+
 static int nx2_gpu_disp(SvcObj* o, IpcCtx* c){
   (void)o;
   switch(c->cmd){
     case 11: out32(c,0); out32(c,31); return 0;
-    case 12: out_copy_h(c,ev_handle(kevent_new("nx2 gpu",0))); return 0;
-    case 21: return 0;
+    case 12:
+      if(!g_nx2_gpu_event) g_nx2_gpu_event=kevent_new("nx2 gpu",0);
+      out_copy_h(c,ev_handle(g_nx2_gpu_event)); return 0;
+    case 21:
+      /* The SDK waits on the event returned by command 12 after starting an
+         operation.  No native NVN2 work is queued yet, so complete it here. */
+      if(g_nx2_gpu_event) kevent_signal(g_nx2_gpu_event);
+      return 0;
     case 22: out_obj(c,svcobj_new("nx2:gpu-sub",nx2_gpu_disp,0)); return 0;
     case 33: out32(c,1); return 0;
     case 41: out32(c,1); return 0;
@@ -138,7 +152,11 @@ static int nx2_gsv_disp(SvcObj* o, IpcCtx* c){
     case 4: case 126: case 201: case 301:
     case 401: case 402: case 403: case 434: case 1101: case 1102: return 0;
     case 11: { /* RegisterClientHandle: wake the client-side completion event. */
-      if(c->ncopy){ KEvent* e=(KEvent*)h_get_type(c->copy_h[0],KO_EVENT); if(e) kevent_signal(e); }
+      if(c->ncopy){
+        /* TIPC sign-extends the 16-bit kernel handle in this request. */
+        u32 h=c->copy_h[0]; if((h&0xFFFF0000u)==0xFFFF0000u) h&=0xFFFFu;
+        KEvent* e=(KEvent*)h_get_type(h,KO_EVENT); if(e) kevent_signal(e);
+      }
       return 0;
     }
     case 101: /* CreateGpuAccessibleMemory / register a CPU range */
@@ -249,7 +267,14 @@ static int am_self(SvcObj* o, IpcCtx* c){          /* ISelfController */
     case 0: { extern void process_exit(int); process_exit(0); return 0; }   /* Exit: the system kills the process, libnx just sleeps
                                                                                until that happens */
     case 9: out_copy_h(c,ev_handle(g_launch_ev)); return 0;            /* GetLibraryAppletLaunchableEvent */
-    case 2000: out_obj(c,svc_nx2_gsv_new()); LOG("applet: ISelfController::2000 returned nx2:gsv\n"); return 0;
+    case 2000: {
+      /* Switch 2's raw-session reply is a copied handle.  A moved handle is
+         consumed by the CMIF wrapper as a different descriptor, leaving its
+         output session field at zero and sending the caller into AbortImpl. */
+      out_copy_h(c,session_new(svc_nx2_gsv_new()));
+      LOG("applet: ISelfController::2000 returned copied nx2:gsv session\n");
+      return 0;
+    }
     case 40: { static u64 layer=1; out64(c,layer++); return 0; }       /* CreateManagedDisplayLayer */
     case 41: out64(c,0); return 0;
     case 44: out64(c,1); out64(c,2); return 0;

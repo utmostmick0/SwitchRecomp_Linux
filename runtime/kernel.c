@@ -665,8 +665,14 @@ static void hle_ctrl_other(CPU* RESTRICT c, u64 entry){ (void)entry; c->x[0]=0; 
 static void hle_abort_impl(CPU* RESTRICT c, u64 entry){ (void)entry;
   /* AbortImpl is noreturn, but this unavailable-platform result has a valid
      generated continuation once remote-memory helpers have returned zero. */
+  u64 lr=c->x[30];
   c->x[0]=0; c->pc=c->x[30];
-  static int said; if(!said){ said=1; LOG("gpu: suppressed early AbortImpl entry=%llx lr=%llx x0=%llx x1=%llx x2=%llx x3=%llx -> pc=%llx\n",(unsigned long long)entry,(unsigned long long)c->x[30],(unsigned long long)c->x[0],(unsigned long long)c->x[1],(unsigned long long)c->x[2],(unsigned long long)c->x[3],(unsigned long long)c->pc); } }
+  /* A failed SDK TLS-slot assertion is reached through the indirect
+     constructor call in F_A5BB898.  Returning to that function's entry
+     re-executes the constructor with x0 cleared and crashes.  Resume at its
+     generated cleanup/return block instead. */
+  if(lr==0xA5BB898ull) c->pc=0xA5BB8B8ull;
+  static int said; if(!said){ said=1; LOG("gpu: suppressed early AbortImpl entry=%llx lr=%llx x0=%llx x1=%llx x2=%llx x3=%llx -> pc=%llx\n",(unsigned long long)entry,(unsigned long long)lr,(unsigned long long)c->x[0],(unsigned long long)c->x[1],(unsigned long long)c->x[2],(unsigned long long)c->x[3],(unsigned long long)c->pc); } }
 
 /* Switch 2's nn::gs startup reaches these SDK entry points before any GPU
    service is opened.  Keep the graphics system alive long enough for the
@@ -727,6 +733,24 @@ static void hle_remote_memory_usage(CPU* RESTRICT c, u64 entry){ (void)entry;
      the Switch 2 remote-memory service is unavailable. */
   c->x[0]=0; c->pc=c->x[30];
   static int said; if(!said){ said=1; LOG("gpu: GetRemoteMemoryUsage answered unavailable\n"); } }
+
+static u32 nx2_gsv_fallback_handle(void){
+  static u32 h;
+  if(!h){ extern SvcObj* svc_nx2_gsv_new(void); h=session_new(svc_nx2_gsv_new()); }
+  return h;
+}
+
+/* The generated SDK wrapper passes a pointer to its session-handle slot to
+   SendSyncRequest.  The title's first NVN2 slot is initially zero; install
+   the persistent GSV session there before dispatching the TIPC request. */
+static void hle_send_sync_request(CPU* RESTRICT c, u64 entry){ (void)entry;
+  KThread* t=kthread_cur();
+  u64 hp=c->x[0]; u32 h=(hp>=AS_BASE && hp<=AS_SIZE-4)?gr32(hp):0;
+  if(!h && hp>=AS_BASE && hp<=AS_SIZE-4){ h=nx2_gsv_fallback_handle(); gw32(hp,h); }
+  if(!h) h=nx2_gsv_fallback_handle();
+  ipc_handle(t,h,t->tls);
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said){ said=1; LOG("nx2: SendSyncRequest installed GSV handle %x in the title slot\n",h); } }
 
 static void hle_open_default_display(CPU* RESTRICT c, u64 entry){ (void)entry;
   /* Keep this identical to the generated title-specific SDK stub.  The
@@ -816,6 +840,10 @@ void hle_install(void){
   if(g_code_lo<=0xA5C19C0ull && 0xA5C19C0ull<g_code_hi){
     g_disp[(0xA5C19C0ull-g_code_lo)/4]=hle_remote_memory_usage;
     LOG("hle: nn::os::GetRemoteMemoryUsage at a5c19c0\n");
+  }
+  if(g_code_lo<=0xA5ED408ull && 0xA5ED408ull<g_code_hi){
+    g_disp[(0xA5ED408ull-g_code_lo)/4]=hle_send_sync_request;
+    LOG("hle: nn::os::SendSyncRequest at a5ed408\n");
   }
   if(g_nhl) LOG("hle: %d sead::ExpHeap functions run under one lock (threads that share a core on the switch run at once here)\n",g_nhl);
   (void)n; }
@@ -989,7 +1017,17 @@ static void swr_svc_(CPU* c, u32 imm){
        generated handle slot is populated.  Service 2000 has already created
        the same logical object, so service the request against a temporary
        nx2:gsv session instead of spinning on handle zero. */
-    if(!h){ extern SvcObj* svc_nx2_gsv_new(void); h=session_new(svc_nx2_gsv_new()); ipc_handle(t,h,t->tls); h_close(h); }
+    if(!h){
+      /* Keep one fallback session alive: GSV command 11 registers state that
+         command 101 and later GPU setup requests depend on. */
+      u32 nx2_gsv_fallback=nx2_gsv_fallback_handle();
+      static u32 zero_req;
+      if(zero_req++<12){
+        u32 w0=gr32(t->tls), w1=gr32(t->tls+4), w2=gr32(t->tls+8), w3=gr32(t->tls+12);
+        LOG("nx2: zero-handle TIPC request #%u words=%08x %08x %08x %08x\n",zero_req,w0,w1,w2,w3);
+      }
+      ipc_handle(t,nx2_gsv_fallback,t->tls);
+    }
     else ipc_handle(t,h,t->tls);
     return; }
   case 0x22: ipc_handle(t,(u32)x[2],x[0]); return;
