@@ -100,23 +100,38 @@ static u64 g_user_id[2]={0x0123456789ABCDEFull,0xFEDCBA9876543210ull};
    vi23 initialization obtains this from ISelfController::2000, then opens
    nx2:gpu (GSV 497) and nx2:vi2 (GSV 305).  Keep the session objects real so
    the SDK does not mistake an empty IPC reply for an unavailable display. */
+static KEvent* g_nx2_vi2_events[8];
+
+static KEvent* nx2_vi2_event(IpcCtx* c){
+  u32 index=in32(c,0)&7u;
+  if(!g_nx2_vi2_events[index]){
+    g_nx2_vi2_events[index]=kevent_new("nx2 vi2 native",0);
+    g_nx2_vi2_events[index]->signaled=1;
+  }
+  return g_nx2_vi2_events[index];
+}
+
 static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
   (void)o;
   switch(c->cmd){
     case 1: case 3: out32(c,1); return 0;
     case 5: out32(c,7); return 0;
-    case 11: case 31: case 32: {
-      /* VI2 lifecycle notifications are completion events in the title's
-         startup path.  There is no native NVN2 producer yet, so signal them
-         immediately instead of leaving the main thread parked forever. */
-      KEvent* e=kevent_new("nx2 vi2",0); e->signaled=1;
-      out_copy_h(c,ev_handle(e)); return 0;
-    }
+    case 11: out_copy_h(c,ev_handle(kevent_new("nx2 vi2",0))); return 0;
+    case 31: case 32: out_copy_h(c,ev_handle(nx2_vi2_event(c))); return 0;
+    case 212:
+      /* GetLayerBufferBits: all compositor slots are immediately available
+         until the native compositor is connected. */
+      out64(c,0x7FFF); return 0;
+    case 229:
+      /* PresentClientBuffer: success, all slots returned, and zero fence
+         metadata.  This is the first command that lets the title enter its
+         render loop. */
+      out64(c,0x7FFF); out32(c,0); out32(c,0); out32(c,0); return 0;
     /* Eden's working trace uses these VI2 lifecycle/event commands.  They
        are deliberately tolerant: the native renderer owns the actual frame
        work, while the SDK needs the session to acknowledge the protocol. */
     case 51: case 101: case 102: case 107: case 111: case 112:
-    case 201: case 202: case 212: case 228: case 229:
+    case 201: case 202: case 228:
     case 251: case 252: case 261: case 265: case 267: case 271:
     case 351: case 352: return 0;
   }
