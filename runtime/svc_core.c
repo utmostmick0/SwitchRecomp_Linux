@@ -4,6 +4,7 @@
 /* sm, am, set, time, acc, apm and a bunch of stub services that just say ok (nifm, shop, prepo...) */
 #include "rt.h"
 #include "audio.h"
+#include "native_vi2.h"
 #include <math.h>
 
 KShmem* kshmem_new(u64 size, const char* name);
@@ -30,16 +31,21 @@ static SvcObj* new_sm(void){ return svcobj_new("sm:",sm_disp,0); }
 /* unknown service -> generic stub, everything succeeds */
 typedef struct { char name[16]; } GenData;
 
-static int generic_disp(SvcObj* o, IpcCtx* c){ extern int ipc_warn_once(const char*,u32); if(ipc_warn_once(((GenData*)o->data)->name,c->cmd)) WARN("  [not implemented] %s cmd %u -> ok\n",((GenData*)o->data)->name,c->cmd); return 0; }
+/* An unimplemented command must not look like a successful command with an
+   empty payload.  Keep the result-only reply shape intact; callers that need
+   buffers or handles must be implemented in their typed dispatcher. */
+#define IPC_UNSUPPORTED RC(128,2)
+
+static int generic_disp(SvcObj* o, IpcCtx* c){ extern int ipc_warn_once(const char*,u32); if(ipc_warn_once(((GenData*)o->data)->name,c->cmd)) WARN("  [not implemented] %s cmd %u -> unsupported\n",((GenData*)o->data)->name,c->cmd); return IPC_UNSUPPORTED; }
 
 SvcObj* svc_generic(const char* n){ SvcObj* o=svcobj_new("generic",generic_disp,sizeof(GenData)); strncpy(((GenData*)o->data)->name,n,15); o->name=((GenData*)o->data)->name; return o; }
 
 /* services that only get an empty ok. each (service, command) gets logged once, so if a game gets stuck waiting on
    one of them you can see it in the log */
 static int quiet_ok(SvcObj* o, IpcCtx* c){ static struct { const char* n; u32 cmd; } seen[96]; static int ns;
-  for(int i=0;i<ns;i++) if(seen[i].n==o->name && seen[i].cmd==c->cmd) return 0;
-  if(ns<96){ seen[ns].n=o->name; seen[ns].cmd=c->cmd; ns++; LOG("ipc: %s cmd %u answered empty\n",o->name,c->cmd); }
-  return 0; }
+  for(int i=0;i<ns;i++) if(seen[i].n==o->name && seen[i].cmd==c->cmd) return IPC_UNSUPPORTED;
+  if(ns<96){ seen[ns].n=o->name; seen[ns].cmd=c->cmd; ns++; LOG("ipc: %s cmd %u unsupported (no fabricated reply)\n",o->name,c->cmd); }
+  return IPC_UNSUPPORTED; }
 
 static SvcObj* quiet(const char* name){ return svcobj_new(name,quiet_ok,0); }
 
@@ -100,20 +106,86 @@ static u64 g_user_id[2]={0x0123456789ABCDEFull,0xFEDCBA9876543210ull};
    vi23 initialization obtains this from ISelfController::2000, then opens
    nx2:gpu (GSV 497) and nx2:vi2 (GSV 305).  Keep the session objects real so
    the SDK does not mistake an empty IPC reply for an unavailable display. */
-static KEvent* g_nx2_vi2_events[8];
-static KEvent* g_nx2_vi2_vsync;
 static int g_nx2_vi2_vsync_thread;
+
+typedef struct {
+  u32 guest_id,native_id;
+  u64 cpu,size,gpu,gpu_size;
+  int mapped;
+} Nx2GsvMemory;
+typedef struct {
+  u32 guest_id,native_id;
+} Nx2GsvImage;
+typedef struct {
+  u64 owner;
+  NativeVi2* vi;
+  u32 next_memory,next_image;
+  Nx2GsvMemory memory[64];
+  Nx2GsvImage image[64];
+} Nx2GsvData;
+typedef struct { SvcObj* session; Nx2GsvData* gsv; } Nx2Vi2Data;
+static NativeVi2* g_nx2_vi2_sessions[64];
+static PMutex g_nx2_vi2_sessions_lock;
+
+static void nx2_vi2_session_add(NativeVi2* vi){
+  pm_lock(&g_nx2_vi2_sessions_lock);
+  for(unsigned i=0;i<64;i++) if(!g_nx2_vi2_sessions[i]){ g_nx2_vi2_sessions[i]=vi; native_vi2_ref(vi); break; }
+  pm_unlock(&g_nx2_vi2_sessions_lock);
+}
+static void nx2_vi2_session_remove(NativeVi2* vi){
+  pm_lock(&g_nx2_vi2_sessions_lock);
+  for(unsigned i=0;i<64;i++) if(g_nx2_vi2_sessions[i]==vi){ g_nx2_vi2_sessions[i]=NULL; native_vi2_unref(vi); break; }
+  pm_unlock(&g_nx2_vi2_sessions_lock);
+}
+
+static int nx2_gva_readable(u64 address,u64 size){
+  if(!address || !size || address>UINT64_MAX-(size-1)) return 0;
+  u64 last=address+size-1;
+  for(u64 p=address;;){
+    if(!gmmu_translate(p)) return 0;
+    if(p>last-0xFFF) break;
+    p=(p+0x1000)&~0xFFFull;
+  }
+  return 1;
+}
+
+static Nx2GsvMemory* nx2_gsv_memory(Nx2GsvData* d,u32 id){
+  if(!d || !id) return NULL;
+  for(unsigned i=0;i<64;i++) if(d->memory[i].guest_id==id) return &d->memory[i];
+  return NULL;
+}
+
+static Nx2GsvImage* nx2_gsv_image(Nx2GsvData* d,u32 id){
+  if(!d || !id) return NULL;
+  for(unsigned i=0;i<64;i++) if(d->image[i].guest_id==id) return &d->image[i];
+  return NULL;
+}
+
+static void nx2_gsv_destroy(SvcObj* o){
+  Nx2GsvData* d=o->data;
+  if(!d) return;
+  nx2_vi2_session_remove(d->vi);
+  for(unsigned i=0;i<64;i++) if(d->image[i].guest_id) native_vi2_unregister(d->vi,d->image[i].native_id);
+  native_vi2_unref(d->vi);
+  for(unsigned i=0;i<64;i++) if(d->memory[i].guest_id && d->memory[i].native_id)
+    nv_native_memory_release(d->owner,d->memory[i].native_id);
+  nv_native_owner_close(d->owner);
+}
+
+static void nx2_vi2_destroy(SvcObj* o){
+  Nx2Vi2Data* d=o->data;
+  if(d && d->session) svcobj_unref(d->session);
+}
+
+static SvcObj* nx2_vi2_new(SvcObj* gsv);
 
 static void nx2_vi2_vsync_clock(void* arg){
   (void)arg;
   plat_thread_low_priority();
   for(;;){
-    KEvent* e=__atomic_load_n(&g_nx2_vi2_vsync,__ATOMIC_ACQUIRE);
-    if(e) kevent_signal(e);
-    for(int i=0;i<8;i++){
-      KEvent* n=__atomic_load_n(&g_nx2_vi2_events[i],__ATOMIC_ACQUIRE);
-      if(n) kevent_signal(n);
-    }
+    pm_lock(&g_nx2_vi2_sessions_lock);
+    for(unsigned i=0;i<64;i++) if(g_nx2_vi2_sessions[i]) native_vi2_signal_vblank(g_nx2_vi2_sessions[i]);
+    pm_unlock(&g_nx2_vi2_sessions_lock);
     plat_sleep_ns(16666667);
   }
 }
@@ -124,16 +196,8 @@ static void nx2_vi2_start_vsync_clock(void){
       __atomic_store_n(&g_nx2_vi2_vsync_thread,0,__ATOMIC_RELEASE);
 }
 
-static KEvent* nx2_vi2_event(IpcCtx* c){
-  u32 index=in32(c,0)&7u;
-  if(!g_nx2_vi2_events[index]){
-    g_nx2_vi2_events[index]=kevent_new("nx2 vi2 native",1);
-  }
-  return g_nx2_vi2_events[index];
-}
-
 static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
-  (void)o;
+  Nx2Vi2Data* vd=o->data;
   static u32 trace_count;
   if(trace_count<96){
     LOG("nx2:vi2 cmd=%u raw=%08x,%08x,%08x,%08x copy=%d move=%d\n",
@@ -145,51 +209,46 @@ static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
     case 5: out32(c,7); return 0;
     case 11:
       /* NVN2 waits on this event before it starts submitting the first frame.
-         The native compositor is not present in the host runtime yet, so a
-         permanently signalled event is the correct bootstrap behavior; an
-         unsignalled one leaves the title in its startup polling loop forever. */
-      if(!g_nx2_vi2_vsync){
-        g_nx2_vi2_vsync=kevent_new("nx2 vi2 vsync",1);
-        /* Command 11 is the bootstrap vblank source.  The title waits on it
-           immediately, before the periodic clock is necessarily running. */
-        g_nx2_vi2_vsync->signaled=1;
-      }
-      out_copy_h(c,ev_handle(g_nx2_vi2_vsync)); return 0;
+         It is owned by this NativeVi2 instance and is signaled only by the
+         vblank clock. */
+      if(!vd || !vd->gsv) return IPC_UNSUPPORTED;
+      out_copy_h(c,ev_handle(native_vi2_vblank_event(vd->gsv->vi))); return 0;
     case 21:
       /* Bananza performs its first display-state transition here and then
-         waits on the event from command 11.  Treat the transition as an
-         immediate vblank until a compositor-backed timer exists. */
-      if(g_nx2_vi2_vsync){ kevent_signal(g_nx2_vi2_vsync); }
-      for(int i=0;i<8;i++) if(g_nx2_vi2_events[i]){
-        kevent_signal(g_nx2_vi2_events[i]);
-      }
+         waits on the event from command 11.  The transition itself does not
+         claim that a hardware vblank has occurred. */
       return 0;
     case 31:
-      out_copy_h(c,ev_handle(nx2_vi2_event(c)));
+      if(!vd || !vd->gsv) return IPC_UNSUPPORTED;
+      out_copy_h(c,ev_handle(native_vi2_vblank_event(vd->gsv->vi)));
       nx2_vi2_start_vsync_clock();
       return 0;
     case 32: {
-      /* DuplicateNativeEvent hands the same slot back after binding.  Lichii
-         keeps the native event alive and the vsync source can signal it again;
-         do the same so the first frame is not stranded behind a consumed
-         one-shot event. */
-      KEvent* e=nx2_vi2_event(c);
-      out_copy_h(c,ev_handle(e)); return 0;
+      /* The completion event is distinct from vblank and is signaled only by
+         the native presentation callback. */
+      if(!vd || !vd->gsv) return IPC_UNSUPPORTED;
+      out_copy_h(c,ev_handle(native_vi2_completion_event(vd->gsv->vi))); return 0;
     }
     case 212:
       /* GetLayerBufferBits: all compositor slots are immediately available
          until the native compositor is connected. */
       out64(c,0x7FFF); return 0;
     case 229:
-      /* PresentClientBuffer: success, all slots returned, and zero fence
-         metadata.  This is the first command that lets the title enter its
-         render loop. */
-      out64(c,0x7FFF); out32(c,0); out32(c,0); out32(c,0); return 0;
+      /* PresentClientBuffer: the guest image and ticket are translated into
+         the native VI2 state machine.  Admission is not completion; the
+         native callback owns the image until the host queue finishes. */
+      if(!vd || !vd->gsv) return IPC_UNSUPPORTED;
+      { u32 image=in32(c,0); u64 fence=in64(c,8); u32 threshold=in32(c,16); Nx2GsvImage* mapped=nx2_gsv_image(vd->gsv,image); u64 ticket=0;
+        if(!mapped) return RC(128,3);
+        int result=native_vi2_acquire(vd->gsv->vi,mapped->native_id,&ticket);
+        if(result!=NG_OK) return RC(128,3);
+        result=native_vi2_present(vd->gsv->vi,mapped->native_id,ticket,fence,threshold);
+        if(result!=NG_OK){ native_vi2_cancel(vd->gsv->vi,mapped->native_id,ticket); return RC(128,3); }
+        out64(c,0x7FFF); out32(c,0); out32(c,0); out32(c,0); return 0; }
     /* Eden's working trace uses these VI2 lifecycle/event commands.  They
        are deliberately tolerant: the native renderer owns the actual frame
        work, while the SDK needs the session to acknowledge the protocol. */
     case 261:
-      if(g_nx2_vi2_vsync){ kevent_signal(g_nx2_vi2_vsync); }
       return 0;
     case 51: case 101: case 102: case 107: case 111: case 112:
     case 201: case 202: case 228:
@@ -201,8 +260,6 @@ static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
 
 static KEvent* g_nx2_gpu_event;
 static u32 g_nx2_gpu_device=1;
-static u32 g_nx2_native_memory=1;
-static u32 g_nx2_native_image=1;
 
 static int nx2_gpu_disp(SvcObj* o, IpcCtx* c){
   (void)o;
@@ -329,7 +386,7 @@ static int nx2_nvsrv_disp(SvcObj* o, IpcCtx* c){
 }
 
 static int nx2_gsv_disp(SvcObj* o, IpcCtx* c){
-  (void)o;
+  Nx2GsvData* d=o->data;
   /* Keep the first bootstrap requests visible.  This is intentionally bounded:
      later GSV traffic includes per-frame commands and must not flood logs. */
   static u32 trace_count;
@@ -353,12 +410,42 @@ static int nx2_gsv_disp(SvcObj* o, IpcCtx* c){
     }
     case 101: /* CreateGpuAccessibleMemory / register a CPU range */
       out32(c,1); return 0;
-    case 111: /* CreateNativeMemory: return a non-zero native memory id. */
-      out32(c,g_nx2_native_memory++); return 0;
-    case 112: case 114: case 314: case 315: case 423: case 430:
+    case 111: { /* CreateNativeMemory: raw[0]=CPU GVA, raw[8]=byte size. */
+      if(!d || d->next_memory==UINT32_MAX) return IPC_UNSUPPORTED;
+      u64 cpu=in64(c,0), size=in64(c,8); if(!nx2_gva_readable(cpu,size)) return RC(128,2);
+      int slot=-1; for(unsigned i=0;i<64;i++) if(!d->memory[i].guest_id){ slot=(int)i; break; }
+      if(slot<0) return RC(128,2);
+      u32 native=0; int result=nv_native_memory_register(d->owner,cpu,size,&native); if(result!=NG_OK) return RC(128,2);
+      u32 guest=++d->next_memory; d->memory[slot]=(Nx2GsvMemory){guest,native,cpu,size,0,0,0}; out32(c,guest); return 0; }
+    case 112: { /* DestroyNativeMemory: release the guest handle, not its mapping lease. */
+      Nx2GsvMemory* m=nx2_gsv_memory(d,in32(c,0)); if(!m || !m->native_id) return RC(128,2);
+      int result=nv_native_memory_release(d->owner,m->native_id); if(result!=NG_OK) return RC(128,3);
+      m->native_id=0; m->guest_id=0; return 0; }
+    case 114: { /* MapNativeMemory: raw[0]=memory, raw[8]=GPU VA, raw[16]=offset, raw[24]=size. */
+      if(!d) return IPC_UNSUPPORTED;
+      Nx2GsvMemory* m=nx2_gsv_memory(d,in32(c,0)); u64 gpu=in64(c,8), off=in64(c,16), size=in64(c,24);
+      if(!m || !size || off>m->size || size>m->size-off || (gpu|off|size)&0xFFF) return RC(128,2);
+      if(nv_native_map(d->owner,m->native_id,gpu,off,size)!=NG_OK) return RC(128,2);
+      m->gpu=gpu; m->gpu_size=size; m->mapped=1; return 0; }
+    case 314: case 315: case 423:
       return 0;
-    case 429: /* CreateNativeImage: return a non-zero image id. */
-      out32(c,g_nx2_native_image++); return 0;
+    case 430: { /* DestroyNativeImage: release only an image that is not queued. */
+      Nx2GsvImage* image=nx2_gsv_image(d,in32(c,0)); if(!image) return RC(128,2);
+      int result=native_vi2_unregister(d->vi,image->native_id); if(result!=NG_OK) return RC(128,3);
+      memset(image,0,sizeof *image); return 0; }
+    case 429: { /* CreateNativeImage: memory, offset, width, height, pitch. */
+      if(!d || d->next_image==UINT32_MAX) return IPC_UNSUPPORTED;
+      Nx2GsvMemory* m=nx2_gsv_memory(d,in32(c,0)); u64 off=in64(c,8);
+      u32 width=in32(c,16), height=in32(c,20), pitch=in32(c,24);
+      u32 layout=in32(c,28), gob_height=in32(c,32), gob_depth=in32(c,36);
+      if(!m || !m->mapped || off>m->gpu_size || !width || !height || !pitch || off>UINT64_MAX-(u64)(height-1)*pitch-(u64)width*4) return RC(128,2);
+      u64 gpu=m->gpu+off, bytes=(u64)(height-1)*pitch+(u64)width*4;
+      if(bytes>m->gpu_size-off || !nx2_gva_readable(m->cpu+(gpu-m->gpu),bytes)) return RC(128,2);
+      int slot=-1; for(unsigned i=0;i<64;i++) if(!d->image[i].guest_id){ slot=(int)i; break; }
+      if(slot<0) return RC(128,2);
+      u32 native=0; int result=layout==NATIVE_VI2_BLOCK_LINEAR ? native_vi2_register_block_linear(d->vi,gpu,width,height,pitch,gob_height,gob_depth,&native) : native_vi2_register_rgba(d->vi,gpu,width,height,pitch,&native);
+      if(result!=NG_OK) return RC(128,2);
+      u32 guest=++d->next_image; d->image[slot]=(Nx2GsvImage){guest,native}; out32(c,guest); return 0; }
     case 115: out32(c,in32(c,0)); out32(c,in32(c,4)); return 0; /* grant requested features */
     case 202: out_obj(c,new_nx2_syncpt()); return 0;
     case 204: {                                  /* AttachSyncptMemory */
@@ -373,22 +460,34 @@ static int nx2_gsv_disp(SvcObj* o, IpcCtx* c){
         u32 hdr[]={1,0,max,0x40,0,0x1040,0x1100,0x0,0x100};
         memcpy(p,hdr,sizeof hdr);
       }
-      /* First event is the client-writable arm event; second is the readable
-         notification event.  Keep notification signalled until the real GPU
-         fence backend is connected. */
+      /* First event is the client-writable arm event; notification remains
+         unsignaled until a real syncpoint reaches its threshold. */
       KEvent* arm=kevent_new("nx2 gsv syncpt arm",0);
-      KEvent* notify=kevent_new("nx2 gsv syncpt notify",0); notify->signaled=1;
+      KEvent* notify=kevent_new("nx2 gsv syncpt notify",0);
       out_copy_h(c,ev_handle(arm)); out_copy_h(c,ev_handle(notify));
       return 0; }
     case 497: out_obj(c,svcobj_new("nx2:gpu",nx2_gpu_disp,0)); return 0;
-    case 305: out_obj(c,svcobj_new("nx2:vi2",nx2_vi2_disp,0)); return 0;
+    case 305: out_obj(c,nx2_vi2_new(o)); return 0;
     case 1402: out_obj(c,svcobj_new("nx2:nvsrv",nx2_nvsrv_disp,sizeof(Nx2NvData))); ((Nx2NvData*)c->out_objs[c->nout_objs-1]->data)->next_fd=1; return 0;
     case 1510: out32(c,0x100000); out32(c,0); out32(c,0x1000); out32(c,0); return 0;
   }
   return quiet_ok(o,c);
 }
 
-SvcObj* svc_nx2_gsv_new(void){ return svcobj_new("nx2:gsv",nx2_gsv_disp,0); }
+static SvcObj* nx2_vi2_new(SvcObj* gsv){
+  SvcObj* o=svcobj_new("nx2:vi2",nx2_vi2_disp,sizeof(Nx2Vi2Data));
+  if(!o) return NULL;
+  Nx2Vi2Data* d=o->data; d->session=gsv; d->gsv=gsv->data; __atomic_add_fetch(&gsv->refs,1,__ATOMIC_SEQ_CST); return o;
+}
+
+SvcObj* svc_nx2_gsv_new(void){
+  SvcObj* o=svcobj_new("nx2:gsv",nx2_gsv_disp,sizeof(Nx2GsvData));
+  if(!o) return NULL;
+  Nx2GsvData* d=o->data; d->owner=nv_native_owner_open(); d->next_memory=0; d->next_image=0;
+  if(!d->owner || !(d->vi=native_vi2_create(d->owner))){ if(d->owner) nv_native_owner_close(d->owner); svcobj_unref(o); return NULL; }
+  nx2_vi2_session_add(d->vi);
+  o->destroy=nx2_gsv_destroy; return o;
+}
 
 static void am_push_msg(u32 m){ pm_lock(&g_klock); if(g_nmsg<16) g_msgq[g_nmsg++]=m; pm_unlock(&g_klock); kevent_signal(g_msg_event); }
 
@@ -938,6 +1037,7 @@ typedef struct { u64 base, size; } RoMap;
 static RoMap g_ro[64]; static PMutex g_ro_lk;
 
 static u64 ro_map(u64 nro, u64 nro_size, u64 bss, u64 bss_size){
+  (void)bss;
   if(nro_size<0x80 || (nro|nro_size|bss_size)&0xFFF) return 0;
   const u8* h=GP(nro); if(memcmp(h+0x10,"NRO0",4)) return 0;
   u64 tot=nro_size+bss_size, base=0; const SwrModInfo* mi=NULL;
@@ -1551,6 +1651,7 @@ static SvcObj* new_ngc(void){ return svcobj_new("ngc:u",ngc_disp,0); }
 
 void svc_core_init(void){
   swr_audio_init();
+  pm_init(&g_nx2_vi2_sessions_lock);
   g_msg_event=kevent_new("applet msg",0); g_launch_ev=kevent_new("launchable",0); g_res_ev=kevent_new("res change",0); g_opmode_ev=kevent_new("opmode",0);
   g_aud_ev=kevent_new("audio renderer",0);
   pm_init(&g_aout_lk);

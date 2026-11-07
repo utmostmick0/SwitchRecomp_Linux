@@ -108,7 +108,7 @@ static int hid_disp(SvcObj* o, IpcCtx* c){
     case 68: case 82: out8(c,1); return 0;                                         /* IsSixAxisSensorFusionEnabled / AtRest */
     case 69: case 70: case 71: case 72: case 73: case 74: case 75: case 76: case 77: case 78: case 79: case 80: case 81: case 83: case 84: case 85: case 86: case 87: case 88: case 89:
       if(c->cmd==71||c->cmd==73||c->cmd==79||c->cmd==84||c->cmd==86||c->cmd==88){ out32(c,0); out32(c,0); } return 0;
-    case 100: g_style_supported=in32(c,0); no1_setup(); return 0;                  /* SetSupportedNpadStyleSet */
+    case 100: g_style_supported=in32(c,0)|1u; no1_setup(); return 0;                /* SetSupportedNpadStyleSet, keep Pro Controller available */
     case 101: out32(c,g_style_supported); return 0;
     case 106: { u32 id=in32(c,0); int i= id==0x20? 8 : id==0x10? 9 : (int)(id&7);
       if(!g_style_ev[i]){ g_style_ev[i]=kevent_new("npad style",0); kobj_ref(&g_style_ev[i]->o); kevent_signal(g_style_ev[i]); }
@@ -144,12 +144,12 @@ static int hidsys_disp(SvcObj* o, IpcCtx* c){ (void)o; (void)c; return 0; }
 
 static SvcObj* new_hidsys(void){ return svcobj_new("hid:sys",hidsys_disp,0); }
 
-/* No1 is one controller so it gets exactly one style bit: a pro controller if the game takes it, if not dual
-   joycons. two bits at once (FullKey|JoyDual) never happens on hw and nn::hid::GetVibrationDeviceHandles aborts on
-   it (kirby and the forgotten land at boot) */
+/* Present the host keyboard/SDL pad as one connected Pro Controller.  Some
+   titles reject the Joy-Con fallback while waiting for their startup input
+   device, so keep No1 stable even when the title's requested style mask is
+   narrower. */
 static void no1_setup(void){ if(!g_hid_shm) return; u8* b=kshmem_ptr(g_hid_shm);
-  if((g_style_supported&1) || !(g_style_supported&(1u<<2))) npad_setup(b,0,1u<<0,1u<<0);   /* FullKey, device: Pro Controller */
-  else npad_setup(b,0,1u<<2,(1u<<4)|(1u<<5));                                               /* JoyDual, devices: left + right Joy-Con */
+  npad_setup(b,0,1u<<0,1u<<0);   /* FullKey, device: Pro Controller */
   if(g_style_ev[0]) kevent_signal(g_style_ev[0]); }
 
 void svc_hid_init(void){

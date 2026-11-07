@@ -68,16 +68,31 @@ void gmem_w32(u64 gva, u32 v){ gmem_write(gva,&v,4); }
 void gmem_w64(u64 gva, u64 v){ gmem_write(gva,&v,8); }
 
 /* ============================================================ block linear */
-u64 bl_offset(u32 x_bytes, u32 y, u32 z, u32 width_bytes, u32 height, u32 bh_log2, u32 bd_log2){
-  u32 gob_w=(width_bytes+63)/64; u32 bh=1u<<bh_log2, bd=1u<<bd_log2;
-  u32 blocks_h=((height+7)/8+bh-1)/bh;
-  u32 gx=x_bytes/64, gy=y/8;
-  u32 block_y=gy/bh, gob_in=gy%bh; u32 block_z=z/bd, z_in=z%bd;
-  u64 block_size=512ull*bh*bd;
-  u64 off=((u64)block_z*blocks_h*gob_w + (u64)block_y*gob_w + gx)*block_size + ((u64)z_in*bh + gob_in)*512;
+static int gva_span_mapped(u64 addr, u64 size){
+  if(!size || addr>UINT64_MAX-(size-1)) return 0;
+  u64 last=addr+size-1;
+  for(u64 p=addr;;){
+    if(!gmmu_translate(p)) return 0;
+    if(p>last-0xFFF) break;
+    p=(p+0x1000)&~0xFFFull;
+  }
+  return 1;
+}
+
+static int bl_offset_checked(u32 x_bytes, u32 y, u32 z, u32 width_bytes, u32 height, u32 bh_log2, u32 bd_log2, u64* out){
+  if(!out || !width_bytes || !height || x_bytes>=width_bytes || y>=height || bh_log2>5 || bd_log2>5) return 0;
+  u64 gob_w=((u64)width_bytes+63)/64, bh=1ull<<bh_log2, bd=1ull<<bd_log2;
+  u64 blocks_h=(((u64)height+7)/8+bh-1)/bh;
+  u64 gx=x_bytes/64, gy=y/8, block_y=gy/bh, gob_in=gy%bh, block_z=z/bd, z_in=z%bd;
+  u64 block_size=512*bh*bd;
+  u64 off=((block_z*blocks_h+block_y)*gob_w+gx)*block_size+((z_in*bh+gob_in)*512);
   u32 xb=x_bytes%64, yb=y%8;
-  off+= ((xb%64)/32)*256 + (yb/2)*64 + ((xb%32)/16)*32 + (yb%2)*16 + (xb%16);
-  return off; }
+  off+=((xb/32)*256)+(yb/2)*64+((xb/16)*32)+(yb%2)*16+(xb%16);
+  *out=off; return 1;
+}
+
+u64 bl_offset(u32 x_bytes, u32 y, u32 z, u32 width_bytes, u32 height, u32 bh_log2, u32 bd_log2){
+  u64 off=0; bl_offset_checked(x_bytes,y,z,width_bytes,height,bh_log2,bd_log2,&off); return off; }
 
 void deswizzle(u8* dst, u32 dst_pitch, const u8* src, u32 w_bytes, u32 h, u32 bh_log2){
   for(u32 y=0;y<h;y++){
@@ -142,14 +157,25 @@ void i2m_data(GpuChannel* ch, u32 v){
   u32 n=ch->i2m_len-ch->i2m_pos; if(n>4) n=4; memcpy(ch->i2m_buf+ch->i2m_pos,&v,n); ch->i2m_pos+=n;
   if(ch->i2m_pos>=ch->i2m_len){
     if(ch->i2m_linear || (ch->i2m_lines<=1 && !ch->i2m_dw)){   /* single line, no surface: plain copy */
-      if(ch->i2m_lines<=1 || !ch->i2m_pitch || ch->i2m_pitch==ch->i2m_w) gmem_write(ch->i2m_addr,ch->i2m_buf,ch->i2m_len);
+      u32 lines=ch->i2m_lines?ch->i2m_lines:1; u64 pitch=ch->i2m_pitch?ch->i2m_pitch:ch->i2m_w;
+      u64 span=lines>1 ? (u64)(lines-1)*pitch+ch->i2m_w : ch->i2m_len;
+      if(pitch<ch->i2m_w || span<ch->i2m_w || span>0x10000000ull){ ch->submission_failed=1; return; }
+      if(!gva_span_mapped(ch->i2m_addr,span)){ ch->submission_failed=1; return; }
+      if(lines<=1 || pitch==ch->i2m_w) gmem_write(ch->i2m_addr,ch->i2m_buf,ch->i2m_len);
       else for(u32 y=0;y<ch->i2m_lines;y++) gmem_write(ch->i2m_addr+(u64)y*ch->i2m_pitch,ch->i2m_buf+(u64)y*ch->i2m_w,ch->i2m_w);
-      gpu_mem_written(ch->i2m_addr,ch->i2m_lines>1 && ch->i2m_pitch? (u64)ch->i2m_pitch*ch->i2m_lines : ch->i2m_len); }
+      gpu_mem_written(ch->i2m_addr,span); }
     else { /* bl dst */
       u32 w=ch->i2m_w, h=ch->i2m_lines? ch->i2m_lines : 1; u32 wb=ch->i2m_dw? ch->i2m_dw : w, hh=ch->i2m_dh? ch->i2m_dh : h;
-      u64 hi=0;
+      if(!w || !h || wb<w || hh<h || ch->i2m_x>wb-w || ch->i2m_y>hh-h || ch->i2m_bh>5 || ch->i2m_bd>5){ ch->submission_failed=1; return; }
+      u64 hi=0, o=0;
       for(u32 y=0;y<h;y++) for(u32 x=0;x<w;){ u32 xb=ch->i2m_x+x, n=16-(xb&15); if(n>w-x) n=w-x;
-        u64 o=bl_offset(xb,ch->i2m_y+y,ch->i2m_z,wb,hh,ch->i2m_bh,ch->i2m_bd); gmem_write(ch->i2m_addr+o,ch->i2m_buf+(u64)y*w+x,n); if(o+n>hi) hi=o+n; x+=n; }
+        if(!bl_offset_checked(xb,ch->i2m_y+y,ch->i2m_z,wb,hh,ch->i2m_bh,ch->i2m_bd,&o) || o>UINT64_MAX-n || o+n>0x10000000ull){ ch->submission_failed=1; return; }
+        if(o+n>hi) hi=o+n;
+        x+=n;
+      }
+      if(!hi || !gva_span_mapped(ch->i2m_addr,hi)){ ch->submission_failed=1; return; }
+      for(u32 y=0;y<h;y++) for(u32 x=0;x<w;){ u32 xb=ch->i2m_x+x, n=16-(xb&15); if(n>w-x) n=w-x;
+        bl_offset_checked(xb,ch->i2m_y+y,ch->i2m_z,wb,hh,ch->i2m_bh,ch->i2m_bd,&o); gmem_write(ch->i2m_addr+o,ch->i2m_buf+(u64)y*w+x,n); x+=n; }
       gpu_mem_written(ch->i2m_addr,hi); }
   }
 }
@@ -206,7 +232,8 @@ static void run_pushbuffer(GpuChannel* ch, const u32* w, u32 n){
     u32 mode=h>>29, sub=(h>>13)&7, m=h&0x1FFF, cnt=(h>>16)&0x1FFF;
     if(h && (mode==0 || mode==2 || mode>=6)){ /* shouldn't happen in a sane stream, log it */
       static int said; if(said<6){ said++; LOG("gpu: odd command header %08x (mode %u) at word %u of %u in channel %u; words around:",h,mode,i-1,n,ch->id);
-        for(u32 j= i>5? i-5 : 0; j<i+6 && j<n; j++) LOG(" %s%08x",j==i-1? "*" : "",w[j]); LOG("\n"); } }
+        for(u32 j= i>5? i-5 : 0; j<i+6 && j<n; j++) LOG(" %s%08x",j==i-1? "*" : "",w[j]);
+        LOG("\n"); } }
     switch(mode){
       case 1: case 3: case 5: ch->pb_mode=mode; ch->pb_sub=sub; ch->pb_m=m; ch->pb_cnt=cnt; ch->pb_k=0; break;
       /* modes 0/2 (fermi), 6 and 7 carry no data words (same as DmaPusher). don't treat them as batches, a stray

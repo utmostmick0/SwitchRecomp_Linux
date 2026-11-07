@@ -4,6 +4,9 @@
 /* HLE kernel: handles, objects, guest threads (1:1 with host threads), sync (events, mutex/condvar, address
    arbiter) and the SVCs games really call */
 #include "rt.h"
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
 
 PMutex g_klock;
 u64 g_title_id = 0x0100000000001000ull;
@@ -660,6 +663,62 @@ static void guest_backtrace(CPU* c){
     u64 lr=gr64(fp+8); WARN("   #%d %llx%s\n",i,(unsigned long long)lr,gsym(lr)); fp=gr64(fp); }
 }
 
+typedef struct {
+  u64 title_id;
+  u8 main_build_id[32];
+  const char* name;
+} HleDiagProfile;
+
+/* These are exact fingerprints of the recompiled main modules whose startup
+   diagnostics have been investigated.  Do not extend this list without
+   capturing the title ID and the complete generated module build ID. */
+static const HleDiagProfile g_hle_diag_profiles[] = {
+  {0x0100CD801CE5E000ull,
+   {0xA0,0x00,0x9B,0xB5,0xDF,0x32,0x28,0x48,0x93,0xDB,0xA9,0xCE,0x3A,0xC2,0x54,0xD7,
+    0xC4,0xEE,0x93,0x1A,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+   "Balatro"},
+  {0x040074A01BF12000ull,
+   {0x9B,0xD0,0xB8,0x87,0xB6,0x48,0x47,0xA6,0x10,0xF7,0x8A,0xFE,0x16,0x99,0xDF,0x3D,
+    0x38,0xDD,0x53,0x37,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+   "base"},
+};
+
+static const HleDiagProfile* hle_diag_profile(void){
+  if(!g_mod || !g_mod->nmods || !g_mod->mods) return NULL;
+  for(size_t i=0;i<sizeof g_hle_diag_profiles/sizeof g_hle_diag_profiles[0];i++){
+    const HleDiagProfile* p=&g_hle_diag_profiles[i];
+    if(g_title_id==p->title_id && !memcmp(g_mod->mods[0].build_id,p->main_build_id,32)) return p;
+  }
+  return NULL;
+}
+
+static int guest_readable_range(u64 addr, u64 size, MemBlock* out){
+  if(!size || addr>=AS_SIZE || size>AS_SIZE-addr) return 0;
+  MemBlock b; mem_query(addr,&b);
+  if(b.state==MS_FREE || b.state==MS_INACCESSIBLE || addr<b.addr || addr-b.addr>b.size) return 0;
+  if(size>b.size-(addr-b.addr) || !(b.perm&PERM_R)) return 0;
+  if(out) *out=b;
+  return 1;
+}
+
+static void svc_break_location(const char* label, u64 addr){
+  MemBlock b;
+  if(!guest_readable_range(addr&~3ull,4,&b)){
+    WARN("  svcBreak %s=%016llx unmapped symbol=%s code=[%016llx,%016llx)\n",label,
+         (unsigned long long)addr,gsym(addr),(unsigned long long)g_code_lo,(unsigned long long)g_code_hi);
+    return;
+  }
+  WARN("  svcBreak %s=%016llx symbol=%s mapped=[%016llx,%016llx) perm=%x code=[%016llx,%016llx)\n",label,
+       (unsigned long long)addr,gsym(addr),(unsigned long long)b.addr,(unsigned long long)(b.addr+b.size),b.perm,
+       (unsigned long long)g_code_lo,(unsigned long long)g_code_hi);
+  if(g_mod) for(u32 i=0;i<g_mod->nmods;i++){
+    const SwrModInfo* m=&g_mod->mods[i];
+    u64 lo=m->base+(u64)m->text_off, hi=lo+m->text_size;
+    if(addr>=lo && addr<hi){ WARN("  svcBreak %s module=%s text=[%016llx,%016llx)\n",label,m->name?m->name:"?",
+      (unsigned long long)lo,(unsigned long long)hi); break; }
+  }
+}
+
 /* SDK functions we replace with native code. only calls that go through the dispatch table see this, so calls from
    the game into the sdk module (PLT), that's how games get to these. nn::hid::ShowController*: the controller
    applet. tomodachi life (SDK 20) aborts inside ShowControllerSupport with hid 710 (npad not connected) before the
@@ -690,6 +749,13 @@ static void hle_abort_impl(CPU* RESTRICT c, u64 entry){ (void)entry;
      A5BB8B8 is still inside the constructor prologue; A5BBB64 is the
      post-call NOP, so resume at the following allocator instruction. */
   if(lr==0xA5BB898ull) c->pc=0xA5BBB68ull;
+  /* Balatro's SDK has the same TlsManager constructor in its sdk module at
+     1df29e14.  Its internal abort thunk leaves x30 at the constructor entry;
+     the caller's real continuation is saved in the constructor frame. */
+  if(lr==0x1DF29E14ull && c->x[31]>=AS_BASE && c->x[31]<=AS_SIZE-0x20){
+    u64 resume=gr64(c->x[31]+8);
+    if(resume>=g_code_lo && resume<g_code_hi && !(resume&3)){ c->x[30]=resume; c->pc=resume; }
+  }
   if(result==0x1203 && c->x[31]>=AS_BASE && c->x[31]<=AS_SIZE-0x80)
     LOG("fs: 0x1203 abort frame sp=%llx words=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx\n",
         (unsigned long long)c->x[31],
@@ -776,6 +842,92 @@ static void hle_remote_memory_usage(CPU* RESTRICT c, u64 entry){ (void)entry;
   c->x[0]=0; c->pc=c->x[30];
   static int said; if(!said){ said=1; LOG("gpu: GetRemoteMemoryUsage answered unavailable\n"); } }
 
+/* Some SDK revisions use the classic nn::fs C++ entry points directly from
+   the title instead of going through fsp-srv.  FileHandle is an eight-byte
+   guest object containing a runtime-owned token; it is not an IPC handle.
+   Balatro uses this path for the Lua archive, so bridge these calls to the
+   extracted RomFS without fabricating an IPC session. */
+typedef struct { FILE* f; } DirectFsFile;
+static DirectFsFile g_direct_fs[64];
+
+static int direct_fs_guest_string(u64 p, char* out, size_t n){
+  if(!p || p>=AS_SIZE || n<2) return 0;
+  const char* s=(const char*)GP(p); size_t i=0;
+  while(i+1<n && p+i<AS_SIZE && s[i]){ out[i]=s[i]; i++; }
+  out[i]=0; return i>0 && i+1<n;
+}
+
+static int direct_fs_slot(u64 handle){
+  u64 v=handle;
+  if(handle>=AS_BASE && handle<AS_SIZE) v=gr64(handle);
+  if(v<1 || v>64) return -1;
+  return (int)v-1;
+}
+
+static void hle_nnfs_open_file(CPU* RESTRICT c, u64 entry){
+  (void)entry; char path[1200]; u64 out=c->x[0], name=c->x[1];
+  if(out<AS_BASE || out>AS_SIZE-8 || !direct_fs_guest_string(name,path,sizeof path)){
+    c->x[0]=RC(2,1); c->pc=c->x[30]; return;
+  }
+  char host[1400];
+  if(!strncmp(path,"rom:/",5)) snprintf(host,sizeof host,"%sromfs/%s",g_datadir,path+5);
+  else if(!strncmp(path,"rom:",4)) snprintf(host,sizeof host,"%sromfs/%s",g_datadir,path+4);
+  else snprintf(host,sizeof host,"%s",path);
+  FILE* f=fopen(host,"rb"); int slot=-1;
+  if(f) for(int i=0;i<64;i++) if(!g_direct_fs[i].f){ slot=i; g_direct_fs[i].f=f; break; }
+  if(slot<0 && f) fclose(f);
+  if(slot<0){ c->x[0]=RC(2,1); c->pc=c->x[30]; return; }
+  gw64(out,(u64)slot+1); gw32(out+8,0);
+  c->x[0]=0; c->pc=c->x[30];
+  static int said; if(!said++) LOG("fs: direct nn::fs OpenFile %s -> slot %d\n",host,slot);
+}
+
+static void hle_nnfs_read_file(CPU* RESTRICT c, u64 entry){
+  (void)entry; u64 out_size=c->x[0], handle=c->x[1], off=c->x[2], dst=c->x[3], size=c->x[4];
+  static int trace;
+  if(!trace++){ LOG("fs: direct ReadFile out=%llx handle=%llx value=%llx off=%llx dst=%llx size=%llx\n",
+      (unsigned long long)out_size,(unsigned long long)handle,
+      (unsigned long long)((handle>=AS_BASE && handle<=AS_SIZE-8)?gr64(handle):0),
+      (unsigned long long)off,(unsigned long long)dst,(unsigned long long)size); }
+  int slot=direct_fs_slot(handle);
+  if(slot<0 || !g_direct_fs[slot].f || dst<AS_BASE || dst>AS_SIZE || size>AS_SIZE-dst || off>0x7fffffffffffffffull){
+    c->x[0]=RC(2,1); c->pc=c->x[30]; return;
+  }
+  if(fseeko(g_direct_fs[slot].f,(off_t)off,SEEK_SET)){ c->x[0]=RC(2,1); c->pc=c->x[30]; return; }
+  size_t got=fread(GP(dst),1,(size_t)size,g_direct_fs[slot].f);
+  if(out_size>=AS_BASE && out_size<=AS_SIZE-8) gw64(out_size,(u64)got);
+  c->x[0]=0; c->pc=c->x[30];
+}
+
+static void hle_nnfs_get_file_size(CPU* RESTRICT c, u64 entry){
+  (void)entry; u64 out_size=c->x[0], handle=c->x[1]; int slot=direct_fs_slot(handle);
+  static int trace;
+  if(!trace++) LOG("fs: direct GetFileSize out=%llx handle=%llx value=%llx slot=%d\n",
+      (unsigned long long)out_size,(unsigned long long)handle,
+      (unsigned long long)((handle>=AS_BASE && handle<=AS_SIZE-8)?gr64(handle):0),slot);
+  if(slot<0 || !g_direct_fs[slot].f){ c->x[0]=RC(2,1); c->pc=c->x[30]; return; }
+  struct stat st; int fd=fileno(g_direct_fs[slot].f);
+  if(fstat(fd,&st)){ c->x[0]=RC(2,1); c->pc=c->x[30]; return; }
+  if(out_size>=AS_BASE && out_size<=AS_SIZE-8) gw64(out_size,(u64)st.st_size);
+  c->x[0]=0; c->pc=c->x[30];
+}
+
+static void hle_nnfs_close_file(CPU* RESTRICT c, u64 entry){
+  (void)entry; int slot=direct_fs_slot(c->x[0]);
+  if(slot>=0 && g_direct_fs[slot].f){ fclose(g_direct_fs[slot].f); g_direct_fs[slot].f=NULL; }
+  c->x[0]=0; c->pc=c->x[30];
+}
+
+static u64 hle_safe_return(CPU* c){
+  u64 r=c->x[30];
+  if(r>=g_code_lo && r<g_code_hi && !(r&3)) return r;
+  if(c->x[31]>=AS_BASE && c->x[31]<=AS_SIZE-16){
+    r=gr64(c->x[31]+8);
+    if(r>=g_code_lo && r<g_code_hi && !(r&3)) return r;
+  }
+  return c->x[30];
+}
+
 /* NVN2 asks the SDK for one thread-local slot while opening its graphics
    allocator.  The title's SDK TLS manager is not present in this runtime,
    but the ABI is small: TlsSlot is a u32 slot number and success is Result 0.
@@ -785,7 +937,7 @@ static void hle_sdk_allocate_tls_slot(CPU* RESTRICT c, u64 entry){ (void)entry;
   u64 out=c->x[0];
   if(out>=AS_BASE && out<=AS_SIZE-4) gw32(out,0);
   c->x[0]=0;
-  c->pc=c->x[30];
+  c->pc=hle_safe_return(c);
   static int said; if(!said){ said=1; LOG("os: SdkAllocateTlsSlot out=%llx callback=%llx flags=%llx lr=%llx -> slot 0 (success)\n",
       (unsigned long long)out,(unsigned long long)c->x[1],
       (unsigned long long)c->x[2],(unsigned long long)c->x[30]); }
@@ -820,7 +972,8 @@ static void hle_tls_manager_allocate_slot(CPU* RESTRICT c, u64 entry){ (void)ent
   if(c->tpidr>=AS_BASE && c->tpidr<=AS_SIZE-512)
     gw64(c->tpidr+(u64)slot*8,0);
   c->x[0]=1; /* AllocateTlsSlot returns true on success. */
-  c->pc=c->x[30];
+  c->pc=hle_safe_return(c);
+  if(!(c->pc>=g_code_lo && c->pc<g_code_hi && !(c->pc&3))) c->pc=entry+0x68;
   static int said;
   if(!said++) LOG("os: direct TlsManager::AllocateTlsSlot manager=%llx out=%llx slot=%u flags=%x destructor=%llx -> true\n",
       (unsigned long long)manager,(unsigned long long)out,slot,flags,
@@ -856,14 +1009,14 @@ static void hle_tls_manager_ctor(CPU* RESTRICT c, u64 entry){ (void)entry;
 static void hle_get_tls_value(CPU* RESTRICT c, u64 entry){ (void)entry;
   u32 slot=(u32)c->x[0];
   c->x[0]=(slot<32)?c->hle_tls[slot]:0;
-  c->pc=c->x[30];
+  c->pc=hle_safe_return(c);
 }
 
 static void hle_set_tls_value(CPU* RESTRICT c, u64 entry){ (void)entry;
   u32 slot=(u32)c->x[0];
   if(slot<32) c->hle_tls[slot]=c->x[1];
   c->x[0]=0;
-  c->pc=c->x[30];
+  c->pc=hle_safe_return(c);
 }
 
 /* Balatro's NVN allocator reaches this SDK diagnostic after the host-backed
@@ -934,24 +1087,51 @@ static int heap_fn_wanted(const char* nm){
 void hle_install(void){
   if(getenv("SWR_NO_HLE")) return;
   extern GuestFn* g_disp; extern u64 g_code_lo, g_code_hi;
+  const HleDiagProfile* diag=hle_diag_profile();
   gsym_load(); int n=0;
+  if(diag) LOG("hle: verified diagnostic profile %s title=%016llx\n",diag->name,(unsigned long long)diag->title_id);
+  else LOG("hle: diagnostic TLS/fs/startup/AbortImpl hooks disabled (unverified title/build)\n");
   for(int i=0;i<g_ngsyms;i++){ const char* nm=(const char*)GP(g_gstr[g_gsyms[i].mod]+g_gsyms[i].name_off); u64 a=g_gsyms[i].addr;
     if(heap_fn_wanted(nm) && !getenv("SWR_NO_HEAP_LOCK") && a>=g_code_lo && a<g_code_hi && !(a&3) && g_nhl<HL_MAX){
       GuestFn* d=&g_disp[(a-g_code_lo)/4]; if(*d && *d!=hle_heap_locked){ if(!g_nhl) pm_init(&g_hl_m); g_hl[g_nhl].a=a; g_hl[g_nhl].f=*d; g_nhl++; *d=hle_heap_locked; }
       continue; }
+    if(diag && strstr(nm,"nn2os6detail10TlsManagerC2Ev")){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_tls_manager_ctor; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
+    if(diag && strstr(nm,"nn2os6detail10TlsManager15AllocateTlsSlot")){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_tls_manager_allocate_slot; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
+    if(diag && strstr(nm,"nn2fs8OpenFile")){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_nnfs_open_file; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
+    if(diag && strstr(nm,"nn2fs8ReadFile")){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_nnfs_read_file; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
+    if(diag && strstr(nm,"nn2fs11GetFileSize")){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_nnfs_get_file_size; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
+    if(diag && strstr(nm,"nn2fs9CloseFile")){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_nnfs_close_file; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
     /* Keep the generated BootGraphicsSystem body active.  It initializes the
        title's service-handle globals; replacing it with a success return
        leaves those handles at zero and the title spins before nx2:gsv opens. */
-    if(strstr(nm,"BootGraphicsSystem")) continue;
-    if(strstr(nm,"TryQueryDonatedTransferMemoryUsage")){
+    if(diag && strstr(nm,"BootGraphicsSystem")) continue;
+    if(diag && strstr(nm,"TryQueryDonatedTransferMemoryUsage")){
       if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_query_donated_transfer_memory; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
       continue;
     }
-    if(strstr(nm,"__cxa_guard_acquire")){
+    if(diag && strstr(nm,"__cxa_guard_acquire")){
       if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_cxa_guard_acquire; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
       continue;
     }
-    if(strstr(nm,"__cxa_guard_release") || strstr(nm,"__cxa_guard_abort")){
+    if(diag && (strstr(nm,"__cxa_guard_release") || strstr(nm,"__cxa_guard_abort"))){
       if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_cxa_guard_finish; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
       continue;
     }
@@ -962,7 +1142,7 @@ void hle_install(void){
        backend is being brought up. */
     /* Let the generated sync-point initializer establish its globals.  Its
        assertion is covered by the temporary AbortImpl recovery below. */
-    if(!strncmp(nm,"_ZN2nn4diag6detail9AbortImpl",28)){
+    if(diag && !strncmp(nm,"_ZN2nn4diag6detail9AbortImpl",28)){
       if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_abort_impl; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
       continue;
     }
@@ -982,34 +1162,51 @@ void hle_install(void){
      it is the first function entered after GetInfo(31/32) reports no remote
      memory.  Return the documented unavailable value instead of reaching the
      title's AbortImpl path. */
-  if(g_code_lo<=0xA5C19C0ull && 0xA5C19C0ull<g_code_hi){
+  if(diag && g_code_lo<=0xA5C19C0ull && 0xA5C19C0ull<g_code_hi){
     g_disp[(0xA5C19C0ull-g_code_lo)/4]=hle_remote_memory_usage;
     LOG("hle: nn::os::GetRemoteMemoryUsage at a5c19c0\n");
   }
-  if(g_code_lo<=0xA5ED408ull && 0xA5ED408ull<g_code_hi){
+  if(diag && g_code_lo<=0xA5ED408ull && 0xA5ED408ull<g_code_hi){
     g_disp[(0xA5ED408ull-g_code_lo)/4]=hle_send_sync_request;
     LOG("hle: nn::os::SendSyncRequest at a5ed408\n");
   }
-  if(g_code_lo<=0xA5BA7F8ull && 0xA5BA7F8ull<g_code_hi){
+  if(diag && g_code_lo<=0xA5BA7F8ull && 0xA5BA7F8ull<g_code_hi){
     g_disp[(0xA5BA7F8ull-g_code_lo)/4]=hle_sdk_allocate_tls_slot;
     LOG("hle: nn::os::SdkAllocateTlsSlot at a5ba7f8\n");
   }
-  if(g_code_lo<=0xA5BB898ull && 0xA5BB898ull<g_code_hi){
+  if(diag && g_code_lo<=0xA5BB898ull && 0xA5BB898ull<g_code_hi){
     g_disp[(0xA5BB898ull-g_code_lo)/4]=hle_tls_manager_ctor;
     LOG("hle: nn::os::detail::TlsManager::TlsManager at a5bb898\n");
   }
-  if(g_code_lo<=0xA5BBAF8ull && 0xA5BBAF8ull<g_code_hi){
+  if(diag && g_code_lo<=0xA5BBAF8ull && 0xA5BBAF8ull<g_code_hi){
     g_disp[(0xA5BBAF8ull-g_code_lo)/4]=hle_tls_manager_allocate_slot;
     LOG("hle: nn::os::detail::TlsManager::AllocateTlsSlot at a5bbaf8\n");
   }
-  if(g_code_lo<=0xA5BA840ull && 0xA5BA840ull<g_code_hi){
+  if(diag && g_code_lo<=0xA5BA840ull && 0xA5BA840ull<g_code_hi){
     g_disp[(0xA5BA840ull-g_code_lo)/4]=hle_get_tls_value;
     LOG("hle: nn::os::GetTlsValue at a5ba840\n");
   }
-  if(g_code_lo<=0xA5BA860ull && 0xA5BA860ull<g_code_hi){
+  if(diag && g_code_lo<=0xA5BA860ull && 0xA5BA860ull<g_code_hi){
     g_disp[(0xA5BA860ull-g_code_lo)/4]=hle_set_tls_value;
     LOG("hle: nn::os::SetTlsValue at a5ba860\n");
   }
+  /* Balatro's SDK build has no exported dynsym entry for these classic FS
+     wrappers.  The addresses are stable in its sdk module and are the
+     ReadFile entry identified by the failing +0x28 call site. */
+  if(diag && g_code_lo<=0x1DE94D70ull && 0x1DE94D70ull<g_code_hi){
+    g_disp[(0x1DE94D70ull-g_code_lo)/4]=hle_nnfs_read_file;
+    LOG("hle: nn::fs::ReadFile at 1de94d70\n");
+  }
+  if(diag && g_code_lo<=0x1DE94CE0ull && 0x1DE94CE0ull<g_code_hi){
+    g_disp[(0x1DE94CE0ull-g_code_lo)/4]=hle_nnfs_read_file;
+    LOG("hle: nn::fs::ReadFile+ReadOption at 1de94ce0\n");
+  }
+  if(diag && g_code_lo<=0x1DE94BF0ull && 0x1DE94BF0ull<g_code_hi){
+    g_disp[(0x1DE94BF0ull-g_code_lo)/4]=hle_nnfs_read_file;
+    LOG("hle: nn::fs::ReadFile+ReadOption(no out) at 1de94bf0\n");
+  }
+  if(diag && g_code_lo<=0x1DE95120ull && 0x1DE95120ull<g_code_hi)
+    g_disp[(0x1DE95120ull-g_code_lo)/4]=hle_nnfs_get_file_size;
   if(g_nhl) LOG("hle: %d sead::ExpHeap functions run under one lock (threads that share a core on the switch run at once here)\n",g_nhl);
   (void)n; }
 
@@ -1202,7 +1399,16 @@ static void swr_svc_(CPU* c, u32 imm){
     u32 reason=(u32)x[0];
     if(reason&0x80000000u){ LOGV("svcBreak (notice) %x\n",reason); x[0]=0; return; }
     WARN("\n*** The game called svcBreak (reason=%x, info=%llx size=%llx) ***\n",reason,(unsigned long long)x[1],(unsigned long long)x[2]);
-    if(x[1] && x[2]>=4 && x[2]<0x1000){ u8 tmp[64]; memcpy(tmp,GP(x[1]),x[2]<64?x[2]:64); WARN("  data: "); for(u64 i=0;i<(x[2]<64?x[2]:64);i++) WARN("%02x",tmp[i]); WARN("\n"); }
+    svc_break_location("pc",c->pc); svc_break_location("lr",c->x[30]);
+    if(x[1] && x[2]>=4 && x[2]<0x1000){
+      u8 tmp[64]; u64 n=x[2]<sizeof tmp?x[2]:sizeof tmp; MemBlock b;
+      if(guest_readable_range(x[1],n,&b)){
+        u32 result=0; memcpy(tmp,GP(x[1]),n); memcpy(&result,tmp,4);
+        WARN("  payload result=%08x mapped=[%016llx,%016llx) perm=%x bytes=",result,
+             (unsigned long long)b.addr,(unsigned long long)(b.addr+b.size),b.perm);
+        for(u64 i=0;i<n;i++) WARN("%02x",tmp[i]); WARN("\n");
+      } else WARN("  payload unmapped/ unreadable at %016llx size=%llx\n",(unsigned long long)x[1],(unsigned long long)n);
+    }
     kernel_dump_regs(c);
     /* strings pointed to by regs, often the abort message */
     for(int r=0;r<31;r++){ u64 a=c->x[r]; if(a<0x10000 || a>=AS_SIZE-256) continue; MemBlock b; mem_query(a,&b);

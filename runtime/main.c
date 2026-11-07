@@ -12,6 +12,9 @@
 const char* g_runtime_version=SWR_RUNTIME_VERSION;
 #include "rt.h"
 #include "audio.h"
+#ifdef SWR_NS2_SHADER
+#include "native_vi2.h"
+#endif
 #include <sys/stat.h>
 static int g_opt_null_trap;   /* null_trap= in the ini */
 
@@ -441,6 +444,9 @@ int swr_main(int argc, char** argv){
   if(load_code()) fatal("Could not load the game's recompiled code.");
   if(g_mod->abi!=1) fatal("The recompiled code is from another SwitchRecomp version.");
   g_title_id=g_mod->title_id;
+#ifdef SWR_NS2_SHADER
+  native_vi2_set_30fps_limit(g_opt_fps==30);
+#endif
   { /* npdm MMU flags: bits 1-3 = address space type, 1 = the old 36-bit one */
     char q[1200]; snprintf(q,sizeof q,"%sexefs/main.npdm",g_datadir); FILE* f=fopen(q,"rb");
     if(f){ u8 h[0x10]; if(fread(h,1,0x10,f)==0x10 && !memcmp(h,"META",4) && ((h[0x0C]>>1)&7)==1){ mem_layout_36bit(); LOG("npdm: 36-bit address space (stack and TLS kept below 64 GB)\n"); } fclose(f); } }

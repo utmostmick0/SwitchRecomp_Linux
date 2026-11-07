@@ -230,6 +230,27 @@ static void read_path(IpcCtx* c, int idx, char* out, u32 max){
   u32 n=0; if(a){ const char* p=(const char*)GP(a); while(n<max-1 && n<0x300 && n<s && p[n]){ out[n]=p[n]; n++; } } out[n]=0; }
 
 static void host_path(FsData* fs, const char* p, char* out, size_t max){
+  /* LÖVE's Switch port exposes the packaged RomFS as /.lovegame.  It is a
+     virtual source mount, not a save-directory child; map it to the extracted
+     title data before applying the ordinary filesystem root. */
+  if(!strncmp(p,"/.lovegame",10) && (p[10]=='/' || p[10]==0)){
+    const char* rel=p+10; while(*rel=='/') rel++;
+    char source[1400]; snprintf(source,sizeof source,"%sromfs/%s",g_datadir,rel);
+    /* Some Balatro dumps omit the two optional GoNoto aliases even though
+       the bundled Noto fonts needed by the title are present. */
+    if(!strcmp(rel,"resources/fonts/GoNotoCurrent-Bold.ttf"))
+      snprintf(source,sizeof source,"%sromfs/resources/fonts/NotoSans-Bold.ttf",g_datadir);
+    else if(!strcmp(rel,"resources/fonts/GoNotoCJKCore.ttf"))
+      snprintf(source,sizeof source,"%sromfs/resources/fonts/NotoSansJP-Bold.ttf",g_datadir);
+    else if(!strcmp(rel,"1/unlocked_jokers.jkr")){
+      /* Balatro creates this optional profile file on first run.  Some
+         extracted saves omit it, but the title waits for the existence check
+         to settle before it leaves the loading screen. */
+      snprintf(source,sizeof source,"%ssave/user/.lovegame/1/unlocked_jokers.jkr",g_datadir);
+      FILE* f=fopen(source,"ab"); if(f) fclose(f);
+    }
+    if(plat_is_dir(source) || plat_file_size(source)>0){ snprintf(out,max,"%s",source); return; }
+  }
   while(*p=='/') p++;
   snprintf(out,max,"%s/%s",fs->root,p);
   size_t l=strlen(out); while(l>0 && (out[l-1]=='/')) out[--l]=0;
@@ -269,7 +290,7 @@ static int file_disp(SvcObj* o, IpcCtx* c){
         if(!got) break;
         n+=(u64)got;
       }
-      out64(c,n); return 0; }
+      out64(c,n); { static int logged; if(logged<40){ logged++; LOG("fs: IFile read %s off=%llx size=%llx -> %llx\n",f->path,(unsigned long long)off,(unsigned long long)sz,(unsigned long long)n); } } return 0; }
     case 1: { u64 off=in64(c,8), sz=in64(c,16), a, bs; buf_in(c,0,&a,&bs); if(sz>bs) sz=bs;
       fseek(f->f,(long)off,SEEK_SET); fwrite(GP(a),1,sz,f->f); /* Position-relative reads bypass stdio buffering. */
       fflush(f->f); return 0; }
@@ -284,6 +305,7 @@ static int file_disp(SvcObj* o, IpcCtx* c){
   return stub_ok(o,c); }
 
 static void file_destroy(SvcObj* o){ FileData* f=o->data; if(f->f) fclose(f->f); }
+
 
 static int dir_disp(SvcObj* o, IpcCtx* c){
   DirData* d=o->data;
@@ -344,6 +366,7 @@ static int fs_disp(SvcObj* o, IpcCtx* c){
       FILE* t=fopen(hp,"rb"); if(!t){ if(errno==ENOENT || errno==ENOTDIR) fs_negative_add(hp,epoch,now); fs_miss("GetEntryType",p); return FS_NOTFOUND; } fclose(t); out32(c,1); return 0; }
     case 8: { read_path(c,0,p,sizeof p); host_path(fs,p,hp,sizeof hp); u32 mode=in32(c,0);
       FILE* t=fopen(hp,(mode&2)? "rb+" : "rb"); if(!t){ fs_miss("OpenFile",p); return FS_NOTFOUND; }
+      { static int logged; if(logged<40){ logged++; LOG("fs: IFile open %s -> %s\n",p,hp); } }
       SvcObj* f=svcobj_new("IFile",file_disp,sizeof(FileData)); FileData* fd=f->data; fd->f=t; fd->mode=mode; strcpy(fd->path,hp); f->destroy=file_destroy;
       out_obj(c,f); return 0; }
     case 9: { read_path(c,0,p,sizeof p); host_path(fs,p,hp,sizeof hp);
@@ -456,6 +479,10 @@ static int fsp_disp(SvcObj* o, IpcCtx* c){
   char p[1200];
   switch(c->cmd){
     case 1: return 0;
+    case 2: /* OpenDataFileSystemByCurrentProcess */
+      snprintf(p,sizeof p,"%sromfs",g_datadir);
+      LOG("fs: fsp-srv cmd 2 -> RomFS filesystem %s\n",p);
+      out_obj(c,hostfs_new(p)); return 0;
     case 18: snprintf(p,sizeof p,"%ssdmc",g_datadir); out_obj(c,hostfs_new(p)); return 0;
     case 51: case 52: case 53: {
       /* in: u8 space, pad[7], then attr = { u64 program_id, uid[16], u64 system_save_id, u8 type, u8 rank, u16 index } */
@@ -484,8 +511,12 @@ static int fsp_disp(SvcObj* o, IpcCtx* c){
     case 1005: out32(c,0); return 0;
     case 1009: out_obj(c,svc_generic("IFileSystemProxyAccessLog")); return 0;
     case 620: case 630: case 631: case 632: case 800: return 0;
-    case 8: case 11: case 17: case 19: case 31: return RC(2,1001);
-    case 2: case 7: return RC(2,1001);
+    case 8: /* OpenFileSystemWithId: the title uses this to obtain its RomFS mount. */
+      snprintf(p,sizeof p,"%sromfs",g_datadir);
+      LOG("fs: fsp-srv cmd 8 -> RomFS filesystem %s\n",p);
+      out_obj(c,hostfs_new(p)); return 0;
+    case 11: case 17: case 19: case 31: return RC(2,1001);
+    case 7: return RC(2,1001);
   }
   return stub_ok(o,c); }
 

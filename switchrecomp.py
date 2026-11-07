@@ -64,6 +64,13 @@ def find_cc(pref=None, target_win=False):
 def is_tcc(cc): return 'tcc' in os.path.basename(cc).lower()
 
 
+def host_has_zlib():
+    """Return whether the host can compile and link the optional gzip trace path."""
+    pkg = shutil.which('pkg-config')
+    if not pkg: return False
+    return subprocess.run([pkg, '--exists', 'zlib'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
 def tcc_b(cc):
     # bundled tcc keeps include\ and lib\ next to the exe
     d = os.path.dirname(os.path.abspath(cc))
@@ -339,7 +346,9 @@ def _build_runtime(cc, out, target_win, backend, say, opt='2', ns2_objects=()):
         if backend == 'win32': cmd += ['-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32']
     else:
         cmd += ['-lpthread', '-ldl', '-lm', '-rdynamic']
-        if backend == 'x11': cmd += ['-lX11', '-lGL', '-DSWR_TRACE_ZIP']
+        if backend == 'x11':
+            cmd += ['-lX11', '-lGL', '-DSWR_TRACE_ZIP']
+            if host_has_zlib(): cmd += ['-DSWR_TRACE_GZIP', '-lz']
     err = run_cc(cmd, cc)
     if err: raise SystemExit('Runtime build failed:\n' + err[-4000:])
 

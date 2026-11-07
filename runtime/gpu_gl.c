@@ -8,6 +8,9 @@
 #ifdef SWR_TRACE_ZIP
 #include "trace_zip.h"
 #endif
+#ifdef SWR_TRACE_GZIP
+#include <zlib.h>
+#endif
 #include <time.h>
 #include <math.h>
 #include "glfn.h"
@@ -160,6 +163,11 @@ static int rt_descriptor_active(u64 gva, u32 w, u32 h){
 static int rt_format17_transient(u32 f, u64 gva, u32 w, u32 h){
   return f==0x17 && !rt_descriptor_active(gva,w,h);
 }
+
+/* 0x17 is BC7/BPTC in the TIC namespace and is never a render-target format.
+   Keep this gate separate from tic_format(), where the same code is valid for
+   sampled compressed textures. */
+static int rt_format_allowed(u32 f){ return f!=0x17; }
 
 static GlFmt rt_format(u32 f){
   switch(f){
@@ -595,6 +603,7 @@ static int getenv_cached_nomip(void){ static int v=-1; if(v<0) v=getenv("SWR_NO_
 static int rt_w_fits(Tex* r, u32 w){ u32 g= r->f.bpp? 64u/r->f.bpp : 16u; if(!g) g=1; return r->w==w || (r->w>w && (r->w+g-1)/g==(w+g-1)/g); }
 
 static Tex* layered_from_rts(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, u32 levels, GLenum target, GlFmt f, u32 fkey, u32 bl, u32 bh, u32 bd){
+  (void)fkey;
   if(!p_cis || levels>15 || d<1) return NULL;
   { u32 ml=max_levels(TD(rt0,w),TD(rt0,h),1); if(levels>ml) levels=ml; }   /* every level must exist at the scaled size too */
   u64 loff[16], lsz=0; for(u32 l=0;l<levels;l++){ loff[l]=lsz; lsz+= bl? bl_level_size(w,h,1,&f,bh,bd,l,NULL) : 0; }
@@ -1465,6 +1474,7 @@ static Tex* g_rt[8]; static Tex* g_zt; static int g_nrt;
 static Tex* rt_texture(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth){
   if(!rt_descriptor_active(gva,w,h)) return NULL;
   if(rt_format17_transient(fmt,gva,w,h)) return NULL;
+  if(!rt_format_allowed(fmt)){ static int said; if(!said++){ WARN("gpu: rejected compressed render target format %x\n",fmt); } return NULL; }
   GlFmt f= rt_format(fmt);
   u32 fkey=fmt|(depth? 0x10000 : 0);
   for(Tex* t=texh[hkey(gva)];t;t=t->next) if(t->gva==gva && t->is_rt && t->w==w && t->h==h && t->fkey==fkey){ t->last_used=g_frame; return t; }
@@ -2152,6 +2162,7 @@ static Sh* fs_get_keyed(GpuChannel* ch, u64 addr){
   for(u32 i=0;i<count;i++){ u32 idx=(ctl>>(4+i*3))&7; u32* rt=&r[0x200+idx*0x10]; if(!rt[4]) continue;
     u64 gva=((u64)rt[0]<<32)|rt[1];
     if(!rt_descriptor_active(gva,rt[2],rt[3])) continue;
+    if(!rt_format_allowed(rt[4])) continue;
     valid_fb=1;
     GlFmt f=rt_format(rt[4]); if(f.is_int){ rm|=1u<<i; if(ifmt_signed(f.ifmt)) rs|=1u<<i; } }
   if(r[0x54E]){ u64 za=((u64)r[0x3F8]<<32)|r[0x3F9]; if(rt_descriptor_active(za,r[0x48A],r[0x48B])) valid_fb=1; }
@@ -2437,7 +2448,12 @@ static GLuint buf_cached(GLenum target, u64 start, u64 len, u32 stride){
   e->cpu=cpu; e->epoch=g_submit_epoch; e->chk_epoch=g_submit_epoch; return e->id; }
 
 /* ============================================================ F5 frame trace */
-static int g_tr_arm, g_tr_on, g_tr_n, g_tr_img; static FILE* g_tr;
+static int g_tr_arm, g_tr_on, g_tr_n, g_tr_img;
+#ifdef SWR_TRACE_GZIP
+static gzFile g_tr;
+#else
+static FILE* g_tr;
+#endif
 static Tex* g_tr_tex[2048]; static int g_tr_ntex;
 static u64 g_tr_sh[1024]; static int g_tr_nsh; static int g_tr_gen;
 /* each F5 gets a per-game folder: captures/traces/<game>_1, <game>_2... */
@@ -2448,7 +2464,16 @@ static GLuint g_tr_fb, g_tr_tx;
 #define TRW 256
 #define TRH 144
 
-static void trace_note(const char* fmt, ...){ if(!g_tr_on || !g_tr) return; va_list ap; va_start(ap,fmt); vfprintf(g_tr,fmt,ap); va_end(ap); }
+static void trace_note(const char* fmt, ...){
+  if(!g_tr_on || !g_tr) return;
+  va_list ap; va_start(ap,fmt);
+#ifdef SWR_TRACE_GZIP
+  gzvprintf(g_tr,fmt,ap);
+#else
+  vfprintf(g_tr,fmt,ap);
+#endif
+  va_end(ap);
+}
 
 
 void gpu_gl_note_compute(void){ }
@@ -2679,7 +2704,12 @@ static void trace_frame(void){
           free(px); } }
       if(ok){ char p[256]; snprintf(p,sizeof p,"%s/tex%03d_%llx_%ux%u_f%x%s.ppm",g_tr_dir,i,(unsigned long long)t->gva,t->w,t->h,t->fkey,t->is_rt?"_rt":""); tr_save(p,o,ow,oh); }
       free(o); }
-    fclose(g_tr); g_tr=NULL; g_tr_on=0; if(g_tr_cbf){ fclose(g_tr_cbf); g_tr_cbf=NULL; }
+#ifdef SWR_TRACE_GZIP
+    gzclose(g_tr);
+#else
+    fclose(g_tr);
+#endif
+    g_tr=NULL; g_tr_on=0; if(g_tr_cbf){ fclose(g_tr_cbf); g_tr_cbf=NULL; }
     LOG("trace: frame saved in %s (%d draws, %d images)\n",g_tr_dir,g_tr_n,g_tr_img);
 #ifdef SWR_TRACE_ZIP
     { char archive[256]; if(trace_zip_create(g_tr_dir,archive,sizeof archive)) LOG("trace: archive saved in %s\n",archive);
@@ -2689,9 +2719,21 @@ static void trace_frame(void){
   { static int envf=-2; if(envf==-2){ const char* e=getenv("SWR_TRACE"); envf= e? atoi(e) : -1; } if(envf>=0 && (int)g_frame==envf) g_tr_arm=1; }
   if(g_tr_arm){ g_tr_arm=0; plat_mkdir("captures"); plat_mkdir("captures/traces");
     char game[96]; trace_game_component(game,sizeof game);
-    for(int n=1;n<1000000;n++){ char p[256]; snprintf(g_tr_dir,sizeof g_tr_dir,"captures/traces/%s_%d",game,n); snprintf(p,sizeof p,"%s/trace.txt",g_tr_dir);
+    for(int n=1;n<1000000;n++){ char p[256]; snprintf(g_tr_dir,sizeof g_tr_dir,"captures/traces/%s_%d",game,n);
+#ifdef SWR_TRACE_GZIP
+      snprintf(p,sizeof p,"%s/execution_%016llx.log.gz",g_tr_dir,(unsigned long long)g_title_id);
+#else
+      snprintf(p,sizeof p,"%s/trace.txt",g_tr_dir);
+#endif
       FILE* e=fopen(p,"rb"); if(!e) break; fclose(e); }
-    plat_mkdir(g_tr_dir); { char p[256]; snprintf(p,sizeof p,"%s/trace.txt",g_tr_dir); g_tr=fopen(p,"w"); snprintf(p,sizeof p,"%s/cbdata.bin",g_tr_dir); g_tr_cbf=fopen(p,"wb"); }
+    plat_mkdir(g_tr_dir); {
+      char p[256];
+#ifdef SWR_TRACE_GZIP
+      snprintf(p,sizeof p,"%s/execution_%016llx.log.gz",g_tr_dir,(unsigned long long)g_title_id); g_tr=gzopen(p,"wb6");
+#else
+      snprintf(p,sizeof p,"%s/trace.txt",g_tr_dir); g_tr=fopen(p,"w");
+#endif
+      snprintf(p,sizeof p,"%s/cbdata.bin",g_tr_dir); g_tr_cbf=fopen(p,"wb"); }
     g_tr_cbpos=0; memset(g_tr_cbh,0,sizeof g_tr_cbh);
     g_tr_on= g_tr!=NULL; g_tr_n=0; g_tr_img=0; g_tr_ntex=0; g_tr_nsh=0; g_tr_gen++;
     { extern const char* g_runtime_version; const char* v=(const char*)glGetString(GL_VENDOR); const char* r=(const char*)glGetString(GL_RENDERER); const char* x=(const char*)glGetString(GL_VERSION);
@@ -3725,6 +3767,14 @@ int gpu_native_queue_rgba(u64 cpu,u32 width,u32 height,u32 pitch,void (*done)(vo
   /* The VI owner retains the source lease through the callback. Snapshot
      CPU pixels now; queued presentation owns its independent copy. */
   for(u32 y=0;y<height;y++) memcpy(job.px+(size_t)y*width,GP(cpu+(u64)y*pitch),(size_t)width*4);
+  q_push(&job); return 1;
+}
+int gpu_native_queue_rgba_pixels(const void* pixels,u32 width,u32 height,u32 pitch,void (*done)(void*,int),void* context){
+  if(!g_gl || !g_gl_ready || g_quit || !pixels || !done || !width || !height || width>4096 || height>4096 || pitch<(u64)width*4) return 0;
+  Work job={0}; job.kind=WK_NATIVE_RGBA; job.w=(int)width; job.h=(int)height;
+  job.native_done=done; job.native_context=context;
+  job.px=malloc((size_t)width*height*4); if(!job.px) return 0;
+  for(u32 y=0;y<height;y++) memcpy(job.px+(size_t)y*width,(const u8*)pixels+(size_t)y*pitch,(size_t)width*4);
   q_push(&job); return 1;
 }
 #endif
