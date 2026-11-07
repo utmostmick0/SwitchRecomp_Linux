@@ -866,6 +866,17 @@ static void hle_set_tls_value(CPU* RESTRICT c, u64 entry){ (void)entry;
   c->pc=c->x[30];
 }
 
+/* Balatro's NVN allocator reaches this SDK diagnostic after the host-backed
+   buffer queue has already been created.  It is a debug trap helper, not the
+   allocator's return value; returning to its caller lets the allocator
+   finish the cleanup path while we continue bringing up presentation. */
+static void hle_nnmem_debug_break(CPU* RESTRICT c, u64 entry){ (void)entry;
+  c->x[0]=0;
+  c->pc=c->x[30];
+  static int said;
+  if(!said++) LOG("mem: suppressed nnmem_nlib_debug_break at %llx\n",(unsigned long long)entry);
+}
+
 static u32 nx2_gsv_fallback_handle(void){
   static u32 h;
   if(!h){ extern SvcObj* svc_nx2_gsv_new(void); h=session_new(svc_nx2_gsv_new()); }
@@ -953,6 +964,10 @@ void hle_install(void){
        assertion is covered by the temporary AbortImpl recovery below. */
     if(!strncmp(nm,"_ZN2nn4diag6detail9AbortImpl",28)){
       if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_abort_impl; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
+      continue;
+    }
+    if(strstr(nm,"nnmem_nlib_debug_break")){
+      if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_nnmem_debug_break; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
       continue;
     }
     /* Keep the generated A9A8010 implementation active.  It performs the
