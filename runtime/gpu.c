@@ -168,11 +168,18 @@ static void call_method(GpuChannel* ch, u32 sub, u32 m, u32 v, int last){
     case 0xA140: kepler_i2m_method(ch,m,v); break;
     case 0x902D: fermi2d_method(ch,m,v); break;
     case 0xB0B5: dma_method(ch,m,v); break;
-    case 0xC797: case 0xC7C0: case 0xC7B5:
-      /* Native class semantics are not Maxwell register layouts. Worker
-         QMD3 execution uses its separate owned submission entry point. */
-      WARN("native GPU class %x method %x requires an authenticated native engine path\n",cls,m);
-      ch->submission_failed=1; break;
+    case 0xC797:
+      /* NVN2 identifies the 3D engine with the Ampere class, while the
+         existing runtime consumes the compatible Maxwell method stream. */
+      maxwell3d_method(ch,m,v,last); break;
+    case 0xC7C0:
+      /* The Switch 2 NvRm maps Ampere compute objects onto the runtime's
+         compute engine slot, matching the nvhost class translation used by
+         the working Eden/Lichii implementation. */
+      compute_method(ch,m,v,last); break;
+    case 0xC7B5:
+      /* DMA copy methods retain the same pushbuffer shape for this path. */
+      dma_method(ch,m,v); break;
     default:
       if(sub==0) maxwell3d_method(ch,m,v,last);
       else if(sub==1) compute_method(ch,m,v,last);

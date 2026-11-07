@@ -102,18 +102,44 @@ static u64 g_user_id[2]={0x0123456789ABCDEFull,0xFEDCBA9876543210ull};
    the SDK does not mistake an empty IPC reply for an unavailable display. */
 static KEvent* g_nx2_vi2_events[8];
 static KEvent* g_nx2_vi2_vsync;
+static int g_nx2_vi2_vsync_thread;
+
+static void nx2_vi2_vsync_clock(void* arg){
+  (void)arg;
+  plat_thread_low_priority();
+  for(;;){
+    KEvent* e=__atomic_load_n(&g_nx2_vi2_vsync,__ATOMIC_ACQUIRE);
+    if(e) kevent_signal(e);
+    for(int i=0;i<8;i++){
+      KEvent* n=__atomic_load_n(&g_nx2_vi2_events[i],__ATOMIC_ACQUIRE);
+      if(n) kevent_signal(n);
+    }
+    plat_sleep_ns(16666667);
+  }
+}
+
+static void nx2_vi2_start_vsync_clock(void){
+  if(!__atomic_exchange_n(&g_nx2_vi2_vsync_thread,1,__ATOMIC_ACQ_REL))
+    if(plat_thread(nx2_vi2_vsync_clock,NULL,256*1024))
+      __atomic_store_n(&g_nx2_vi2_vsync_thread,0,__ATOMIC_RELEASE);
+}
 
 static KEvent* nx2_vi2_event(IpcCtx* c){
   u32 index=in32(c,0)&7u;
   if(!g_nx2_vi2_events[index]){
-    g_nx2_vi2_events[index]=kevent_new("nx2 vi2 native",0);
-    g_nx2_vi2_events[index]->signaled=1;
+    g_nx2_vi2_events[index]=kevent_new("nx2 vi2 native",1);
   }
   return g_nx2_vi2_events[index];
 }
 
 static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
   (void)o;
+  static u32 trace_count;
+  if(trace_count<96){
+    LOG("nx2:vi2 cmd=%u raw=%08x,%08x,%08x,%08x copy=%d move=%d\n",
+        c->cmd,in32(c,0),in32(c,4),in32(c,8),in32(c,12),c->ncopy,c->nmove);
+    trace_count++;
+  }
   switch(c->cmd){
     case 1: case 3: out32(c,1); return 0;
     case 5: out32(c,7); return 0;
@@ -122,9 +148,34 @@ static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
          The native compositor is not present in the host runtime yet, so a
          permanently signalled event is the correct bootstrap behavior; an
          unsignalled one leaves the title in its startup polling loop forever. */
-      if(!g_nx2_vi2_vsync){ g_nx2_vi2_vsync=kevent_new("nx2 vi2 vsync",0); g_nx2_vi2_vsync->signaled=1; }
+      if(!g_nx2_vi2_vsync){
+        g_nx2_vi2_vsync=kevent_new("nx2 vi2 vsync",1);
+        /* Command 11 is the bootstrap vblank source.  The title waits on it
+           immediately, before the periodic clock is necessarily running. */
+        g_nx2_vi2_vsync->signaled=1;
+      }
       out_copy_h(c,ev_handle(g_nx2_vi2_vsync)); return 0;
-    case 31: case 32: out_copy_h(c,ev_handle(nx2_vi2_event(c))); return 0;
+    case 21:
+      /* Bananza performs its first display-state transition here and then
+         waits on the event from command 11.  Treat the transition as an
+         immediate vblank until a compositor-backed timer exists. */
+      if(g_nx2_vi2_vsync){ kevent_signal(g_nx2_vi2_vsync); }
+      for(int i=0;i<8;i++) if(g_nx2_vi2_events[i]){
+        kevent_signal(g_nx2_vi2_events[i]);
+      }
+      return 0;
+    case 31:
+      out_copy_h(c,ev_handle(nx2_vi2_event(c)));
+      nx2_vi2_start_vsync_clock();
+      return 0;
+    case 32: {
+      /* DuplicateNativeEvent hands the same slot back after binding.  Lichii
+         keeps the native event alive and the vsync source can signal it again;
+         do the same so the first frame is not stranded behind a consumed
+         one-shot event. */
+      KEvent* e=nx2_vi2_event(c);
+      out_copy_h(c,ev_handle(e)); return 0;
+    }
     case 212:
       /* GetLayerBufferBits: all compositor slots are immediately available
          until the native compositor is connected. */
@@ -137,18 +188,30 @@ static int nx2_vi2_disp(SvcObj* o, IpcCtx* c){
     /* Eden's working trace uses these VI2 lifecycle/event commands.  They
        are deliberately tolerant: the native renderer owns the actual frame
        work, while the SDK needs the session to acknowledge the protocol. */
+    case 261:
+      if(g_nx2_vi2_vsync){ kevent_signal(g_nx2_vi2_vsync); }
+      return 0;
     case 51: case 101: case 102: case 107: case 111: case 112:
     case 201: case 202: case 228:
-    case 251: case 252: case 261: case 265: case 267: case 271:
+    case 251: case 252: case 265: case 267: case 271:
     case 351: case 352: return 0;
   }
   return quiet_ok(o,c);
 }
 
 static KEvent* g_nx2_gpu_event;
+static u32 g_nx2_gpu_device=1;
+static u32 g_nx2_native_memory=1;
+static u32 g_nx2_native_image=1;
 
 static int nx2_gpu_disp(SvcObj* o, IpcCtx* c){
   (void)o;
+  static u32 trace_count;
+  if(trace_count<96){
+    LOG("nx2:gpu cmd=%u raw=%08x,%08x,%08x,%08x copy=%d move=%d\n",
+        c->cmd,in32(c,0),in32(c,4),in32(c,8),in32(c,12),c->ncopy,c->nmove);
+    trace_count++;
+  }
   switch(c->cmd){
     case 11: out32(c,0); out32(c,31); return 0;
     case 12:
@@ -161,14 +224,121 @@ static int nx2_gpu_disp(SvcObj* o, IpcCtx* c){
       return 0;
     case 22: out_obj(c,svcobj_new("nx2:gpu-sub",nx2_gpu_disp,0)); return 0;
     case 33: out32(c,1); return 0;
-    case 41: out32(c,1); return 0;
-    case 202: case 203: out32(c,1); return 0;
+    case 41:
+      /* CreateGraphicsDevice returns a success result followed by a second
+         result and a non-zero device id. */
+      out32(c,0); out32(c,g_nx2_gpu_device++); return 0;
+    case 201:
+      /* User partition: start and size, both u64. */
+      out32(c,0x08000000); out32(c,0);
+      out32(c,0xF8000000); out32(c,0xBF); return 0;
+    case 202:
+      /* The GSV partition is empty: min=~0, max=0. */
+      out32(c,0xFFFFFFFF); out32(c,0xFFFFFFFF); out32(c,0); out32(c,0); return 0;
+    case 203:
+      /* GPU VA range: kind=1, start=0x08000000, size=0xBFF8000000. */
+      out32(c,1); out32(c,0);
+      out32(c,0x08000000); out32(c,0);
+      out32(c,0xF8000000); out32(c,0xBF); return 0;
+  }
+  return quiet_ok(o,c);
+}
+
+/* ================================================================ nx2:nvsrv
+   NVN2 opens the NVIDIA resource manager through the raw session returned by
+   gsv command 1402.  The old generic object made every call look successful,
+   but returned no file descriptors or GPU characteristics, so NVN stopped
+   before it could create a channel.  Keep the protocol deliberately small:
+   the existing host GPU path consumes the command buffers after this
+   handshake, while this session supplies the NvRm identity and fd plumbing. */
+typedef struct { u32 next_fd; } Nx2NvData;
+
+static u32 nx2_nv_ioctl(IpcCtx* c){
+  u32 raw=in32(c,4);
+  return raw;
+}
+
+static void nx2_nv_fill_characteristics(u8* p, u64 n){
+  if(!p || n<0xA0) return;
+  memset(p,0,(size_t)n);
+  u32 u32v;
+  u16 u16v;
+  u64 u64v;
+#define NV32(off,v) do{ u32v=(u32)(v); if((off)+4<=n) memcpy(p+(off),&u32v,4); }while(0)
+#define NV16(off,v) do{ u16v=(u16)(v); if((off)+2<=n) memcpy(p+(off),&u16v,2); }while(0)
+#define NV64(off,v) do{ u64v=(u64)(v); if((off)+8<=n) memcpy(p+(off),&u64v,8); }while(0)
+  NV32(0x00,0x170);       /* arch */
+  NV32(0x04,0xE);         /* implementation: chip 0x17E */
+  NV32(0x08,0xA1);        /* revision */
+  NV32(0x0C,1);           /* GPC count */
+  NV32(0x10,0x40000);     /* L2 cache */
+  NV32(0x20,0x6);         /* TPCs per GPC */
+  NV32(0x24,0x20);        /* bus type */
+  NV32(0x28,0x20000);     /* big page */
+  NV32(0x2C,0x20000);     /* compression page */
+  NV32(0x30,0x1B);        /* PDE coverage */
+  NV32(0x34,0x30000);     /* available big pages */
+  NV32(0x38,1);           /* GPC mask */
+  NV32(0x3C,0x808);       /* SM architecture */
+  NV32(0x40,0x808);       /* SPA architecture */
+  NV32(0x44,0x80);        /* warp count */
+  NV32(0x48,0x28);        /* GPU VA bits */
+  NV64(0x50, (1ull<<8)|(1ull<<22)|(1ull<<26)|(1ull<<34)|(1ull<<35)|(0x1Full<<40));
+  NV32(0x60,0x902D);      /* 2D */
+  NV32(0x64,0xC797);      /* Ampere 3D */
+  NV32(0x68,0xC7C0);      /* Ampere compute */
+  NV32(0x6C,0xC56F);      /* GPFIFO */
+  NV16(0x70,0x40); NV16(0x72,0x40); NV16(0x74,0x40);
+  NV16(0x76,0x40); NV16(0x78,0x40); NV16(0x7A,0x40);
+  NV16(0x7C,0x40); NV16(0x7E,0x40); NV16(0x80,0x40);
+  NV32(0x84,0xC7B5);      /* DMA copy */
+  NV32(0xB4,64);          /* maximum TSG subcontexts */
+#undef NV16
+#undef NV32
+#undef NV64
+}
+
+static int nx2_nvsrv_disp(SvcObj* o, IpcCtx* c){
+  Nx2NvData* d=o->data;
+  switch(c->cmd){
+    case 0: { /* Open */
+      char path[128]={0}; u64 a,n;
+      if(buf_in(c,0,&a,&n) && a && n){ if(n>=sizeof path) n=sizeof path-1; memcpy(path,GP(a),(size_t)n); path[n]=0; }
+      u32 fd=d->next_fd++;
+      LOG("nx2:nvsrv Open(%s) -> fd %u\n",path,fd);
+      out32(c,fd); out32(c,0); return 0;
+    }
+    case 1: case 11: case 12: { /* Ioctl / Ioctl2 / Ioctl3 */
+      u32 raw=nx2_nv_ioctl(c), group=(raw>>8)&0xFF, cmd=(raw>>16)&0x3FFF;
+      LOG("nx2:nvsrv ioctl cmd=%u fd=%u raw=%08x group=%02x subcmd=%u\n",c->cmd,in32(c,0),raw,group,cmd);
+      u64 outa=0,outn=0; buf_out(c,0,&outa,&outn);
+      if(group=='G' && cmd==5 && outa && outn){
+        nx2_nv_fill_characteristics(GP(outa),outn);
+        LOG("nx2:nvsrv Ampere characteristics ioctl %08x (%llx bytes)\n",raw,(unsigned long long)outn);
+      } else if(group=='G' && cmd==0x1F && outa && outn){
+        memset(GP(outa),0,(size_t)outn);
+        if(outn>=16){ gw32(outa+0,0); gw32(outa+4,0); gw32(outa+8,0); gw32(outa+12,0); }
+        if(outn>=32){ gw32(outa+16,2); gw32(outa+20,0); gw32(outa+24,1); gw32(outa+28,0); }
+      } else if(outa && outn){ memset(GP(outa),0,(size_t)outn); }
+      out32(c,0); return 0;
+    }
+    case 2: /* Close */ out32(c,0); return 0;
+    case 4: case 13: case 14: case 15: out32(c,0); return 0;
   }
   return quiet_ok(o,c);
 }
 
 static int nx2_gsv_disp(SvcObj* o, IpcCtx* c){
   (void)o;
+  /* Keep the first bootstrap requests visible.  This is intentionally bounded:
+     later GSV traffic includes per-frame commands and must not flood logs. */
+  static u32 trace_count;
+  if(trace_count<96){
+    LOG("nx2:gsv cmd=%u raw=%08x,%08x,%08x,%08x copy=%d move=%d in=%d out=%u objs=%d\n",
+        c->cmd,in32(c,0),in32(c,4),in32(c,8),in32(c,12),c->ncopy,c->nmove,c->raw_size,
+        c->out_size,c->nout_objs);
+    trace_count++;
+  }
   switch(c->cmd){
     case 0: out32(c,in32(c,0)); out32(c,in32(c,4)); return 0; /* TIPC handshake */
     case 4: case 126: case 201: case 301:
@@ -183,6 +353,12 @@ static int nx2_gsv_disp(SvcObj* o, IpcCtx* c){
     }
     case 101: /* CreateGpuAccessibleMemory / register a CPU range */
       out32(c,1); return 0;
+    case 111: /* CreateNativeMemory: return a non-zero native memory id. */
+      out32(c,g_nx2_native_memory++); return 0;
+    case 112: case 114: case 314: case 315: case 423: case 430:
+      return 0;
+    case 429: /* CreateNativeImage: return a non-zero image id. */
+      out32(c,g_nx2_native_image++); return 0;
     case 115: out32(c,in32(c,0)); out32(c,in32(c,4)); return 0; /* grant requested features */
     case 202: out_obj(c,new_nx2_syncpt()); return 0;
     case 204: {                                  /* AttachSyncptMemory */
@@ -206,7 +382,7 @@ static int nx2_gsv_disp(SvcObj* o, IpcCtx* c){
       return 0; }
     case 497: out_obj(c,svcobj_new("nx2:gpu",nx2_gpu_disp,0)); return 0;
     case 305: out_obj(c,svcobj_new("nx2:vi2",nx2_vi2_disp,0)); return 0;
-    case 1402: out_obj(c,svc_generic("nx2:nvsrv")); return 0;
+    case 1402: out_obj(c,svcobj_new("nx2:nvsrv",nx2_nvsrv_disp,sizeof(Nx2NvData))); ((Nx2NvData*)c->out_objs[c->nout_objs-1]->data)->next_fd=1; return 0;
     case 1510: out32(c,0x100000); out32(c,0); out32(c,0x1000); out32(c,0); return 0;
   }
   return quiet_ok(o,c);

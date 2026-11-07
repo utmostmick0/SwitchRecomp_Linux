@@ -438,11 +438,26 @@ static u32 svc_wait_sync(KThread* t, u64 hptr, u32 n, i64 timeout, u32* out_idx)
   KObj* objs[64]; u32 hs[64];
   for(u32 i=0;i<n;i++) hs[i]=gr32(hptr+i*4);
   pm_lock(&g_klock);
-  for(u32 i=0;i<n;i++){ objs[i]=h_get_nl(hs[i]); if(!objs[i] || !objs[i]->is_signaled){ pm_unlock(&g_klock); if(!objs[i]){ static u32 nw; if(nw++<20 || !(nw&0xFFFF)) WARN("WaitSynchronization: invalid handle %x (%u times)\n",hs[i],nw); } return R_BADHANDLE; } }
+  for(u32 i=0;i<n;i++){
+    objs[i]=h_get_nl(hs[i]);
+    /* An unsignaled object is a normal blocking-wait condition, not an
+       invalid handle.  Returning R_BADHANDLE here made native VI2 events
+       impossible to wait on and left Switch 2 titles in their startup poll. */
+    if(!objs[i]){ pm_unlock(&g_klock); static u32 nw; if(nw++<20 || !(nw&0xFFFF)) WARN("WaitSynchronization: invalid handle %x (%u times)\n",hs[i],nw); return R_BADHANDLE; }
+  }
   if(t->cancel){ t->cancel=0; pm_unlock(&g_klock); return R_CANCELLED; }
   u64 end= timeout<0? 0 : plat_ns()+(u64)timeout;
   for(;;){
-    for(u32 i=0;i<n;i++) if(objs[i]->is_signaled(objs[i])){ *out_idx=i; pm_unlock(&g_klock); return 0; }
+    for(u32 i=0;i<n;i++) if(objs[i]->is_signaled(objs[i])){
+      *out_idx=i;
+      /* Switch events created with autoclear consume their signal when a
+         waiter successfully observes them.  The old runtime left the bit
+         set forever, which made native VI2 events behave like level-triggered
+         events and prevented the NVN2 startup state machine from advancing. */
+      if(objs[i]->type==KO_EVENT && ((KEvent*)objs[i])->autoclear)
+        ((KEvent*)objs[i])->signaled=0;
+      pm_unlock(&g_klock); return 0;
+    }
     if(timeout==0){ pm_unlock(&g_klock); return R_TIMEOUT; }
     i64 rem=-1; if(timeout>0){ u64 now=plat_ns(); if(now>=end){ pm_unlock(&g_klock); return R_TIMEOUT; } rem=(i64)(end-now); }
     /* n==0 is a plain sleep that CancelSynchronization ends (nn::os MultiWait with only user objects) */
@@ -665,14 +680,40 @@ static void hle_ctrl_other(CPU* RESTRICT c, u64 entry){ (void)entry; c->x[0]=0; 
 static void hle_abort_impl(CPU* RESTRICT c, u64 entry){ (void)entry;
   /* AbortImpl is noreturn, but this unavailable-platform result has a valid
      generated continuation once remote-memory helpers have returned zero. */
+  u64 original_x0=c->x[0], original_lr=c->x[30];
+  u32 result=0;
+  if(original_x0>=AS_BASE && original_x0<AS_SIZE && AS_SIZE-original_x0>=4)
+    result=gr32(original_x0);
   u64 lr=c->x[30];
   c->x[0]=0; c->pc=c->x[30];
-  /* A failed SDK TLS-slot assertion is reached through the indirect
-     constructor call in F_A5BB898.  Returning to that function's entry
-     re-executes the constructor with x0 cleared and crashes.  Resume at its
-     generated cleanup/return block instead. */
-  if(lr==0xA5BB898ull) c->pc=0xA5BB8B8ull;
-  static int said; if(!said){ said=1; LOG("gpu: suppressed early AbortImpl entry=%llx lr=%llx x0=%llx x1=%llx x2=%llx x3=%llx -> pc=%llx\n",(unsigned long long)entry,(unsigned long long)lr,(unsigned long long)c->x[0],(unsigned long long)c->x[1],(unsigned long long)c->x[2],(unsigned long long)c->x[3],(unsigned long long)c->pc); } }
+  /* The constructor's assertion is reached from TlsManager::AllocateTlsSlot.
+     A5BB8B8 is still inside the constructor prologue; A5BBB64 is the
+     post-call NOP, so resume at the following allocator instruction. */
+  if(lr==0xA5BB898ull) c->pc=0xA5BBB68ull;
+  if(result==0x1203 && c->x[31]>=AS_BASE && c->x[31]<=AS_SIZE-0x80)
+    LOG("fs: 0x1203 abort frame sp=%llx words=%llx,%llx,%llx,%llx,%llx,%llx,%llx,%llx\n",
+        (unsigned long long)c->x[31],
+        (unsigned long long)gr64(c->x[31]),
+        (unsigned long long)gr64(c->x[31]+8),
+        (unsigned long long)gr64(c->x[31]+16),
+        (unsigned long long)gr64(c->x[31]+24),
+        (unsigned long long)gr64(c->x[31]+32),
+        (unsigned long long)gr64(c->x[31]+40),
+        (unsigned long long)gr64(c->x[31]+48),
+        (unsigned long long)gr64(c->x[31]+56));
+  /* SetResultHandledByApplication reaches AbortImpl through a thunk whose
+     LR points back to the thunk itself.  The saved caller continuation is
+     the frame word at SP+0x18 for this SDK build; resume there only for the
+     known handled mount-conflict result. */
+  if(result==0x1203 && c->x[31]>=AS_BASE && c->x[31]<=AS_SIZE-0x20){
+    u64 resume=gr64(c->x[31]+0x18);
+    if(resume>=g_code_lo && resume<g_code_hi && !(resume&3)){
+      c->x[30]=resume;
+      c->pc=resume;
+    }
+  }
+  static int said; if(!said){ said=1; LOG("gpu: suppressed early AbortImpl entry=%llx lr=%llx result_ptr=%llx result=%08x x1=%llx x2=%llx x3=%llx -> pc=%llx\n",(unsigned long long)entry,(unsigned long long)original_lr,(unsigned long long)original_x0,result,(unsigned long long)c->x[1],(unsigned long long)c->x[2],(unsigned long long)c->x[3],(unsigned long long)c->pc); guest_backtrace(c);
+  } }
 
 /* Switch 2's nn::gs startup reaches these SDK entry points before any GPU
    service is opened.  Keep the graphics system alive long enough for the
@@ -707,6 +748,7 @@ static void hle_vi23_initialize(CPU* RESTRICT c, u64 entry){ (void)entry;
   c->x[0]=0; c->pc=c->x[30];
   static int said; if(!said){ said=1; LOG("vi2: nn::vi23::sdk::Initialize answered by the runtime\n"); } }
 
+
 static void hle_syncpt_initialize(CPU* RESTRICT c, u64 entry){ (void)entry;
   /* CheckGraphicsSystemInitialized runs immediately after this title's
      one-time bootstrap.  Mark the SDK state initialized while the real GSV
@@ -733,6 +775,65 @@ static void hle_remote_memory_usage(CPU* RESTRICT c, u64 entry){ (void)entry;
      the Switch 2 remote-memory service is unavailable. */
   c->x[0]=0; c->pc=c->x[30];
   static int said; if(!said){ said=1; LOG("gpu: GetRemoteMemoryUsage answered unavailable\n"); } }
+
+/* NVN2 asks the SDK for one thread-local slot while opening its graphics
+   allocator.  The title's SDK TLS manager is not present in this runtime,
+   but the ABI is small: TlsSlot is a u32 slot number and success is Result 0.
+   Reserve slot zero in the per-thread TLS page; the generated SDK accessors
+   already use TPIDRRO_EL0, which points at that page for every guest thread. */
+static void hle_sdk_allocate_tls_slot(CPU* RESTRICT c, u64 entry){ (void)entry;
+  u64 out=c->x[0];
+  if(out>=AS_BASE && out<=AS_SIZE-4) gw32(out,0);
+  c->x[0]=0;
+  c->pc=c->x[30];
+  static int said; if(!said){ said=1; LOG("os: SdkAllocateTlsSlot out=%llx callback=%llx flags=%llx lr=%llx -> slot 0 (success)\n",
+      (unsigned long long)out,(unsigned long long)c->x[1],
+      (unsigned long long)c->x[2],(unsigned long long)c->x[30]); }
+}
+
+/* The NVN2 title calls the TlsManager method directly from guest code.  The
+   public SdkAllocateTlsSlot export is therefore not reached by the current
+   call path.  Allocate a small, non-zero guest handle at the actual method
+   entry; 0xA5BBB64 is AllocateTlsSlot+0x6c (a continuation), not an entry. */
+static void hle_tls_manager_allocate_slot(CPU* RESTRICT c, u64 entry){ (void)entry;
+  static u32 next_slot=4;
+  const u64 out=c->x[1];
+  const u32 slot=next_slot++;
+  const u64 handle=(u64)slot | (u64)1<<32 | (u64)1<<48;
+  if(out>=AS_BASE && out<=AS_SIZE-8) gw64(out,handle);
+  /* Guest TPIDR_EL0 is c->tpidr.  Threads created by this runtime already
+     have a guest TLS page in TPIDRRO_EL0; use that page as the initial
+     TPIDR_EL0 backing when the title has not installed its own TCB yet. */
+  if(c->tpidr<AS_BASE || c->tpidr>AS_SIZE-512) c->tpidr=c->tpidrro;
+  if(c->tpidr>=AS_BASE && c->tpidr<=AS_SIZE-512)
+    gw64(c->tpidr+(u64)slot*8,0);
+  c->x[0]=0;
+  c->pc=c->x[30];
+  static int said;
+  if(!said++) LOG("os: direct TlsManager::AllocateTlsSlot out=%llx slot=%u handle=%llx destructor=%llx\n",
+      (unsigned long long)out,slot,(unsigned long long)handle,
+      (unsigned long long)c->x[2]);
+}
+
+static void hle_tls_manager_ctor(CPU* RESTRICT c, u64 entry){ (void)entry;
+  /* The SDK constructor only initializes Horizon-owned TLS manager state;
+     that state is supplied by the runtime's per-thread TLS page instead. */
+  u64 self=c->x[0];
+  u64 ret=c->x[30];
+  /* This constructor is reached through the SDK's indirect thunk.  That
+     thunk leaves x30 pointing at the constructor entry; the caller's real
+     continuation is the saved LR in the guest frame. */
+  if(ret==entry && c->x[31]>=AS_BASE && c->x[31]<=AS_SIZE-16)
+    ret=gr64(c->x[31]+8);
+  c->x[0]=self;
+  /* The HLE return is a tail return into the caller.  Preserve the caller's
+     link register as well as the PC; leaving x30 equal to the constructor
+     entry makes a later AbortImpl look as if it returned to the constructor
+     and sends the recovery path back through the wrong frame. */
+  c->x[30]=ret;
+  c->pc=ret;
+  static int said; if(!said){ said=1; LOG("os: TlsManager constructor bypassed (runtime TLS manager active)\n"); }
+}
 
 static u32 nx2_gsv_fallback_handle(void){
   static u32 h;
@@ -798,8 +899,7 @@ void hle_install(void){
       continue; }
     /* Keep the generated BootGraphicsSystem body active.  It initializes the
        title's service-handle globals; replacing it with a success return
-       leaves those handles at zero and the title spins on svcSendSyncRequest
-       with an invalid handle. */
+       leaves those handles at zero and the title spins before nx2:gsv opens. */
     if(strstr(nm,"BootGraphicsSystem")) continue;
     if(strstr(nm,"TryQueryDonatedTransferMemoryUsage")){
       if(a>=g_code_lo && a<g_code_hi && !(a&3)){ g_disp[(a-g_code_lo)/4]=hle_query_donated_transfer_memory; n++; LOG("hle: %s at %llx\n",nm,(unsigned long long)a); }
@@ -816,9 +916,8 @@ void hle_install(void){
     /* Keep the generated query wrapper active: it performs the SDK's Result
        cleanup and output-structure bookkeeping around the implementation
        thunk. */
-    /* Let the generated BootGraphicsSystem execute.  Its initialization
-       sequence creates the title's NVN2 service objects; short-circuiting it
-       leaves the main thread waiting forever before nx2:gsv is opened. */
+    /* Let the generated BootGraphicsSystem execute while the native NVN2
+       backend is being brought up. */
     /* Let the generated sync-point initializer establish its globals.  Its
        assertion is covered by the temporary AbortImpl recovery below. */
     if(!strncmp(nm,"_ZN2nn4diag6detail9AbortImpl",28)){
@@ -844,6 +943,18 @@ void hle_install(void){
   if(g_code_lo<=0xA5ED408ull && 0xA5ED408ull<g_code_hi){
     g_disp[(0xA5ED408ull-g_code_lo)/4]=hle_send_sync_request;
     LOG("hle: nn::os::SendSyncRequest at a5ed408\n");
+  }
+  if(g_code_lo<=0xA5BA7F8ull && 0xA5BA7F8ull<g_code_hi){
+    g_disp[(0xA5BA7F8ull-g_code_lo)/4]=hle_sdk_allocate_tls_slot;
+    LOG("hle: nn::os::SdkAllocateTlsSlot at a5ba7f8\n");
+  }
+  if(g_code_lo<=0xA5BB898ull && 0xA5BB898ull<g_code_hi){
+    g_disp[(0xA5BB898ull-g_code_lo)/4]=hle_tls_manager_ctor;
+    LOG("hle: nn::os::detail::TlsManager::TlsManager at a5bb898\n");
+  }
+  if(g_code_lo<=0xA5BBAF8ull && 0xA5BBAF8ull<g_code_hi){
+    g_disp[(0xA5BBAF8ull-g_code_lo)/4]=hle_tls_manager_allocate_slot;
+    LOG("hle: nn::os::detail::TlsManager::AllocateTlsSlot at a5bbaf8\n");
   }
   if(g_nhl) LOG("hle: %d sead::ExpHeap functions run under one lock (threads that share a core on the switch run at once here)\n",g_nhl);
   (void)n; }
