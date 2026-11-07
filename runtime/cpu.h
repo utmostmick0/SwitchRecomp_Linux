@@ -76,6 +76,10 @@ typedef struct CPU {
   int  depth;
   u32  pad_;
   u64  user[8];
+  /* Runtime-owned fallback for SDK TLS slots whose Horizon TCB is not
+     available in the host implementation yet.  Kept after the fields used
+     by generated code so the generated ABI remains unchanged. */
+  u64 hle_tls[32];
 } CPU;
 
 /* ---- memory: base + addr, no page tables ---- */

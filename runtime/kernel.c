@@ -797,22 +797,34 @@ static void hle_sdk_allocate_tls_slot(CPU* RESTRICT c, u64 entry){ (void)entry;
    entry; 0xA5BBB64 is AllocateTlsSlot+0x6c (a continuation), not an entry. */
 static void hle_tls_manager_allocate_slot(CPU* RESTRICT c, u64 entry){ (void)entry;
   static u32 next_slot=4;
+  const u64 manager=c->x[0];
   const u64 out=c->x[1];
+  const u64 destructor=c->x[2];
+  const u32 flags=(u32)c->x[3];
   const u32 slot=next_slot++;
-  const u64 handle=(u64)slot | (u64)1<<32 | (u64)1<<48;
-  if(out>=AS_BASE && out<=AS_SIZE-8) gw64(out,handle);
+  /* This is the actual nn::os::detail::TlsManager ABI, not the public
+     TlsSlot wrapper ABI: the method writes a u32 index to x1 and returns a
+     bool in w0.  Its generated body stores the destructor in the manager's
+     callback table at this+8+slot*8.  Writing a fabricated 64-bit handle
+     here corrupts the adjacent stack word and returning ResultSuccess (0)
+     makes the caller take its allocation-failed path. */
+  if(out>=AS_BASE && out<=AS_SIZE-4) gw32(out,slot);
+  if(manager>=AS_BASE && manager<=AS_SIZE-8-(u64)slot*8){
+    gw64(manager+8+(u64)slot*8,destructor);
+    if(flags & 1) gw32(manager,slot+1);
+  }
   /* Guest TPIDR_EL0 is c->tpidr.  Threads created by this runtime already
      have a guest TLS page in TPIDRRO_EL0; use that page as the initial
      TPIDR_EL0 backing when the title has not installed its own TCB yet. */
   if(c->tpidr<AS_BASE || c->tpidr>AS_SIZE-512) c->tpidr=c->tpidrro;
   if(c->tpidr>=AS_BASE && c->tpidr<=AS_SIZE-512)
     gw64(c->tpidr+(u64)slot*8,0);
-  c->x[0]=0;
+  c->x[0]=1; /* AllocateTlsSlot returns true on success. */
   c->pc=c->x[30];
   static int said;
-  if(!said++) LOG("os: direct TlsManager::AllocateTlsSlot out=%llx slot=%u handle=%llx destructor=%llx\n",
-      (unsigned long long)out,slot,(unsigned long long)handle,
-      (unsigned long long)c->x[2]);
+  if(!said++) LOG("os: direct TlsManager::AllocateTlsSlot manager=%llx out=%llx slot=%u flags=%x destructor=%llx -> true\n",
+      (unsigned long long)manager,(unsigned long long)out,slot,flags,
+      (unsigned long long)destructor);
 }
 
 static void hle_tls_manager_ctor(CPU* RESTRICT c, u64 entry){ (void)entry;
@@ -833,6 +845,25 @@ static void hle_tls_manager_ctor(CPU* RESTRICT c, u64 entry){ (void)entry;
   c->x[30]=ret;
   c->pc=ret;
   static int said; if(!said){ said=1; LOG("os: TlsManager constructor bypassed (runtime TLS manager active)\n"); }
+}
+
+/* The title's SDK GetTlsValue/SetTlsValue helpers address a Horizon TCB at
+   TPIDRRO_EL0+0x1f8.  The emulator currently has the kernel thread TLS page
+   but not the SDK-owned TCB object, so that path can return arbitrary guest
+   data as a pointer (the first failure was the string "MainThread").  Keep
+   the per-CPU slot values in a small runtime-owned table until the full TCB
+   layout is implemented. */
+static void hle_get_tls_value(CPU* RESTRICT c, u64 entry){ (void)entry;
+  u32 slot=(u32)c->x[0];
+  c->x[0]=(slot<32)?c->hle_tls[slot]:0;
+  c->pc=c->x[30];
+}
+
+static void hle_set_tls_value(CPU* RESTRICT c, u64 entry){ (void)entry;
+  u32 slot=(u32)c->x[0];
+  if(slot<32) c->hle_tls[slot]=c->x[1];
+  c->x[0]=0;
+  c->pc=c->x[30];
 }
 
 static u32 nx2_gsv_fallback_handle(void){
@@ -955,6 +986,14 @@ void hle_install(void){
   if(g_code_lo<=0xA5BBAF8ull && 0xA5BBAF8ull<g_code_hi){
     g_disp[(0xA5BBAF8ull-g_code_lo)/4]=hle_tls_manager_allocate_slot;
     LOG("hle: nn::os::detail::TlsManager::AllocateTlsSlot at a5bbaf8\n");
+  }
+  if(g_code_lo<=0xA5BA840ull && 0xA5BA840ull<g_code_hi){
+    g_disp[(0xA5BA840ull-g_code_lo)/4]=hle_get_tls_value;
+    LOG("hle: nn::os::GetTlsValue at a5ba840\n");
+  }
+  if(g_code_lo<=0xA5BA860ull && 0xA5BA860ull<g_code_hi){
+    g_disp[(0xA5BA860ull-g_code_lo)/4]=hle_set_tls_value;
+    LOG("hle: nn::os::SetTlsValue at a5ba860\n");
   }
   if(g_nhl) LOG("hle: %d sead::ExpHeap functions run under one lock (threads that share a core on the switch run at once here)\n",g_nhl);
   (void)n; }
